@@ -1,0 +1,17 @@
+services:
+  announce:
+    container_name: announce
+    build:
+      context: .
+      args:
+        BUILD_TIME: "2026-07-11"
+    image: announce:latest
+
+    restart: unless-stopped
+    shm_size: "256m"
+
+    environment:
+      - TZ=Asia/Shanghai
+
+    volumes:
+      - ./:/app  # 项目目录挂载到容器
