@@ -86,16 +86,13 @@ docker compose down
 4. **创建 Compose 项目**
    - 点击 **「创建」** 或 **「新建项目」**
    - 项目名称填写：`ham-repeater-bot`（或自定义名称）
+   - 路径选择步骤 1 中上传的目录，例如 `/vol1/docker/ham-repeater-bot`
 
-5. **导入 docker-compose.yml**
-   - **方式 A - 粘贴内容**：用文本编辑器打开 `docker-compose.yml`，将内容复制粘贴到编辑框中
-   - **方式 B - 上传文件**：点击「上传」或「导入」按钮，选择本地的 `docker-compose.yml` 文件
+5. **确认使用现有配置**
+   - 选择路径后，系统会弹窗提示：*「所选择的路径已包含 docker-compose 配置文件，确定要使用现有的 docker-compose 配置文件来创建项目吗？」*
+   - 点击 **「确定」**，系统会自动识别 `docker-compose.yml` 并创建项目
 
-6. **设置 Compose 路径**
-   - 将 Compose 文件路径设置为步骤 1 中上传的目录，例如 `/vol1/docker/ham-repeater-bot`
-   - 确保「构建镜像」选项已开启（因为本项目需要本地构建）
-
-7. **部署启动**
+6. **部署启动**
    - 点击 **「部署」** 或 **「启动」** 按钮
    - 系统会自动构建镜像并启动容器
    - 在「容器」页面可以查看运行状态和日志
