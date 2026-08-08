@@ -16,52 +16,76 @@ from playwright.sync_api import sync_playwright
 import edge_tts
 import base64
 
-# ====================== 配置项 ======================
-# 滔滔链路配置
-TALK_URL = "https://totalkd.allptt.com:1443/"  # 滔滔链路 Web 端地址
-USER_DATA_DIR = r"/app/edge_user_data"          # 浏览器持久化数据目录（保存登录态）
-TALK_USERNAME = "YOUR_TALK_USERNAME"            # 滔滔链路账号
-TALK_PASSWORD = "YOUR_TALK_PASSWORD"            # 滔滔链路密码
-PTT_SELECTOR = "#imagePtt_div"                  # PTT 按钮 CSS 选择器
+# ====================== 用户必填配置 ======================
+# 以下配置项必须根据你的实际情况修改，否则服务无法正常运行
+
+TALK_USERNAME = "YOUR_TALK_USERNAME"            # 滔滔链路登录账号
+TALK_PASSWORD = "YOUR_TALK_PASSWORD"            # 滔滔链路登录密码
+
+# 播报内容模板，根据你的中继台信息修改（呼号、频率、亚音等）
+# 可用变量：{year} {month} {day} {weekday} {hour} {minute_text}
+ANNOUNCE_TEMPLATE = "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是YOUR_CALLSIGN，本中继下行频率 XXX.XXX 兆赫，上行频率 XXX.XXX 兆赫，叉频 负 X.XX 兆赫。单上行接入亚音为模拟 XXX.X 赫兹。请规范用频，保持信道畅通。完毕"
+
+# 企业微信群机器人 Webhook（可选，不需要告警可留空）
+WECHAT_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WEBHOOK_KEY"
+
+# ==========================================================
+
+
+# ====================== 播报调度参数 ======================
+# 控制播报的时间范围和频率，按需调整
+
+ANNOUNCE_START_HOUR = 6          # 每日起始播报时（24h 制），例如 6 表示早 6 点开始
+ANNOUNCE_END_HOUR = 22           # 每日结束播报时（24h 制），例如 22 表示晚 10 点后停止
+                                 # 播报频率：每半小时一次（XX:00 和 XX:30）
+
+# ==========================================================
+
+
+# ====================== 高级配置（一般无需修改） ======================
+# 以下参数已有合理默认值，仅在需要微调时修改
+
+# --- 滔滔链路页面 ---
+TALK_URL = "https://totalkd.allptt.com:1443/"  # 滔滔链路 Web 端地址（平台更新时可能变更）
+PTT_SELECTOR = "#imagePtt_div"                  # PTT 按钮 CSS 选择器（页面改版时需更新）
 LOGIN_BTN_SELECTOR = "#loginUI > div.container > div > div > div > form > div:nth-child(7) > div > div.col-xs-12 > input"  # 登录按钮 CSS 选择器
-TTS_VOICE = "zh-CN-XiaoxiaoNeural"             # Edge-TTS 语音角色
 
-# 播报内容配置
-# 请根据实际中继台信息修改以下模板（呼号、频率、亚音等）
-ANNOUNCE_TEMPLATE = "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是咸阳市业余无线电中继台B阿九AB，本中继下行频率 XXX.XXX 兆赫，上行频率 XXX.XXX 兆赫，叉频 负 X.XX 兆赫。单上行接入亚音为模拟 XXX.X 赫兹。请规范用频，保持信道畅通。完毕"
-ANNOUNCE_START_HOUR = 6
-ANNOUNCE_END_HOUR = 22
+# --- TTS 语音合成 ---
+TTS_VOICE = "zh-CN-XiaoxiaoNeural"             # Edge-TTS 语音角色（可选：zh-CN-YunxiNeural 等）
+TTS_SYNTH_TIMEOUT = 30                          # 单次合成超时（秒）
+TTS_MAX_RETRIES = 3                             # 合成失败最大重试次数
+TTS_RETRY_DELAY = 5.0                           # 重试间隔（秒）
+CACHE_EXPIRE_DAYS = 7                           # TTS 缓存文件过期天数，过期自动清理
 
-# 缓存与时序配置
-CACHE_DIR = r"/app/tts_cache"
-LOG_DIR = r"/app/logs"
-PTT_PRESS_DELAY = 800            # PTT 按下后等待时间（ms）
-PAGE_LOAD_TIMEOUT = 15000        # 页面加载超时（ms）
-HEADLESS_MODE = True             # 浏览器无头模式
-REFRESH_WAIT_SEC = 6             # 刷新后等待音频链路稳定时间（s）
-LOG_MAX_BYTES = 0.25 * 1024 * 1024  # 日志轮转：单文件最大 0.25MB
-LOG_BACKUP_COUNT = 40              # 保留最近 40 个备份
-CACHE_EXPIRE_DAYS = 7             # TTS 缓存过期天数
+# --- 音频链路 ---
+AUDIO_SAMPLE_RATE = 24000       # 虚拟麦克风采样率（Hz），需与滔滔链路音频参数匹配
+MIC_GAIN = 1.5                  # 虚拟麦克风播报音量增益，>1 放大，<1 缩小
+LEVEL_CHECK_THRESHOLD = 10      # 电平检测通过阈值（0-255），低于此值视为无音频输出
+LEVEL_CHECK_ROUNDS = 5          # 电平检测最大轮数，连续检测均低于阈值则告警
+PTT_BUFFER_OFFSET = 0.6         # PTT 提前释放时间（秒），抵消 WebRTC 音频缓冲延迟
 
-# TTS 合成配置
-TTS_SYNTH_TIMEOUT = 30           # TTS 单次合成超时（秒）
-TTS_MAX_RETRIES = 3              # TTS 合成最大重试次数
-TTS_RETRY_DELAY = 5.0            # TTS 合成重试间隔（秒）
+# --- PTT 与时序 ---
+PTT_PRESS_DELAY = 800           # PTT 按下后等待时间（ms），确保中继台已响应
+REFRESH_WAIT_SEC = 6            # 页面刷新后等待时间（秒），让音频链路和 WebSocket 稳定
+PAGE_LOAD_TIMEOUT = 15000       # 页面加载超时（ms）
 
-# 音频与播报配置
-AUDIO_SAMPLE_RATE = 24000        # 虚拟麦克风采样率（Hz）
-MIC_GAIN = 1.5                   # 虚拟麦克风播报音量增益
-LEVEL_CHECK_THRESHOLD = 10       # 电平检测通过阈值（0-255）
-LEVEL_CHECK_ROUNDS = 5           # 电平检测最大轮数
-PTT_BUFFER_OFFSET = 0.6          # PTT 提前释放缓冲时间（秒），抵消 WebRTC 音频缓冲
+# --- 浏览器 ---
+HEADLESS_MODE = True            # 浏览器无头模式，True=无界面运行，False=显示浏览器窗口（调试用）
+USER_DATA_DIR = r"/app/edge_user_data"  # 浏览器数据目录（保存登录态，勿手动清理）
 
-# 企业微信 Webhook 推送配置
-# Webhook 地址（企业微信群机器人）
-WECHAT_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WEBHOOK_KEY"  # 企业微信群机器人 Webhook
-# 日志推送级别：WARNING=仅告警+错误, ERROR=仅错误
+# --- 存储路径 ---
+CACHE_DIR = r"/app/tts_cache"   # TTS 缓存目录
+LOG_DIR = r"/app/logs"          # 日志目录
+
+# --- 日志 ---
+LOG_MAX_BYTES = 0.25 * 1024 * 1024  # 单个日志文件最大大小（字节），达到后自动轮转
+LOG_BACKUP_COUNT = 40               # 保留的历史日志文件数量
+
+# --- 企业微信告警级别 ---
 # 可选值：logging.INFO / logging.WARNING / logging.ERROR
-WEBHOOK_LOG_LEVEL = logging.WARNING
-# ======================================================
+WEBHOOK_LOG_LEVEL = logging.WARNING  # WARNING=仅告警和错误推送，ERROR=仅错误推送
+
+# ==================================================================
 
 # 日志初始化（轮转日志，防止单文件撑满磁盘）
 Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
