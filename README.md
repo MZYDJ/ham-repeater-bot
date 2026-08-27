@@ -116,11 +116,11 @@ exec python3 announce.py -i
 ### 播报时间
 
 ```python
-ANNOUNCE_START_HOUR = 6    # 每日起始播报时间（整点）
-ANNOUNCE_END_HOUR = 22     # 每日结束播报时间（整点）
+ANNOUNCE_START_HOUR = 6    # 每日首次播报时刻（整点）
+ANNOUNCE_END_HOUR = 22     # 每日最后一次播报所在小时（22 表示最后一次为 22:30）
 ```
 
-播报规则：每半小时一次，XX:00 和 XX:30 各播报一次。XX:29 和 XX:59 会自动预刷新页面和预合成 TTS。
+播报规则：每半小时一次，XX:00 和 XX:30 各播报一次。每次播报前一分钟（XX:29 / XX:59）自动预刷新页面和预合成 TTS；每天首次播报由前一日 (START-1):59 预热，确保不使用闲置整夜的页面；收盘播报后浏览器保持关闭，不整夜空转。
 
 ### TTS 合成
 
@@ -130,7 +130,10 @@ TTS_SYNTH_TIMEOUT = 30        # TTS 单次合成超时（秒）
 TTS_MAX_RETRIES = 3           # TTS 合成最大重试次数
 TTS_RETRY_DELAY = 5.0         # TTS 合成重试间隔（秒）
 CACHE_EXPIRE_DAYS = 7         # TTS 缓存过期天数
+TTS_PREFILL_HOURS = 36        # TTS 蓄水池提前量（小时）
 ```
+
+TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `TTS_PREFILL_HOURS` 内所有播报时段缺失的音频，使准点播报不依赖播报时刻的 Edge-TTS 网络状态——网络突发故障（分钟到小时级）不再导致播报失败，只有连续中断超过一天才可能缺音。蓄水池任务遇到预热/播报任务入队会立即让位，不阻塞准点流程。
 
 ### 音频与播报
 
@@ -148,7 +151,10 @@ PTT_BUFFER_OFFSET = 0.6       # PTT 提前释放缓冲时间（秒），抵消 W
 PTT_PRESS_DELAY = 800        # PTT 按下后等待时间（ms）
 PAGE_LOAD_TIMEOUT = 15000    # 页面加载超时（ms）
 REFRESH_WAIT_SEC = 6         # 刷新后等待音频链路稳定时间（s）
+BROWSER_MAX_AGE_SEC = 1800   # 浏览器连续运行超过该时长后，预热时强制关闭重建（秒）
 ```
+
+浏览器超龄重建：若浏览器已连续运行超过 `BROWSER_MAX_AGE_SEC`（如服务在夜间重启后闲置到早上），预热时会强制关闭重建而非仅刷新页面，避免闲置过久的页面 websocket/音频链路失效导致播报无声。
 
 ### 日志与 Webhook
 

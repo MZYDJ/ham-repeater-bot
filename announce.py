@@ -56,6 +56,7 @@ TTS_SYNTH_TIMEOUT = 30                          # 单次合成超时（秒）
 TTS_MAX_RETRIES = 3                             # 合成失败最大重试次数
 TTS_RETRY_DELAY = 5.0                           # 重试间隔（秒）
 CACHE_EXPIRE_DAYS = 7                           # TTS 缓存文件过期天数，过期自动清理
+TTS_PREFILL_HOURS = 36                          # TTS 蓄水池提前量（小时）：预合成未来该时长内所有播报时段的音频
 
 # --- 音频链路 ---
 AUDIO_SAMPLE_RATE = 24000       # 虚拟麦克风采样率（Hz），需与滔滔链路音频参数匹配
@@ -395,10 +396,14 @@ def get_announce_text(now: datetime.datetime) -> str:
     )
 
 
+def tts_cache_path(text: str) -> Path:
+    """TTS 缓存文件路径（以播报文本 md5 为键）"""
+    return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
+
+
 def get_tts_file(text: str) -> str:
     """TTS合成，子线程隔离事件循环。含文件完整性校验 + 超时重试"""
-    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
-    cache_path = Path(CACHE_DIR) / f"{text_hash}.mp3"
+    cache_path = tts_cache_path(text)
 
     # 缓存命中时校验文件大小，空文件视为损坏，删除后重新合成
     if cache_path.exists():
@@ -410,10 +415,17 @@ def get_tts_file(text: str) -> str:
     for attempt in range(1, TTS_MAX_RETRIES + 1):
         logger.info(f"合成语音 (第{attempt}/{TTS_MAX_RETRIES}次): {text}")
         try:
+            # 捕获子线程内的真实异常（threading 不向外传播异常），
+            # 否则失败原因被吞掉，无从判断是超时/403/DNS等问题
+            syn_error = []
+
             def _syn_thread():
                 async def _syn():
                     await edge_tts.Communicate(text, TTS_VOICE).save(str(cache_path))
-                asyncio.run(_syn())
+                try:
+                    asyncio.run(_syn())
+                except Exception as e:
+                    syn_error.append(f"{type(e).__name__}: {e}")
 
             t = threading.Thread(target=_syn_thread)
             t.start()
@@ -427,7 +439,8 @@ def get_tts_file(text: str) -> str:
             elif cache_path.exists() and cache_path.stat().st_size > 0:
                 return str(cache_path)
             else:
-                logger.warning(f"TTS合成失败或文件为空 (第{attempt}次)")
+                reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
+                logger.warning(f"TTS合成失败或文件为空 (第{attempt}次): {reason}")
         except Exception as e:
             logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
 
@@ -468,6 +481,53 @@ def prepare_next_tts():
             removed += 1
     if removed:
         logger.info(f"清理过期TTS缓存: 删除 {removed} 个超过 {CACHE_EXPIRE_DAYS} 天的文件")
+
+
+def get_upcoming_announce_times(now: datetime.datetime, hours: int = TTS_PREFILL_HOURS):
+    """枚举 now 之后 hours 小时内的全部准点播报时刻"""
+    end = now + datetime.timedelta(hours=hours)
+    t = now.replace(minute=0, second=0, microsecond=0)
+    slots = []
+    while t <= end:
+        if t > now and ANNOUNCE_START_HOUR <= t.hour <= ANNOUNCE_END_HOUR and t.minute in (0, 30):
+            slots.append(t)
+        t += datetime.timedelta(minutes=30)
+    return slots
+
+
+def tts_prefill_task():
+    """TTS 蓄水池：预合成未来播报时段缺失的音频。
+
+    播报文本完全由日期+时间决定，可提前计算。edge-tts 网络故障具有
+    突发性（常持续数分钟到数小时），把合成提前到更早的时间窗口并
+    每小时补充一次，准点播报就不再依赖播报时刻的网络状态；
+    只有连续超过一天的网络中断才可能影响播报。
+    """
+    now = datetime.datetime.now()
+    slots = get_upcoming_announce_times(now)
+    synthesized, still_missing = 0, []
+    for slot in slots:
+        # 预热/播报任务入队时立即让位，绝不阻塞准点流程
+        if not task_queue.empty():
+            logger.info("TTS蓄水池：检测到待执行任务，本轮提前结束，剩余时段下次继续补充")
+            break
+        text = get_announce_text(slot)
+        cache_path = tts_cache_path(text)
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            continue  # 已备好
+        if get_tts_file(text):
+            synthesized += 1
+        else:
+            still_missing.append(slot.strftime("%m-%d %H:%M"))
+
+    if synthesized or still_missing:
+        summary = f"TTS蓄水池：本轮新合成 {synthesized} 个"
+        if still_missing:
+            preview = "、".join(still_missing[:5]) + ("..." if len(still_missing) > 5 else "")
+            summary += f"，剩余缺口 {len(still_missing)} 个（{preview}），将持续重试"
+        logger.info(summary)
+        if still_missing:
+            logger.warning(f"TTS蓄水池仍有 {len(still_missing)} 个时段未备好，若到播报时仍未成功将现场重试")
 
 
 def is_logged_in() -> bool:
@@ -699,6 +759,9 @@ def schedule_announce():
 def schedule_pre_refresh():
     task_queue.put("pre_refresh")
 
+def schedule_tts_prefill():
+    task_queue.put("tts_prefill")
+
 if __name__ == "__main__":
     try:
         # 交互模式：阻塞式，按回车播报，不进入调度
@@ -766,7 +829,18 @@ if __name__ == "__main__":
                 minute="0,30",
                 second=0
             )
+            # TTS 蓄水池：每小时补充预合成未来时段缺失的音频，
+            # 让准点播报不依赖播报时刻的 edge-tts 网络状态
+            scheduler.add_job(
+                schedule_tts_prefill,
+                "cron",
+                minute="5",
+                second=0
+            )
             scheduler.start()
+
+            # 启动即补充一次蓄水池（首次部署/缓存清空后尽快备好音频）
+            task_queue.put("tts_prefill")
 
             logger.info(f"自动播报服务启动成功，每日 {ANNOUNCE_START_HOUR}:00 ~ {ANNOUNCE_END_HOUR}:30 每半小时播报一次")
             logger.info(f"预热规则：XX:00 / XX:30 准时播报；每次播报前一分钟（XX:29 / XX:59）自动刷新页面重置音频链路，每天首次播报由 {first_pre_refresh_hour}:59 预热")
@@ -780,6 +854,8 @@ if __name__ == "__main__":
                         close_browser()  # 播报完毕关闭浏览器，空闲期间不占CPU
                     elif task == "pre_refresh":
                         refresh_page_reinit()
+                    elif task == "tts_prefill":
+                        tts_prefill_task()
                 except Exception as e:
                     logger.error(f"队列任务执行异常 task={task}: {str(e)}", exc_info=True)
                 finally:
