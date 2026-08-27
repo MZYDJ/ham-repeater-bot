@@ -35,8 +35,8 @@ WECHAT_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_
 # ====================== 播报调度参数 ======================
 # 控制播报的时间范围和频率，按需调整
 
-ANNOUNCE_START_HOUR = 6          # 每日起始播报时（24h 制），例如 6 表示早 6 点开始
-ANNOUNCE_END_HOUR = 22           # 每日结束播报时（24h 制），例如 22 表示晚 10 点后停止
+ANNOUNCE_START_HOUR = 6          # 每日首次播报时刻（24h 制），例如 6 表示早 6:00 开始播报
+ANNOUNCE_END_HOUR = 22           # 每日最后一次播报所在小时，例如 22 表示晚 22:30 为最后一次播报
                                  # 播报频率：每半小时一次（XX:00 和 XX:30）
 
 # ==========================================================
@@ -72,6 +72,7 @@ PAGE_LOAD_TIMEOUT = 15000       # 页面加载超时（ms）
 # --- 浏览器 ---
 HEADLESS_MODE = True            # 浏览器无头模式，True=无界面运行，False=显示浏览器窗口（调试用）
 USER_DATA_DIR = r"/app/edge_user_data"  # 浏览器数据目录（保存登录态，勿手动清理）
+BROWSER_MAX_AGE_SEC = 30 * 60   # 浏览器连续运行超过该时长（秒）后，预热时强制关闭重建，防止闲置过久后音频链路失效
 
 # --- 存储路径 ---
 CACHE_DIR = r"/app/tts_cache"   # TTS 缓存目录
@@ -163,6 +164,7 @@ logger.addHandler(_wechat_handler)
 page = None
 playwright_instance = None
 context = None
+_browser_opened_at = None  # init_browser() 完成时刻，用于判断浏览器是否闲置过久
 task_queue = queue.Queue()
 WEEKDAY_MAP = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 
@@ -509,11 +511,18 @@ def refresh_page_reinit():
     """播报前打开浏览器 + 页面预热 + 预合成TTS"""
     logger.info("===== 执行播报前置页面刷新重置 =====")
     try:
+        browser_age = time.time() - _browser_opened_at if _browser_opened_at else 0
         if page is None or context is None:
             # 浏览器未就绪（首次启动或上次播报后已关闭），重新初始化
             init_browser()
+        elif browser_age > BROWSER_MAX_AGE_SEC:
+            # 浏览器已连续运行过久（如服务在夜间重启后一直闲置到早上），
+            # 页面内部 websocket/音频链路状态不可信，强制关闭重建
+            logger.info(f"浏览器已连续运行 {browser_age / 3600:.1f} 小时，关闭重建")
+            close_browser()
+            init_browser()
         else:
-            # 浏览器仍在运行（非29/59时间点启动的情况），刷新页面即可
+            # 浏览器仍在运行且不够久（服务刚启动不久的情况），刷新页面即可
             logger.info("浏览器已在运行，刷新页面")
             page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
             time.sleep(2)
@@ -622,7 +631,7 @@ def announce_task():
 
    
 def init_browser():
-    global page, playwright_instance, context
+    global page, playwright_instance, context, _browser_opened_at
     logger.info("初始化常驻浏览器...")
     Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -680,6 +689,7 @@ def init_browser():
         logger.info("检测到已登录状态，直接进入对讲")
         
     logger.info("浏览器初始化完成")
+    _browser_opened_at = time.time()
 
 
 # ========== 调度任务分发函数 ==========
@@ -726,11 +736,27 @@ if __name__ == "__main__":
                 
             # 后台调度器
             scheduler = BackgroundScheduler(timezone="Asia/Shanghai", daemon=True)
+            # 每日首次播报前的预热小时：START 为 0 时需回绕到前一日 23 点（跨天取模）
+            first_pre_refresh_hour = (ANNOUNCE_START_HOUR - 1) % 24
+            # XX:59 预热覆盖的小时列表（START-1 至 END-1，支持 START=0 时 23 点回绕）
+            pre_refresh_hours_59 = ",".join(str(h % 24) for h in range(ANNOUNCE_START_HOUR - 1, ANNOUNCE_END_HOUR))
+            # 预热任务一：XX:30 播报前一分钟（XX:29）预热，覆盖时段内每个半点
             scheduler.add_job(
                 schedule_pre_refresh,
                 "cron",
                 hour=f"{ANNOUNCE_START_HOUR}-{ANNOUNCE_END_HOUR}",
-                minute="29,59",
+                minute="29",
+                second=0
+            )
+            # 预热任务二：XX:00 播报前一分钟（前一小时 XX:59）预热，覆盖时段内每个整点。
+            # 其中 (START-1):59 保证每天首次播报前浏览器/音频链路/TTS 都是新鲜就绪的，
+            # 不再拿着前一夜闲置的页面直接播报；同时 END:59 不再预热（其后已无播报），
+            # 最后一次播报结束后浏览器保持关闭，整夜不空转。
+            scheduler.add_job(
+                schedule_pre_refresh,
+                "cron",
+                hour=pre_refresh_hours_59,
+                minute="59",
                 second=0
             )
             scheduler.add_job(
@@ -742,8 +768,8 @@ if __name__ == "__main__":
             )
             scheduler.start()
 
-            logger.info(f"自动播报服务启动成功，每日 {ANNOUNCE_START_HOUR}:00 ~ {ANNOUNCE_END_HOUR}:00 每半小时播报一次")
-            logger.info("预热规则：XX:29 / XX:59 自动刷新页面重置音频链路；XX:00 / XX:30 准时播报")
+            logger.info(f"自动播报服务启动成功，每日 {ANNOUNCE_START_HOUR}:00 ~ {ANNOUNCE_END_HOUR}:30 每半小时播报一次")
+            logger.info(f"预热规则：XX:00 / XX:30 准时播报；每次播报前一分钟（XX:29 / XX:59）自动刷新页面重置音频链路，每天首次播报由 {first_pre_refresh_hour}:59 预热")
 
             # 主线程循环：队列串行执行所有页面操作（必须单线程操作Playwright）
             while True:
