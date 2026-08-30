@@ -4,14 +4,18 @@ services:
     build:
       context: .
       args:
-        BUILD_TIME: "2026-07-11"
+        BUILD_TIME: "2026-08-30"
     image: announce:latest
 
     restart: unless-stopped
-    shm_size: "256m"
 
     environment:
       - TZ=Asia/Shanghai
+      # 滔滔链路账号（必填）
+      - TALK_USERNAME=YOUR_TALK_USERNAME
+      - TALK_PASSWORD=YOUR_TALK_PASSWORD
+      # 企业微信告警 Webhook（可选，留空禁用告警推送）
+      - WECHAT_WEBHOOK_URL=
 
     volumes:
       - ./:/app  # 项目目录挂载到容器

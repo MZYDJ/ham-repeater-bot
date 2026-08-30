@@ -1,9 +1,12 @@
+import os
 import sys
 import time
 import hashlib
 import logging
 import logging.handlers
 import datetime
+import gc
+import ctypes
 import asyncio
 import threading
 import queue
@@ -12,92 +15,52 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from apscheduler.schedulers.background import BackgroundScheduler
-from playwright.sync_api import sync_playwright
 import edge_tts
-import base64
+import contextlib
+import direct_announce
 
-# ====================== 用户必填配置 ======================
-# 以下配置项必须根据你的实际情况修改，否则服务无法正常运行
+# ====================== 配置项 ======================
+# 滔滔链路账号：优先读环境变量（推荐 compose 的 environment 段配置），
+# 也可直接改为你的账号密码常量
+TALK_USERNAME = os.environ.get("TALK_USERNAME", "")
+TALK_PASSWORD = os.environ.get("TALK_PASSWORD", "")
+TTS_VOICE = "zh-CN-XiaoxiaoNeural"
 
-TALK_USERNAME = "YOUR_TALK_USERNAME"            # 滔滔链路登录账号
-TALK_PASSWORD = "YOUR_TALK_PASSWORD"            # 滔滔链路登录密码
+# 播报内容配置
+ANNOUNCE_TEMPLATE = "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是咸阳市业余无线电中继台B阿九AB，本中继下行频率 4三9.625 兆赫，上行频率 4三2.575 兆赫，叉频 负 7.05 兆赫。单上行接入亚音为模拟 88.5 赫兹。请规范用频，保持信道畅通。完毕"
+ANNOUNCE_TEMPLATE = "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是咸阳市业余无线电中继台B阿九AB，本中继下行频率 4三9.6875 兆赫，上行频率 4三4.4875 兆赫，叉频 负 5.2 兆赫。单上行接入亚音为模拟 88.5 赫兹。请规范用频，保持信道畅通。完毕"
+ANNOUNCE_START_HOUR = 7    # 每日首次播报 x:00
+ANNOUNCE_END_HOUR = 22     # 每日最后一次播报 x:30
 
-# 播报内容模板，根据你的中继台信息修改（呼号、频率、亚音等）
-# 可用变量：{year} {month} {day} {weekday} {hour} {minute_text}
-ANNOUNCE_TEMPLATE = "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是YOUR_CALLSIGN，本中继下行频率 XXX.XXX 兆赫，上行频率 XXX.XXX 兆赫，叉频 负 X.XX 兆赫。单上行接入亚音为模拟 XXX.X 赫兹。请规范用频，保持信道畅通。完毕"
+# 缓存与时序配置
+CACHE_DIR = r"/app/tts_cache"
+LOG_MAX_BYTES = 0.25 * 1024 * 1024  # 日志轮转：单文件最大 0.25MB
+LOG_BACKUP_COUNT = 40              # 保留最近 40 个备份
+CACHE_EXPIRE_DAYS = 2             # TTS 缓存过期天数
+TTS_PREFILL_HOURS = 48            # TTS 蓄水池提前量：预合成未来该时长内所有播报时段的音频
+NATIVE_PREP_LEAD = 2.5            # 直连预建链提前量：准点前该秒数建链+登录
+                                  # （实测建链~1s，空闲仅~1s 无需保活）
+NATIVE_MIC_LEAD = 0.5             # 抢麦提前量：准点前该秒数才发起抢麦（不提前占麦，
+                                  # 避免频道长时间"说话中"静默）；抢麦响应~1.1s，
+                                  # 首包≈准点+1.1s，UserTalking→首包 0.5s 官方时序由 play() 保证
 
-# 企业微信群机器人 Webhook（可选，不需要告警可留空）
-WECHAT_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WEBHOOK_KEY"
-
-# ==========================================================
-
-
-# ====================== 播报调度参数 ======================
-# 控制播报的时间范围和频率，按需调整
-
-ANNOUNCE_START_HOUR = 6          # 每日首次播报时刻（24h 制），例如 6 表示早 6:00 开始播报
-ANNOUNCE_END_HOUR = 22           # 每日最后一次播报所在小时，例如 22 表示晚 22:30 为最后一次播报
-                                 # 播报频率：每半小时一次（XX:00 和 XX:30）
-
-# ==========================================================
-
-
-# ====================== 高级配置（一般无需修改） ======================
-# 以下参数已有合理默认值，仅在需要微调时修改
-
-# --- 滔滔链路页面 ---
-TALK_URL = "https://totalkd.allptt.com:1443/"  # 滔滔链路 Web 端地址（平台更新时可能变更）
-PTT_SELECTOR = "#imagePtt_div"                  # PTT 按钮 CSS 选择器（页面改版时需更新）
-LOGIN_BTN_SELECTOR = "#loginUI > div.container > div > div > div > form > div:nth-child(7) > div > div.col-xs-12 > input"  # 登录按钮 CSS 选择器
-
-# --- TTS 语音合成 ---
-TTS_VOICE = "zh-CN-XiaoxiaoNeural"             # Edge-TTS 语音角色（可选：zh-CN-YunxiNeural 等）
-TTS_SYNTH_TIMEOUT = 30                          # 单次合成超时（秒）
-TTS_MAX_RETRIES = 3                             # 合成失败最大重试次数
-TTS_RETRY_DELAY = 5.0                           # 重试间隔（秒）
-CACHE_EXPIRE_DAYS = 7                           # TTS 缓存文件过期天数，过期自动清理
-TTS_PREFILL_HOURS = 36                          # TTS 蓄水池提前量（小时）：预合成未来该时长内所有播报时段的音频
-
-# --- 音频链路 ---
-AUDIO_SAMPLE_RATE = 24000       # 虚拟麦克风采样率（Hz），需与滔滔链路音频参数匹配
-MIC_GAIN = 1.5                  # 虚拟麦克风播报音量增益，>1 放大，<1 缩小
-LEVEL_CHECK_THRESHOLD = 10      # 电平检测通过阈值（0-255），低于此值视为无音频输出
-LEVEL_CHECK_ROUNDS = 5          # 电平检测最大轮数，连续检测均低于阈值则告警
-PTT_BUFFER_OFFSET = 0.6         # PTT 提前释放时间（秒），抵消 WebRTC 音频缓冲延迟
-
-# --- PTT 与时序 ---
-PTT_PRESS_DELAY = 800           # PTT 按下后等待时间（ms），确保中继台已响应
-REFRESH_WAIT_SEC = 6            # 页面刷新后等待时间（秒），让音频链路和 WebSocket 稳定
-PAGE_LOAD_TIMEOUT = 15000       # 页面加载超时（ms）
-
-# --- 浏览器 ---
-HEADLESS_MODE = True            # 浏览器无头模式，True=无界面运行，False=显示浏览器窗口（调试用）
-USER_DATA_DIR = r"/app/edge_user_data"  # 浏览器数据目录（保存登录态，勿手动清理）
-BROWSER_MAX_AGE_SEC = 30 * 60   # 浏览器连续运行超过该时长（秒）后，预热时强制关闭重建，防止闲置过久后音频链路失效
-
-# --- 存储路径 ---
-CACHE_DIR = r"/app/tts_cache"   # TTS 缓存目录
-LOG_DIR = r"/app/logs"          # 日志目录
-
-# --- 日志 ---
-LOG_MAX_BYTES = 0.25 * 1024 * 1024  # 单个日志文件最大大小（字节），达到后自动轮转
-LOG_BACKUP_COUNT = 40               # 保留的历史日志文件数量
-
-# --- 企业微信告警级别 ---
+# 企业微信 Webhook 推送配置
+# Webhook 地址（企业微信群机器人）；为空时自动禁用告警推送
+WECHAT_WEBHOOK_URL = os.environ.get("WECHAT_WEBHOOK_URL", "")
+# 日志推送级别：WARNING=仅告警+错误, ERROR=仅错误
 # 可选值：logging.INFO / logging.WARNING / logging.ERROR
-WEBHOOK_LOG_LEVEL = logging.WARNING  # WARNING=仅告警和错误推送，ERROR=仅错误推送
-
-# ==================================================================
+WEBHOOK_LOG_LEVEL = logging.WARNING
+# ======================================================
 
 # 日志初始化（轮转日志，防止单文件撑满磁盘）
 Path(CACHE_DIR).mkdir(parents=True, exist_ok=True)
-Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+Path(r"/app/logs").mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.handlers.RotatingFileHandler(
-            str(Path(LOG_DIR) / "daemon.log"),
+            r"/app/logs/daemon.log",
             maxBytes=LOG_MAX_BYTES,
             backupCount=LOG_BACKUP_COUNT,
             encoding="utf-8"
@@ -156,225 +119,14 @@ class WeChatWebhookHandler(logging.Handler):
 
 # 注册 Webhook Handler，推送级别由 WEBHOOK_LOG_LEVEL 控制
 # 如需调整推送级别，修改上方 WEBHOOK_LOG_LEVEL 即可，无需改动以下代码
-_wechat_handler = WeChatWebhookHandler(WECHAT_WEBHOOK_URL, level=WEBHOOK_LOG_LEVEL)
-_wechat_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-logger.addHandler(_wechat_handler)
+if WECHAT_WEBHOOK_URL:
+    _wechat_handler = WeChatWebhookHandler(WECHAT_WEBHOOK_URL, level=WEBHOOK_LOG_LEVEL)
+    _wechat_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
+    logger.addHandler(_wechat_handler)
 # ======================================================================
 
-# 全局对象
-page = None
-playwright_instance = None
-context = None
-_browser_opened_at = None  # init_browser() 完成时刻，用于判断浏览器是否闲置过久
 task_queue = queue.Queue()
 WEEKDAY_MAP = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
-
-def setup_virtual_mic(context):
-    """
-    稳定运行版：永久保活上下文 + 真实电平检测
-    解决长时间闲置后首次播报无声的问题
-    """
-    js_template = """
-    (() => {
-        // ========== 播报期间主线程开销抑制 ==========
-        window.__playbackActive = false;
-        const _origLog = console.log.bind(console);
-        const _origWarn = console.warn.bind(console);
-        const _origDebug = console.debug.bind(console);
-        console.log = function(...args) {
-            if (!window.__playbackActive) _origLog(...args);
-        };
-        console.warn = function(...args) {
-            if (!window.__playbackActive) _origWarn(...args);
-        };
-        console.debug = function(...args) {
-            if (!window.__playbackActive) _origDebug(...args);
-        };
-
-        // ========== 全局 AudioContext 接管与唤醒 ==========
-        const _OriginalAudioContext = window.AudioContext || window.webkitAudioContext;
-        const allAudioContexts = new Set();
-
-        window.AudioContext = function(...args) {
-            const ctx = new _OriginalAudioContext(...args);
-            allAudioContexts.add(ctx);
-            return ctx;
-        };
-        window.AudioContext.prototype = _OriginalAudioContext.prototype;
-        if (window.webkitAudioContext) {
-            window.webkitAudioContext = window.AudioContext;
-        }
-
-        function resumeAllContexts() {
-            if (window.__playbackActive) return; // 播报期间跳过，减少主线程开销
-            allAudioContexts.forEach(ctx => {
-                if (ctx.state === 'suspended') ctx.resume();
-            });
-        }
-
-        document.addEventListener('mousedown', () => { try { resumeAllContexts(); } catch(e) {} }, true);
-        setInterval(resumeAllContexts, 1000);
-
-        // ========== 全局虚拟麦克风（保活版） ==========
-        let virtualCtx = null;
-        let virtualStream = null;
-        let gainNode = null;       // 主音量节点
-        let analyser = null;       // 真实电平检测
-        let sourceNode = null;     // 播报音频源
-        let audioBuffer = null;
-        const mainGain = __MIC_GAIN__;  // 播报音量（由配置项 MIC_GAIN 控制）
-
-        function ensureVirtualMic() {
-            if (virtualStream) return virtualStream;
-
-            virtualCtx = new _OriginalAudioContext({ sampleRate: __AUDIO_SAMPLE_RATE__ });
-            allAudioContexts.add(virtualCtx);
-
-            // 输出流目标
-            const dest = virtualCtx.createMediaStreamDestination();
-            virtualStream = dest.stream;
-
-            // 主增益节点
-            gainNode = virtualCtx.createGain();
-            gainNode.gain.value = mainGain;
-            gainNode.connect(dest);
-
-            // 真实电平分析器
-            analyser = virtualCtx.createAnalyser();
-            analyser.fftSize = 256;
-            gainNode.connect(analyser);
-
-            // 启用音频轨道（track 一旦启用不会被浏览器自动关闭，无需定时重复设置）
-            virtualStream.getAudioTracks().forEach(track => {
-                track.enabled = true;
-            });
-            
-            console.log('[虚拟麦] 初始化完成');
-            return virtualStream;
-        }
-
-        // ========== 播放控制接口 ==========
-        async function loadAudio(base64Str) {
-            ensureVirtualMic();
-            
-            const binaryStr = atob(base64Str);
-            const bytes = new Uint8Array(binaryStr.length);
-            for (let i = 0; i < binaryStr.length; i++) {
-                bytes[i] = binaryStr.charCodeAt(i);
-            }
-            audioBuffer = await virtualCtx.decodeAudioData(bytes.buffer);
-            console.log(`[虚拟麦] 音频加载完成：时长${audioBuffer.duration.toFixed(2)}s`);
-            return audioBuffer.duration;
-        }
-
-        function play() {
-            if (!audioBuffer) throw new Error('音频未加载');
-            ensureVirtualMic();
-            resumeAllContexts();
-
-            // 停止上一次播报
-            stop();
-
-            // 创建播报源，接入主增益链路
-            sourceNode = virtualCtx.createBufferSource();
-            sourceNode.buffer = audioBuffer;
-            sourceNode.connect(gainNode);
-            sourceNode.start(0);
-
-            sourceNode.onended = () => {
-                console.log('[虚拟麦] 播报音频播放结束');
-                sourceNode = null;
-            };
-
-            console.log('[虚拟麦] 开始播报');
-            return audioBuffer.duration;
-        }
-
-        function stop() {
-            if (sourceNode) {
-                try { sourceNode.stop(); } catch(e) {}
-                try { sourceNode.disconnect(); } catch(e) {}
-                sourceNode = null;
-            }
-        }
-
-        // 真实电平检测（0-255）
-        function getLevel() {
-            if (!analyser) return 0;
-            const data = new Uint8Array(analyser.frequencyBinCount);
-            analyser.getByteFrequencyData(data);
-            return data.reduce((a,b) => a+b, 0) / data.length;
-        }
-
-        // ========== 劫持 ScriptProcessorNode，强制加大 buffer 减少回调频率 ==========
-        // 网站用 960 采样点（40ms/次@24kHz=25次/秒），改为 8192（341ms/次=3次/秒）
-        function _patchScriptProcessor(proto) {
-            // 劫持 createScriptProcessor（标准 API）
-            const _orig = proto.createScriptProcessor;
-            if (_orig) {
-                proto.createScriptProcessor = function(bufferSize, numberOfInputChannels, numberOfOutputChannels) {
-                    const origBuf = bufferSize;
-                    bufferSize = Math.max(bufferSize, 16384);
-                    if (bufferSize !== origBuf) {
-                        _origLog(`[优化] ScriptProcessorNode buffer: ${origBuf} → ${bufferSize}`);
-                    }
-                    return _orig.call(this, bufferSize, numberOfInputChannels, numberOfOutputChannels);
-                };
-            }
-            // 劫持 createJavaScriptNode（旧版 API，部分网站仍在用）
-            const _origJ = proto.createJavaScriptNode;
-            if (_origJ) {
-                proto.createJavaScriptNode = function(bufferSize, numberOfInputChannels, numberOfOutputChannels) {
-                    const origBuf = bufferSize;
-                    bufferSize = Math.max(bufferSize, 16384);
-                    if (bufferSize !== origBuf) {
-                        _origLog(`[优化] JavaScriptNode buffer: ${origBuf} → ${bufferSize}`);
-                    }
-                    return _origJ.call(this, bufferSize, numberOfInputChannels, numberOfOutputChannels);
-                };
-            }
-        }
-        _patchScriptProcessor(_OriginalAudioContext.prototype);
-        _patchScriptProcessor(window.AudioContext.prototype);
-        _origLog(`[优化] ScriptProcessorNode buffer 劫持已注入 (min=16384)`);
-
-        // ========== 劫持麦克风 API ==========
-        const _origGetUserMedia = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-        const _origEnumerate = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-
-        navigator.mediaDevices.getUserMedia = async function(constraints) {
-            if (constraints?.audio) {
-                const stream = ensureVirtualMic();
-                resumeAllContexts();
-                return stream;
-            }
-            return _origGetUserMedia(constraints);
-        };
-
-        navigator.mediaDevices.enumerateDevices = async function() {
-            const list = await _origEnumerate();
-            const filtered = list.filter(d => d.kind !== 'audioinput');
-            filtered.push(
-                { deviceId: 'default', label: 'Virtual Microphone', kind: 'audioinput', groupId: 'virtual' },
-                { deviceId: 'virtual-mic-0', label: 'Virtual Microphone', kind: 'audioinput', groupId: 'virtual' }
-            );
-            return filtered;
-        };
-
-        // 强制确保 MediaStream track 启用（浏览器重启后 track 可能被自动 disable）
-        function ensureTrackEnabled() {
-            if (!virtualStream) return false;
-            const tracks = virtualStream.getAudioTracks();
-            tracks.forEach(t => { t.enabled = true; });
-            return tracks.length > 0 && tracks.every(t => t.enabled);
-        }
-
-        window.__virtualMic = { loadAudio, play, stop, getLevel, ensureTrackEnabled };
-    })();
-    """
-    # 将 Python 配置注入 JS 模板
-    js_code = js_template.replace("__MIC_GAIN__", str(MIC_GAIN)).replace("__AUDIO_SAMPLE_RATE__", str(AUDIO_SAMPLE_RATE))
-    context.add_init_script(js_code)
 
 def format_minute_text(minute: int) -> str:
     if minute == 0:
@@ -401,7 +153,7 @@ def tts_cache_path(text: str) -> Path:
     return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
 
 
-def get_tts_file(text: str) -> str:
+def get_tts_file(text: str, max_retries: int = 3, retry_delay: float = 5.0) -> str:
     """TTS合成，子线程隔离事件循环。含文件完整性校验 + 超时重试"""
     cache_path = tts_cache_path(text)
 
@@ -412,8 +164,8 @@ def get_tts_file(text: str) -> str:
         logger.warning(f"TTS缓存文件为空（损坏），将重新合成: {cache_path.name}")
         cache_path.unlink()
 
-    for attempt in range(1, TTS_MAX_RETRIES + 1):
-        logger.info(f"合成语音 (第{attempt}/{TTS_MAX_RETRIES}次): {text}")
+    for attempt in range(1, max_retries + 1):
+        logger.info(f"合成语音 (第{attempt}/{max_retries}次): {text}")
         try:
             # 捕获子线程内的真实异常（threading 不向外传播异常），
             # 否则失败原因被吞掉，无从判断是超时/403/DNS等问题
@@ -423,13 +175,15 @@ def get_tts_file(text: str) -> str:
                 async def _syn():
                     await edge_tts.Communicate(text, TTS_VOICE).save(str(cache_path))
                 try:
-                    asyncio.run(_syn())
+                    # 内层超时比外层 join 超时短 2 秒，让取消先落地、线程必定退出：
+                    # 否则 websocket 挂死时线程会带着事件循环和连接永久滞留进程内（内存泄漏）
+                    asyncio.run(asyncio.wait_for(_syn(), timeout=28))
                 except Exception as e:
                     syn_error.append(f"{type(e).__name__}: {e}")
 
-            t = threading.Thread(target=_syn_thread)
+            t = threading.Thread(target=_syn_thread, daemon=True)
             t.start()
-            t.join(timeout=TTS_SYNTH_TIMEOUT)
+            t.join(timeout=30)  # 最多等30秒（兜底安全网）
 
             if t.is_alive():
                 logger.warning(f"TTS合成超时 (第{attempt}次)")
@@ -444,24 +198,23 @@ def get_tts_file(text: str) -> str:
         except Exception as e:
             logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
 
-        if attempt < TTS_MAX_RETRIES:
-            logger.info(f"等待 {TTS_RETRY_DELAY} 秒后重试...")
-            time.sleep(TTS_RETRY_DELAY)
+        if attempt < max_retries:
+            logger.info(f"等待 {retry_delay} 秒后重试...")
+            time.sleep(retry_delay)
 
-    logger.error(f"TTS合成最终失败，已重试 {TTS_MAX_RETRIES} 次")
+    logger.error(f"TTS合成最终失败，已重试 {max_retries} 次")
     return ""
 
 
 def prepare_next_tts():
     """预合成下一次准点播报的TTS音频，供播报时直接使用。顺便清理过期缓存。"""
     now = datetime.datetime.now()
-    if now.minute < 30:
-        # XX:29 预刷新 → 下一次播报是 XX:30
-        next_time = now.replace(minute=30, second=0, microsecond=0)
-    else:
-        # XX:59 预刷新 → 下一次播报是 XX+1:00
-        next_hour = now + datetime.timedelta(hours=1)
-        next_time = next_hour.replace(minute=0, second=0, microsecond=0)
+    # 按调度规则取下一场真实播报：播报时段外/跨天时自动指向次日首场，
+    # 不再为不存在的时段（如 22:30 之后算出的 23:00）白做合成
+    slots = get_upcoming_announce_times(now)
+    if not slots:
+        return
+    next_time = slots[0]
 
     announce_text = get_announce_text(next_time)
     logger.info(f"预合成下一次播报音频: {next_time.strftime('%H:%M')}")
@@ -530,80 +283,175 @@ def tts_prefill_task():
             logger.warning(f"TTS蓄水池仍有 {len(still_missing)} 个时段未备好，若到播报时仍未成功将现场重试")
 
 
-def is_logged_in() -> bool:
+def trim_python_memory():
+    """主动归还内存给操作系统：回收循环引用 + glibc 碎片整理。
+
+    每个播报周期都会创建/销毁大量临时对象（音频包缓冲、
+    合成/webhook线程等），glibc 各线程 arena 的空闲内存默认不归还
+    操作系统，长跑容器表现为 RSS 只涨不降的"疑似内存泄漏"。
+    """
+    gc.collect()
     try:
-        return page.locator(PTT_SELECTOR).is_visible(timeout=2000)
-    except:
-        return False
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass  # 非 glibc 平台（如 musl）无此函数，忽略
 
 
-def auto_login():
-    """自动登录，仅主线程调用"""
-    logger.info("检测到未登录，执行自动登录")
-    page.wait_for_selector("#username", timeout=5000)
-    page.locator("#username").first.fill(TALK_USERNAME)
-    page.locator("#pwd").first.fill(TALK_PASSWORD)
-    page.locator(LOGIN_BTN_SELECTOR).first.click()
-    page.locator(PTT_SELECTOR).wait_for(state="visible", timeout=30000)
-    logger.info("自动登录成功")
-    time.sleep(2)
+def prewarm_task():
+    """播报前一分钟预热：预合成TTS + 预构建音频包 + 临近准点预建链抢麦"""
+    logger.info("预热：预合成TTS+预构建音频+预建链")
+    prepare_next_tts()
+    _native_prewarm()
 
-def close_browser():
-    """关闭浏览器释放资源，播报间歇期间不占用 CPU"""
-    global page, context, playwright_instance
-    try:
-        if context:
-            context.close()
-    except:
+
+def schedule_prewarm():
+    """定时入队：播报前一分钟预热"""
+    task_queue.put("prewarm")
+
+
+# ====================== 直连模式播报（native） ======================
+class _StdoutToLogger:
+    """把 direct_announce 的 print 诊断重定向进 logger（进 daemon.log + 企业微信告警链路）"""
+    def write(self, s):
+        s = s.rstrip()
+        if s:
+            logger.info("[直连] " + s)
+
+    def flush(self):
         pass
+
+
+# 预建链状态（预热任务写入，准点播报消费）
+_native_session = None     # direct_announce.DirectAnnouncer：已登录+已抢麦的会话
+_native_prebuilt = None    # (mp3路径, packets)：预构建的音频包
+_native_session_temp = False  # 预建会话是否临时短链（播完 close；常驻的只 release）
+_native_link = None        # direct_announce.PersistentAnnouncer：常驻直连链路
+
+
+def _native_link_event(kind, detail):
+    """常驻链路事件回调（企业微信告警链路复用 logger 级别）"""
+    if kind == "removed":
+        logger.error(f"[常驻链路] {detail}，退避后自动重连（若正在使用手机属正常互踢）")
+    elif kind == "reconnected":
+        logger.info(f"[常驻链路] {detail}")
+    else:
+        logger.warning(f"[常驻链路] {detail}")
+
+
+def _native_link_start():
+    """启动常驻直连链路（后台 Ping 保活+下行泵）。失败仅告警，播报走兜底。"""
+    global _native_link
+    if _native_link:
+        return
     try:
-        if playwright_instance:
-            playwright_instance.stop()
-    except:
-        pass
-    page = None
-    context = None
-    playwright_instance = None
-    logger.info("浏览器已关闭，释放资源")
-
-
-def refresh_page_reinit():
-    """播报前打开浏览器 + 页面预热 + 预合成TTS"""
-    logger.info("===== 执行播报前置页面刷新重置 =====")
-    try:
-        browser_age = time.time() - _browser_opened_at if _browser_opened_at else 0
-        if page is None or context is None:
-            # 浏览器未就绪（首次启动或上次播报后已关闭），重新初始化
-            init_browser()
-        elif browser_age > BROWSER_MAX_AGE_SEC:
-            # 浏览器已连续运行过久（如服务在夜间重启后一直闲置到早上），
-            # 页面内部 websocket/音频链路状态不可信，强制关闭重建
-            logger.info(f"浏览器已连续运行 {browser_age / 3600:.1f} 小时，关闭重建")
-            close_browser()
-            init_browser()
-        else:
-            # 浏览器仍在运行且不够久（服务刚启动不久的情况），刷新页面即可
-            logger.info("浏览器已在运行，刷新页面")
-            page.reload(wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-            time.sleep(2)
-            if not is_logged_in():
-                auto_login()
-
-        # 预合成下一次播报TTS音频
-        prepare_next_tts()
-
-        # 额外预留时间：给AudioContext、MediaStream完整初始化
-        logger.info(f"等待 {REFRESH_WAIT_SEC} 秒，等待音频链路、websocket稳定建立")
-        time.sleep(REFRESH_WAIT_SEC)
-
-        logger.info("===== 页面刷新预热全部完成，等待准点播报 =====")
+        link = direct_announce.PersistentAnnouncer(
+            username=TALK_USERNAME, password=TALK_PASSWORD,
+            on_event=_native_link_event)
+        link.start()
+        _native_link = link
+        logger.info("常驻直连链路已建立（后台 Ping 保活，服务器画像=长在线用户）")
     except Exception as e:
-        logger.error(f"页面刷新预热异常: {str(e)}", exc_info=True)
-        close_browser()
+        logger.warning(f"常驻链路启动失败（播报时现场建链兜底）: {e}")
 
-def pre_refresh_task():
-    """定时入队：播报前一分钟刷新预热"""
-    task_queue.put("pre_refresh")
+
+def _next_announce_time(now: datetime.datetime) -> datetime.datetime:
+    """下一个准点播报时刻（minute ∈ {0,30}）"""
+    t = now.replace(second=0, microsecond=0)
+    if t.minute < 30:
+        return t.replace(minute=30)
+    return (t + datetime.timedelta(hours=1)).replace(minute=0)
+
+
+def _native_prewarm():
+    """预热阶段（XX:29/XX:59 触发）：
+    1. 预构建下一准点的音频包（省去准点后 ~2.3s 解码编码）
+    2. 临近准点（<70s）：常驻链路健康检查（不健康自动重建）→ 准点前
+       NATIVE_MIC_LEAD 才发起抢麦（不提前占麦）。常驻不可用时退化为临时短链
+       （准点前 NATIVE_PREP_LEAD 建链），再不行留给准点现场流程兜底。
+    启动场景（距准点尚远）只做 1。"""
+    global _native_session, _native_prebuilt, _native_session_temp
+    if _native_session:                      # 上次预热残留（播报未消费等异常），先清理
+        if _native_session_temp:
+            _native_session.close()
+        elif _native_link:
+            _native_link.release()
+        _native_session = None
+    nxt = _next_announce_time(datetime.datetime.now())
+    try:
+        mp3 = get_tts_file(get_announce_text(nxt))
+        if mp3:
+            packets, n = direct_announce.build_audio(mp3)
+            _native_prebuilt = (mp3, packets)
+            logger.info(f"音频预构建完成: {n}帧 {len(packets)}包（{nxt:%H:%M} 播报用）")
+    except Exception as e:
+        logger.warning(f"音频预构建失败（准点现场构建兜底）: {e}")
+        _native_prebuilt = None
+
+    wait = (nxt - datetime.datetime.now()).total_seconds()
+    if wait > 70:                            # 距准点尚远（服务刚启动），无需预建链
+        return
+    # 睡到准点前2.5s再动链路：期间常驻连接由守护线程正常 Ping 保活
+    # （若提前独占，60s 无 Ping 可能被服务器当空闲连接踢掉）
+    time.sleep(max(0, wait - NATIVE_PREP_LEAD))
+    s = None
+    if _native_link:
+        s = _native_link.ensure_session()    # 健康检查/重建（常驻活着则瞬时完成）
+    if s is not None:
+        _native_session_temp = False
+        logger.info("常驻链路就绪（已健康检查）")
+    else:
+        try:                                  # 二级兜底：立即建临时短链
+            s = direct_announce.DirectAnnouncer(
+                username=TALK_USERNAME, password=TALK_PASSWORD)
+            with contextlib.redirect_stdout(_StdoutToLogger()):
+                s.connect()                            # 连接+登录 ~1s
+            _native_session_temp = True
+            logger.info("临时短链预建完成（常驻链路不可用）")
+        except Exception as e:
+            logger.warning(f"临时短链预建失败（准点现场流程兜底）: {e}")
+            s = None
+    if s is None:
+        return
+    _native_session = s
+    try:
+        mic_wait = (nxt - datetime.datetime.now()).total_seconds() - NATIVE_MIC_LEAD
+        if mic_wait > 0:
+            time.sleep(mic_wait)                       # 睡到准点前0.5s才抢麦
+        with contextlib.redirect_stdout(_StdoutToLogger()):
+            s.take_mic()                               # 抢麦+UserTalking（响应~1.1s）
+        logger.info(f"已抢麦，待 {nxt:%H:%M} 准点发包（play 再留 0.5s 建链间隔）")
+    except Exception as e:
+        logger.warning(f"抢麦失败（准点现场流程兜底）: {e}")
+        if _native_session_temp:
+            s.close()
+        elif _native_link:
+            _native_link.release()
+        _native_session = None
+
+
+def _native_play(session, packets):
+    """消费预建会话发包（此刻即准点整）。异常抛给 announce_task 外层统一告警。"""
+    t0 = time.time()
+    with contextlib.redirect_stdout(_StdoutToLogger()):
+        ok = session.play(packets)
+    if ok:
+        logger.info(f"直连播报完成（预建链），耗时 {time.time() - t0:.1f} 秒")
+    else:
+        logger.error("直连播报返回失败")
+
+
+def _announce_native(tts_file: str):
+    """直连播报（现场完整流程，容错兜底）：编码→登录→抢麦→匀速发包→放麦→断开。
+    抛出的异常由 announce_task 外层 except 统一记录并触发企业微信告警。"""
+    t0 = time.time()
+    with contextlib.redirect_stdout(_StdoutToLogger()):
+        ok = direct_announce.announce_once(
+            tts_file, username=TALK_USERNAME, password=TALK_PASSWORD)
+    if ok:
+        logger.info(f"直连播报完成，耗时 {time.time() - t0:.1f} 秒")
+    else:
+        logger.error("直连播报返回失败")
+
 
 def announce_task():
     """播报核心逻辑，仅主线程执行"""
@@ -612,152 +460,34 @@ def announce_task():
     logger.info(f"触发定时播报: {announce_text}")
 
     try:
-        # 浏览器未就绪时当场初始化（页面崩溃等异常的容错）
-        if page is None or context is None:
-            logger.warning("播报时浏览器未就绪，紧急初始化")
-            init_browser()
-
-        if not is_logged_in():
-            auto_login()
-
+        global _native_session, _native_prebuilt, _native_session_temp
         tts_file = get_tts_file(announce_text)
         if not tts_file:
             logger.error("TTS音频文件无效，跳过本次播报")
             return
-
-        ptt_btn = page.locator(PTT_SELECTOR)
-        ptt_btn.wait_for(state="visible", timeout=5000)
-
-        # 按下PTT，沿用Windows成熟写法
-        ptt_btn.dispatch_event("mousedown")
-        logger.info("PTT 已按下")
-        time.sleep(PTT_PRESS_DELAY / 1000)
-
-        # 加载音频
-        with open(tts_file, "rb") as f:
-            audio_b64 = base64.b64encode(f.read()).decode()
-        duration = page.evaluate("b64 => window.__virtualMic.loadAudio(b64)", audio_b64)
-        dur = float(duration)
-        logger.info(f"音频加载完成，时长 {dur:.2f} 秒")
-
-        # 播放前强制启用 track（防止浏览器重启后 track 被自动 disable）
-        track_ok = page.evaluate("() => window.__virtualMic.ensureTrackEnabled()")
-        logger.info(f"MediaStream track 状态: {'启用' if track_ok else '异常'}")
-
-        page.evaluate("() => window.__virtualMic.play()")
-        logger.info("音频开始播放")
-
-        # 播报期间抑制浏览器控制台日志，减少主线程 CDP 通道开销
-        page.evaluate("() => { window.__playbackActive = true; }")
-
-        # 电平检测 + track 状态校验（合并为一次 evaluate 减少主线程开销）
-        for i in range(LEVEL_CHECK_ROUNDS):
-            time.sleep(0.3)
-            status = page.evaluate("() => ({ level: window.__virtualMic.getLevel(), trackOk: window.__virtualMic.ensureTrackEnabled() })")
-            level = status['level']
-            track_ok = status['trackOk']
-            logger.info(f"第 {i+1} 次电平检测: {level:.1f}, track: {'启用' if track_ok else '异常'}")
-            if level > LEVEL_CHECK_THRESHOLD and track_ok:
-                logger.info("[OK] 音频输出正常，track 启用")
-                break
-
-        # ==========关键改动：提前释放PTT，抵消网页WebRTC音频缓冲==========
-        wait_play = max(0.5, dur - PTT_BUFFER_OFFSET)
-        logger.info(f"等待{wait_play:.2f}s后预释放PTT，预留{PTT_BUFFER_OFFSET}s网页缓冲时间")
-        time.sleep(wait_play)
-
-        # 派发松开事件
-        ptt_btn.dispatch_event("mouseup")
-        logger.info("PTT 已预释放")
-
-        # 等待剩余时长结束，让音频完整播放收尾
-        time.sleep(PTT_BUFFER_OFFSET)
-
-        # 播报结束，恢复浏览器控制台日志
-        page.evaluate("() => { window.__playbackActive = false; }")
-        logger.info("播报完整结束")
+        # 预建会话+预构建音频均就绪（预热任务准点前0.5s已发起抢麦，此刻刚完成）
+        # —— play() 内部再留 0.5s 建链间隔后发包，官方时序完整保留
+        if _native_session and _native_prebuilt and _native_prebuilt[0] == tts_file:
+            s, packets = _native_session, _native_prebuilt[1]
+            temp = _native_session_temp
+            _native_session = _native_prebuilt = None   # 先取走，防重入
+            try:
+                _native_play(s, packets)
+            finally:
+                if temp:                       # 临时短链：用完即弃
+                    s.close()
+                elif _native_link:             # 常驻链路：还给守护线程继续保活
+                    _native_link.release()
+            return
+        _announce_native(tts_file)   # 容错兜底：现场完整流程（含 LEAD_DELAY）
 
     except Exception as e:
         logger.error(f"播报流程异常: {str(e)}", exc_info=True)
-        try:
-            page.evaluate("() => { window.__playbackActive = false; }")
-        except:
-            pass
-        try:
-            page.locator(PTT_SELECTOR).dispatch_event("mouseup")
-        except:
-            pass
-
-
-   
-def init_browser():
-    global page, playwright_instance, context, _browser_opened_at
-    logger.info("初始化常驻浏览器...")
-    Path(USER_DATA_DIR).mkdir(parents=True, exist_ok=True)
-
-    playwright_instance = sync_playwright().start()
-    context = playwright_instance.chromium.launch_persistent_context(
-        user_data_dir=USER_DATA_DIR,
-        viewport={"width":320, "height":240},
-        headless=HEADLESS_MODE,
-        permissions=["microphone"],
-        ignore_https_errors=True,
-        args=[
-            # 音频相关
-            "--disable-audio-processing",
-            "--disable-echo-cancellation",
-            "--disable-noise-suppression",
-            "--disable-automatic-gain-control",
-            "--disable-audio-input-device-sandbox",
-            f"--audio-output-sample-rate={AUDIO_SAMPLE_RATE}",
-            f"--audio-input-sample-rate={AUDIO_SAMPLE_RATE}",
-            # 渲染优化（纯音频场景，不需要视觉输出）
-            "--disable-gpu",
-            "--disable-images",
-            "--disable-remote-fonts",
-            "--disable-reading-from-canvas",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-component-extensions-with-background-pages",
-            "--disable-features=IsolateOrigins,site-per-process",
-            "--disable-background-networking",
-            # 安全沙箱
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-        ]
-    )
-
-    # 页面加载前注入虚拟麦克风
-    setup_virtual_mic(context)
-
-    page = context.pages[0] if context.pages else context.new_page()
-
-    # ========== 新增：监听浏览器所有控制台输出，自动写入日志 ==========
-    page.on("console", lambda msg: logger.info(f"[浏览器控制台] {msg.type}: {msg.text}"))
-    page.on("pageerror", lambda err: logger.error(f"[页面报错] {err.message}"))
-
-    page.goto(TALK_URL, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-
-    # 验证注入
-    test_devices = page.evaluate("navigator.mediaDevices.enumerateDevices().then(d => d.filter(x => x.kind==='audioinput'))")
-    logger.info(f"注入验证：识别到麦克风数量 = {len(test_devices)}")
-
-    if not is_logged_in():
-        auto_login()
-        time.sleep(1)
-    else:
-        logger.info("检测到已登录状态，直接进入对讲")
-        
-    logger.info("浏览器初始化完成")
-    _browser_opened_at = time.time()
 
 
 # ========== 调度任务分发函数 ==========
 def schedule_announce():
     task_queue.put("announce")
-
-def schedule_pre_refresh():
-    task_queue.put("pre_refresh")
 
 def schedule_tts_prefill():
     task_queue.put("tts_prefill")
@@ -766,7 +496,6 @@ if __name__ == "__main__":
     try:
         # 交互模式：阻塞式，按回车播报，不进入调度
         if len(sys.argv) > 1 and sys.argv[1] in ("--interactive", "-i"):
-            init_browser()
             logger.info("=== 交互测试模式：按回车播报一次 ===")
             while True:
                 input()
@@ -784,7 +513,6 @@ if __name__ == "__main__":
                     except ValueError:
                         logger.error(f"无效的次数参数: {sys.argv[2]}，应为正整数")
                         sys.exit(1)
-                init_browser()
                 logger.info(f"=== 测试模式：连续播报 {repeat} 次 ===")
                 for i in range(1, repeat + 1):
                     logger.info(f"--- 第 {i}/{repeat} 次播报 ---")
@@ -794,31 +522,26 @@ if __name__ == "__main__":
                 logger.info(f"测试完成，共播报 {repeat} 次，进入正常调度模式")
                 prepare_next_tts()
             else:
-                # 启动时执行一次预刷新（初始化浏览器 + TTS预合成）                                                                                                                 
-                refresh_page_reinit()
-                
+                # 启动时执行一次预热（TTS 预合成 + 常驻链路启动）
+                prewarm_task()
+
             # 后台调度器
             scheduler = BackgroundScheduler(timezone="Asia/Shanghai", daemon=True)
-            # 每日首次播报前的预热小时：START 为 0 时需回绕到前一日 23 点（跨天取模）
-            first_pre_refresh_hour = (ANNOUNCE_START_HOUR - 1) % 24
-            # XX:59 预热覆盖的小时列表（START-1 至 END-1，支持 START=0 时 23 点回绕）
-            pre_refresh_hours_59 = ",".join(str(h % 24) for h in range(ANNOUNCE_START_HOUR - 1, ANNOUNCE_END_HOUR))
             # 预热任务一：XX:30 播报前一分钟（XX:29）预热，覆盖时段内每个半点
             scheduler.add_job(
-                schedule_pre_refresh,
+                schedule_prewarm,
                 "cron",
                 hour=f"{ANNOUNCE_START_HOUR}-{ANNOUNCE_END_HOUR}",
                 minute="29",
                 second=0
             )
             # 预热任务二：XX:00 播报前一分钟（前一小时 XX:59）预热，覆盖时段内每个整点。
-            # 其中 (START-1):59 保证每天首次播报前浏览器/音频链路/TTS 都是新鲜就绪的，
-            # 不再拿着前一夜闲置的页面直接播报；同时 END:59 不再预热（其后已无播报），
-            # 最后一次播报结束后浏览器保持关闭，整夜不空转。
+            # (START-1):59 保证每天首次播报前 TTS/音频/常驻链路都是新鲜就绪的；
+            # END:59 不再预热（其后已无播报），最后一次播报结束后整夜只留常驻链路保活。
             scheduler.add_job(
-                schedule_pre_refresh,
+                schedule_prewarm,
                 "cron",
-                hour=pre_refresh_hours_59,
+                hour=f"{ANNOUNCE_START_HOUR - 1}-{ANNOUNCE_END_HOUR - 1}",
                 minute="59",
                 second=0
             )
@@ -842,30 +565,32 @@ if __name__ == "__main__":
             # 启动即补充一次蓄水池（首次部署/缓存清空后尽快备好音频）
             task_queue.put("tts_prefill")
 
-            logger.info(f"自动播报服务启动成功，每日 {ANNOUNCE_START_HOUR}:00 ~ {ANNOUNCE_END_HOUR}:30 每半小时播报一次")
-            logger.info(f"预热规则：XX:00 / XX:30 准时播报；每次播报前一分钟（XX:29 / XX:59）自动刷新页面重置音频链路，每天首次播报由 {first_pre_refresh_hour}:59 预热")
+            # 常驻直连链路：后台 Ping 保活，播报前健康检查复用
+            _native_link_start()
 
-            # 主线程循环：队列串行执行所有页面操作（必须单线程操作Playwright）
+            logger.info(f"自动播报服务启动成功，每日 {ANNOUNCE_START_HOUR}:00 ~ {ANNOUNCE_END_HOUR}:30 每半小时播报一次")
+            logger.info("客户端：协议直连 totalkd.allptt.com:59638（常驻链路）")
+            logger.info(f"预热规则：XX:00 / XX:30 准时播报；每次播报前一分钟（XX:29 / XX:59）预合成TTS+预构建音频+预建链，每天首次播报由 {ANNOUNCE_START_HOUR - 1}:59 预热")
+
+            # 主线程循环：队列串行执行所有任务
             while True:
                 task = task_queue.get()
                 try:
                     if task == "announce":
                         announce_task()
-                        close_browser()  # 播报完毕关闭浏览器，空闲期间不占CPU
-                    elif task == "pre_refresh":
-                        refresh_page_reinit()
+                        trim_python_memory()  # 回收播报产生的音频缓冲对象
+                    elif task == "prewarm":
+                        prewarm_task()
                     elif task == "tts_prefill":
                         tts_prefill_task()
                 except Exception as e:
                     logger.error(f"队列任务执行异常 task={task}: {str(e)}", exc_info=True)
                 finally:
                     task_queue.task_done()
-        
+
     except KeyboardInterrupt:
         logger.info("接收到停止信号，正在清理资源...")
     finally:
-        if context:
-            context.close()
-        if playwright_instance:
-            playwright_instance.stop()
-        logger.info("服务已停止，登录态已保存")
+        if _native_link:
+            _native_link.stop()
+        logger.info("服务已停止")
