@@ -3,25 +3,6 @@
 """
 滔滔链路直连播报客户端 —— direct_announce.py
 
-管线: mp3 →(libmpg123)→ PCM 48k 单声道 →(libopus 12kbps CBR)→ 30字节/帧
-      → 6帧/包(185B) → 600ms一批5包 → UDPTunnel(ID=1)，抢麦/放麦全自动。
-
-2026-08-29 v10: 预建链只做 connect+login（不提前抢麦——长时间"说话中"静默
-会干扰频道）；抢麦由调用方控制时机（announce.py 在准点前 0.5s 发起），
-LEAD_DELAY 移入 play() 统一保证 UserTalking→首包 0.5s 官方时序。
-v9: DirectAnnouncer 类支持分步（connect/take_mic/play），配合
-announce.py 预热阶段预建链+预构建音频包，使首包恰在准点整发出；凭据改为
-构造函数参数，不再依赖模块级硬编码。v7: UserTalking 与首包之间加 0.5s 间隔
-（官方 App 实测时序）——中继台靠该信令建链，首包紧跟会吞掉开头字。
-v6: 发包节奏改匀速 120ms/包。此前照抄下行抓包的"600ms批5包"上送，
-生产实测手机/中继台都卡顿丢字且卡顿点各自不同——突发让接收端浅 jitter buffer
-溢出/下溢（实时对讲追求低延迟 buffer 很浅，不同设备处理策略不同→卡顿点不同）。
-官方手机上行本是实时编码匀速节奏；600ms 批是下行/无线链路的聚合现象，不能反推
-上行。另加 TCP_NODELAY 禁 Nagle（小包攒发会叠加节奏抖动）。
-v3 定案包格式: [0x20][varint seq][varint len=180] + 180字节Opus = 185字节
-（v1 len 编码 0x81B4→436 倍速；v2 误加上行 session→纯噪声。详见 HANDOFF.md）。
-announce_once() 供 announce.py 调用。
-
 依赖（仅系统库，无需 pip）:
     apt-get install -y libopus0 libmpg123-0
 
@@ -47,14 +28,14 @@ PORT = 59638
 # 平台账号：从环境变量 TALK_USERNAME / TALK_PASSWORD 读取（announce.py 同名配置）
 USERNAME = os.environ.get("TALK_USERNAME", "")
 PASSWORD = os.environ.get("TALK_PASSWORD", "")
-# 客户端画像（对齐频道内真实手机 App 抓样 BI9BZW，2026-08-30 peek_release 实测）：
+# 客户端画像
 # UserState.f22=os, f23=os_version, f24=release(App版本), f25=model(机型)
 RELEASE = "V2.8.5"
 OS_NAME = "Android"
 OS_VERSION = "16"
 MODEL = "PKT110"
 
-# ---------------- protobuf 编解码（与 validate_client.py 同源已验证） ----------------
+# ---------------- protobuf 编解码 ----------------
 def varint_enc(n):
     out = bytearray()
     while True:
@@ -84,9 +65,7 @@ def enc_str(field, value):
 
 def build_version():
     """Version 上报：release/os 是服务器侧"登录类型"显示的数据源（UserState
-    f22/f23/f24 广播给频道成员）。v12 前沿用网页客户端 "web" 被显示为"浏览器
-    登陆"；v13 对齐频道内真实手机 App 画像（peek_release.py 实测 BI9BZW）。
-    version 号沿用 1.2.4 编码（服务器已验证接受）。"""
+    f22/f23/f24 广播给频道成员）。"web" 被显示为"浏览器登陆"。"""
     return (enc_uint(1, (1 << 16) | (2 << 8) | 4) +
             enc_str(2, RELEASE) + enc_str(3, OS_NAME) + enc_str(4, OS_VERSION))
 
@@ -106,7 +85,7 @@ def build_user_talking(session, talking):
     """UserTalking 上报（ID=15）。官方客户端抢麦成功后立即上报 talking=true，
     松 PTT 上报 talking=false；服务器广播给频道成员（UI 显示说话人）并
     触发录音/中继台链路。实测字段: f1=自己session, f2=talking, f9=voice_cast=0。
-    （2026-08-29 listen_capture --all 抓包确认，缺失此上报=不显示说话人+中继台不转发）"""
+    （缺失此上报=不显示说话人+中继台不转发）"""
     return enc_uint(1, session) + enc_uint(2, 1 if talking else 0) + enc_uint(9, 0)
 
 def decode_pb(data, limit=30):
@@ -430,7 +409,7 @@ class DirectAnnouncer:
     """直连播报会话，支持分步执行供 announce.py 预建链复用：
     connect() 建链+登录 → take_mic() 抢麦+上报开始说话 → play(packets) 匀速发包+放麦。
     announce_once() 是一步到位的便捷组合（CLI / 容错兜底用）。
-    凭据由构造函数传入，不再依赖模块级硬编码。"""
+    凭据由构造函数传入。"""
 
     def __init__(self, host=HOST, port=PORT, use_tls=True,
                  username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL):
@@ -468,7 +447,7 @@ class DirectAnnouncer:
         time.sleep(LEAD_DELAY)
         start = time.time()
         n_sent = 0
-        for i, pkt in enumerate(packets):     # 匀速 120ms/包（官方实时编码节奏，v6）
+        for i, pkt in enumerate(packets):     # 匀速 120ms/包
             c.send(1, pkt)
             n_sent += 1
             if verbose and n_sent % 50 == 0:
@@ -483,8 +462,7 @@ class DirectAnnouncer:
         c.send(14, build_apply_mic(False))
         if verbose:
             print("发包完成，已放麦（耗时 %.1f秒）" % (time.time() - start))
-        for t, p in c.pump(0.5):        # 收回执（v8: 3s→0.5s，回执即刻到达，仅诊断用）：
-                                        # 自己session的UserTalking广播(含服务器录音url)=完全认可
+        for t, p in c.pump(0.5):        # 自己session的UserTalking广播(含服务器录音url)=完全认可
             if t in (14, 15) and verbose:
                 print("    <- %s: %s" % ("ApplyMic" if t == 14 else "UserTalking", pb_dict(p)))
         return True
@@ -497,10 +475,9 @@ class DirectAnnouncer:
 
 class PersistentAnnouncer:
     """常驻直连会话（v11.1）：守护线程小粒度循环（每0.5s 醒一次，锁内 Ping 保活
-    + drain 读空下行，单次锁持有<100ms）。服务器画像 = 长在线用户（拟真防风控）。
+    + drain 读空下行，单次锁持有<100ms）。
 
-    线程安全设计（v11.1 修正，v11 的 ensure_session 直接碰 socket 与守护线程
-    pump 竞争，回显被抢走导致健康检查等满超时+误重建，首包晚 8 秒）：
+    线程安全设计：
     - 所有 socket IO 只在守护线程锁内发生，且锁内复检 busy（防 TOCTOU）
     - ensure_session() 纯状态查询不碰 socket：健康判据 = _last_ok（守护线程
       最近收到 Ping 回显的时刻）距今 ≤8s；ping 周期 2.5s，3 个周期容错
