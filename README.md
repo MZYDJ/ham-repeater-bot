@@ -1,55 +1,62 @@
 # Ham Repeater Bot - 中继报时钟
 
-业余无线电中继台自动播报服务，通过滔滔链路（ALLPTT）Web 端实现定时语音播报，支持 Docker 一键部署。
+业余无线电中继台自动播报服务：通过**协议直连**滔滔链路（ALLPTT）服务器实现定时语音播报，不依赖浏览器与任何图形环境，支持 Docker 一键部署。
+
+> v2 架构升级：以 Python 直连平台 TCP/TLS 协议端口（与手机 App 同级链路）替代原 Playwright 浏览器方案——无需 Chromium、无需虚拟声卡、容器镜像体积从 ~1.5GB 精简到 ~300MB，且不再受平台网页网关故障影响。
 
 ## 功能特性
 
-- **定时播报**：每半小时自动播报一次（默认 6:00 ~ 22:00），内容包含日期、星期、时间
-- **TTS 语音合成**：使用 Edge-TTS 生成中文语音，支持缓存和自动过期清理
-- **虚拟麦克风注入**：通过 Playwright 注入 JS 操控 Web Audio API，实现无物理声卡的音频输入
-- **PTT 自动控制**：自动按下/释放滔滔链路的 PTT 按键，播报前预留缓冲时间抵消 WebRTC 延迟
+- **协议直连**：原生对接平台服务器（改造版 Mumble 协议），链路可靠性与手机 App 同级
+- **定时播报**：每半小时自动播报一次（默认 7:00 ~ 22:30），内容包含日期、星期、时间
+- **常驻链路**：后台线程 Ping 保活 + 下行流量泵，服务器视角与长在线的真实用户一致
+- **准点对齐**：播报前一分钟预热（TTS 预合成 + 音频包预构建 + 预建链），准点前 0.5s 才抢麦（不提前占用信道），首包紧贴整点发出
+- **三级兜底**：常驻链路 → 临时短链 → 准点现场完整流程，任一环节故障自动降级，播报不中断
+- **TTS 蓄水池**：每小时预合成未来 48 小时所有播报时段的音频，准点播报不依赖播报时刻的 Edge-TTS 网络状态
 - **企业微信告警**：日志达到指定级别时自动推送到企业微信群机器人
-- **资源优化**：播报间隔期间自动关闭浏览器释放 CPU，播报前自动重新初始化
+- **轻量运行**：仅依赖 libopus0/libmpg123-0 两个系统库（ctypes 直调），无 pip 重型依赖
 
 ## 架构
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│  APScheduler │────▶│  Playwright      │────▶│  滔滔链路     │
-│  (定时触发)   │     │  (Chromium Headless)│    │  (Web PTT)   │
-└─────────────┘     └──────────────────┘     └──────────────┘
-       │                     │
-       │                     ▼
-       │              ┌──────────────┐
-       └─────────────▶│  Edge-TTS    │
-                      │  (语音合成)   │
-                      └──────────────┘
+┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ APScheduler │────▶│ direct_announce  │────▶│ 滔滔链路服务器     │
+│ (定时触发)   │     │ (协议直连客户端)  │     │ (TLS :59638)     │
+└─────────────┘     └──────────────────┘     └──────────────────┘
+       │                     ▲
+       │                     │ mp3 → Opus 12kbps → 185B/包
+       ▼                     │
+┌──────────────┐             │
+│  Edge-TTS    │─────────────┘
+│  (语音合成)   │
+└──────────────┘
 ```
+
+- **常驻链路（PersistentAnnouncer）**：守护线程每 2.5s Ping 保活并消费下行流量；播报前健康检查（Ping 回显），不健康自动重建
+- **播报流程**：抢麦（ApplyMic）→ 上报开始说话（UserTalking）→ 0.5s 建链间隔 → 匀速 120ms/包发包（官方实时编码节奏）→ 放麦 → 收服务器回执（录音 URL = 端到端确认）
 
 ## 快速开始
 
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ham-repeater-bot.git
+git clone https://github.com/MZYDJ/ham-repeater-bot.git
 cd ham-repeater-bot
 ```
 
-### 2. 编辑配置
+### 2. 配置账号
 
-编辑 `announce.py` 顶部的配置项，修改为你的实际信息：
+滔滔链路账号通过环境变量注入（也可直接改 `announce.py` 顶部常量）：
 
-```python
-# 滔滔链路账号（必填）
-TALK_USERNAME = "YOUR_TALK_USERNAME"
-TALK_PASSWORD = "YOUR_TALK_PASSWORD"
-
-# 播报内容（修改为你的中继台呼号、频率等信息）
-ANNOUNCE_TEMPLATE = "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是YOUR_CALLSIGN，本中继下行频率 XXX.XXX 兆赫，上行频率 XXX.XXX 兆赫，叉频 负 X.XX 兆赫。单上行接入亚音为模拟 XXX.X 赫兹。请规范用频，保持信道畅通。完毕"
-
-# 企业微信 Webhook（可选，不需要可留空）
-WECHAT_WEBHOOK_URL = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WEBHOOK_KEY"
+```yaml
+# docker-compose.yml 的 environment 段
+environment:
+  - TZ=Asia/Shanghai
+  - TALK_USERNAME=你的滔滔链路账号      # 必填
+  - TALK_PASSWORD=你的滔滔链路密码      # 必填
+  - WECHAT_WEBHOOK_URL=                # 可选：企业微信机器人 Webhook，留空禁用告警
 ```
+
+播报内容（中继台呼号、频率、亚音频等）编辑 `announce.py` 顶部的 `ANNOUNCE_TEMPLATE`。
 
 ### 3. 启动服务
 
@@ -74,7 +81,7 @@ docker compose down
 飞牛NAS 内置 Docker 管理功能，可通过 Compose 图形界面一键部署：
 
 1. **上传项目文件**
-   - 将本项目的所有文件（`announce.py`、`Dockerfile`、`docker-compose.yml`、`start.sh`）上传到飞牛NAS 的共享文件夹中，例如 `/vol1/docker/ham-repeater-bot/`
+   - 将本项目的所有文件（`announce.py`、`direct_announce.py`、`Dockerfile`、`docker-compose.yml`、`start.sh`）上传到飞牛NAS 的共享文件夹中，例如 `/vol1/docker/ham-repeater-bot/`
 
 2. **打开 Docker 管理**
    - 登录飞牛NAS 管理后台
@@ -101,60 +108,48 @@ docker compose down
 
 ### 4. 测试与调试
 
-修改 `start.sh` 最后一行的启动参数，可以切换运行模式：
-
 ```bash
-# 测试模式：播报指定次数后进入正常调度（默认 1 次）
-exec python3 announce.py -t [次数]
+# 容器内测试模式：播报指定次数后进入正常调度（默认 1 次）
+docker exec -it announce python3 announce.py -t [次数]
 
 # 交互模式：按回车播报一次（适合调试）
-exec python3 announce.py -i
+docker exec -it announce python3 announce.py -i
+
+# 直连客户端独立自测（不联网，只跑音频编解码管线）
+docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存文件.mp3 --dry-run
 ```
+
+> 注意：测试模式与常驻链路同账号并发会互踢（服务器顶掉旧会话），触发一条告警后自动重连，属正常现象。
 
 ## 配置说明
 
 ### 播报时间
 
 ```python
-ANNOUNCE_START_HOUR = 6    # 每日首次播报时刻（整点）
+ANNOUNCE_START_HOUR = 7    # 每日首次播报时刻（整点）
 ANNOUNCE_END_HOUR = 22     # 每日最后一次播报所在小时（22 表示最后一次为 22:30）
 ```
 
-播报规则：每半小时一次，XX:00 和 XX:30 各播报一次。每次播报前一分钟（XX:29 / XX:59）自动预刷新页面和预合成 TTS；每天首次播报由前一日 (START-1):59 预热，确保不使用闲置整夜的页面；收盘播报后浏览器保持关闭，不整夜空转。
+播报规则：每半小时一次，XX:00 和 XX:30 各播报一次。每次播报前一分钟（XX:29 / XX:59）自动预热（预合成 TTS + 预构建音频包 + 预建链）；每天首次播报由 (START-1):59 预热；收盘播报后仅保留常驻链路保活，不空转。
+
+### 直连时序
+
+```python
+NATIVE_PREP_LEAD = 2.5   # 准点前该秒数建链+登录（实测建链 ~1s）
+NATIVE_MIC_LEAD = 0.5    # 准点前该秒数才发起抢麦（不提前占麦）
+```
+
+抢麦提前量 0.5s 是刻意设计：提前抢麦会让频道内其他用户看到"说话中"状态长时间静默。抢麦服务器响应约 1.1s，实际首包落在准点后 ~1.1s，其中 UserTalking 与首包保持 0.5s 官方间隔（中继台链路设备靠该间隔建立转发）。
 
 ### TTS 合成
 
 ```python
 TTS_VOICE = "zh-CN-XiaoxiaoNeural"   # Edge-TTS 语音角色
-TTS_SYNTH_TIMEOUT = 30        # TTS 单次合成超时（秒）
-TTS_MAX_RETRIES = 3           # TTS 合成最大重试次数
-TTS_RETRY_DELAY = 5.0         # TTS 合成重试间隔（秒）
-CACHE_EXPIRE_DAYS = 7         # TTS 缓存过期天数
-TTS_PREFILL_HOURS = 36        # TTS 蓄水池提前量（小时）
+CACHE_EXPIRE_DAYS = 2                # TTS 缓存过期天数
+TTS_PREFILL_HOURS = 48               # TTS 蓄水池提前量（小时）
 ```
 
-TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `TTS_PREFILL_HOURS` 内所有播报时段缺失的音频，使准点播报不依赖播报时刻的 Edge-TTS 网络状态——网络突发故障（分钟到小时级）不再导致播报失败，只有连续中断超过一天才可能缺音。蓄水池任务遇到预热/播报任务入队会立即让位，不阻塞准点流程。
-
-### 音频与播报
-
-```python
-AUDIO_SAMPLE_RATE = 24000     # 虚拟麦克风采样率（Hz）
-MIC_GAIN = 1.5                # 虚拟麦克风播报音量增益
-LEVEL_CHECK_THRESHOLD = 10    # 电平检测通过阈值（0-255）
-LEVEL_CHECK_ROUNDS = 5        # 电平检测最大轮数
-PTT_BUFFER_OFFSET = 0.6       # PTT 提前释放缓冲时间（秒），抵消 WebRTC 音频缓冲
-```
-
-### 超时与延迟
-
-```python
-PTT_PRESS_DELAY = 800        # PTT 按下后等待时间（ms）
-PAGE_LOAD_TIMEOUT = 15000    # 页面加载超时（ms）
-REFRESH_WAIT_SEC = 6         # 刷新后等待音频链路稳定时间（s）
-BROWSER_MAX_AGE_SEC = 1800   # 浏览器连续运行超过该时长后，预热时强制关闭重建（秒）
-```
-
-浏览器超龄重建：若浏览器已连续运行超过 `BROWSER_MAX_AGE_SEC`（如服务在夜间重启后闲置到早上），预热时会强制关闭重建而非仅刷新页面，避免闲置过久的页面 websocket/音频链路失效导致播报无声。
+TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `TTS_PREFILL_HOURS` 内所有播报时段缺失的音频，使准点播报不依赖播报时刻的 Edge-TTS 网络状态——网络突发故障（分钟到小时级）不再导致播报失败，只有连续中断超过一天才可能缺音。
 
 ### 日志与 Webhook
 
@@ -170,22 +165,20 @@ LOG_BACKUP_COUNT = 40                  # 保留最近 40 个备份
 
 | 子目录 | 说明 |
 |--------|------|
-| `edge_user_data/` | 浏览器持久化数据（登录态等） |
 | `tts_cache/` | TTS 合成音频缓存 |
 | `logs/` | 运行日志（自动轮转） |
 
 ## 运行要求
 
 - Docker 与 Docker Compose
-- 宿主机需要支持 Chromium headless 运行（需共享 `/dev/shm`，compose 中已配置 `shm_size: 256m`）
-- 网络需能访问滔滔链路（allptt.com）和 Edge-TTS 服务
+- 网络需能访问滔滔链路（allptt.com:59638，TLS）和 Edge-TTS 服务
 
 ## 依赖
 
 - Python 3.x
-- [Playwright](https://playwright.dev/) (Chromium)
-- [edge-tts](https://github.com/rany2/edge-tts)
-- [APScheduler](https://github.com/agronholm/apscheduler)
+- [edge-tts](https://github.com/rany2/edge-tts)（语音合成）
+- [APScheduler](https://github.com/agronholm/apscheduler)（定时调度）
+- 系统库 `libopus0`、`libmpg123-0`（音频编解码，ctypes 直调，Dockerfile 已包含）
 
 ## 许可证
 
