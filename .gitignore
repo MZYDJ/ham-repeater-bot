@@ -3,6 +3,11 @@ edge_user_data/
 tts_cache/
 logs/
 
+# 敏感/环境相关配置文件（禁止提交；开源仓库只保留 config.example.json）
+config.json
+config.production.json
+*.local.json
+
 # Claude Code 本地配置
 .claude/
 

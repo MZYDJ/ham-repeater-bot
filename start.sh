@@ -12,6 +12,11 @@ echo "[ENV] BUILD_TIME: ${BUILD_TIME:-unknown}"
 # 直连链路音频编解码库自检（缺失则起服务也必然播报失败，fail-fast）
 echo "[ENV] libopus: $(python3 -c 'import ctypes.util; print("OK" if ctypes.util.find_library("opus") else "缺失!")' 2>&1)"
 echo "[ENV] libmpg123: $(python3 -c 'import ctypes.util; print("OK" if ctypes.util.find_library("mpg123") else "缺失!")' 2>&1)"
+# 配置文件定位（默认同目录 config.json，可用环境变量 HAM_BOT_CONFIG 覆盖）
+echo "[ENV] HAM_BOT_CONFIG: ${HAM_BOT_CONFIG:-（未设置，默认使用 /app/config.json）}"
+if [ -z "${HAM_BOT_CONFIG}" ] && [ ! -f /app/config.json ]; then
+    echo "[WARN] 未找到 /app/config.json！请将 config.example.json 复制为 config.json 并填写参数。"
+fi
 echo "=============================="
 
 # 持久目录授权

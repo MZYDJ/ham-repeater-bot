@@ -1,0 +1,54 @@
+{
+  "talk": {
+    "host": "totalkd.allptt.com",
+    "port": 59638,
+    "use_tls": true,
+    "username": "YOUR_TALK_USERNAME",
+    "password": "YOUR_TALK_PASSWORD",
+    "client_profile": {
+      "release": "V2.8.5",
+      "os_name": "Android",
+      "os_version": "16",
+      "model": "PKT110"
+    }
+  },
+  "tts": {
+    "voice": "zh-CN-XiaoxiaoNeural",
+    "timeout_inner": 28,
+    "timeout_join": 30,
+    "max_retries": 3,
+    "retry_delay": 5.0,
+    "cache_expire_days": 2,
+    "prefill_hours": 48
+  },
+  "announce": {
+    "template": "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是示例市业余无线电中继台B阿九AB，本中继下行频率 4三9.625 兆赫，上行频率 4三2.575 兆赫，叉频 负 7.05 兆赫。单上行接入亚音为模拟 88.5 赫兹。请规范用频，保持信道畅通。完毕",
+    "start_hour": 7,
+    "end_hour": 22
+  },
+  "timing": {
+    "native_prep_lead": 2.5,
+    "native_mic_lead": 0.5,
+    "lead_delay": 0.5,
+    "packet_period": 0.12,
+    "tail_flush": 0.3
+  },
+  "audio": {
+    "opus_bitrate": 12000,
+    "trim_silence": true,
+    "trim_threshold": 200,
+    "trim_min_ms": 50
+  },
+  "paths": {
+    "cache_dir": "/app/tts_cache",
+    "log_dir": "/app/logs"
+  },
+  "logging": {
+    "max_bytes": 262144,
+    "backup_count": 40
+  },
+  "notify": {
+    "webhook_url": "",
+    "webhook_log_level": "WARNING"
+  }
+}

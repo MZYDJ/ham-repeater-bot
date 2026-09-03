@@ -4,18 +4,15 @@ services:
     build:
       context: .
       args:
-        BUILD_TIME: "2026-08-30"
+        BUILD_TIME: "2026-09-02"
     image: announce:latest
 
     restart: unless-stopped
 
     environment:
       - TZ=Asia/Shanghai
-      # 滔滔链路账号（必填）
-      - TALK_USERNAME=YOUR_TALK_USERNAME
-      - TALK_PASSWORD=YOUR_TALK_PASSWORD
-      # 企业微信告警 Webhook（可选，留空禁用告警推送）
-      - WECHAT_WEBHOOK_URL=
+      # 配置文件路径（默认 /app/config.json；也可留空使用默认路径）
+      - HAM_BOT_CONFIG=/app/config.json
 
     volumes:
-      - ./:/app  # 项目目录挂载到容器
+      - ./:/app  # 项目目录挂载到容器（含 config.json / config.example.json）
