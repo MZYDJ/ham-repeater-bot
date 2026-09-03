@@ -2,40 +2,83 @@
 # -*- coding: utf-8 -*-
 """
 滔滔链路直连播报客户端 —— direct_announce.py
-
+管线: mp3 →(libmpg123)→ PCM 48k 单声道 →(libopus 12kbps CBR)→ 30字节/帧
+      → 6帧/包(185B) → 匀速120ms/包 → UDPTunnel(ID=1)，抢麦/放麦全自动。
+v12（配置独立版）: 所有可变参数迁移至 config.json（支持环境变量
+HAM_BOT_CONFIG 指定路径，默认读取脚本同目录 config.json）。代码保持与
+生产/开源一致，仅配置文件不同即可切换部署环境。函数 dry_validate_mp3
+（libmpg123 完整解码 dry-run 校验）与 trim_silence（头尾静音裁剪）同步
+保留在生产基准上。
+v10: 预建链只做 connect+login（不提前抢麦——长时间"说话中"静默
+会干扰频道）；抢麦由调用方控制时机（announce.py 在准点前 0.5s 发起），
+LEAD_DELAY 移入 play() 统一保证 UserTalking→首包 0.5s 官方时序。
+v9: DirectAnnouncer 类支持分步（connect/take_mic/play），配合
+announce.py 预热阶段预建链+预构建音频包，使首包恰在准点整发出；凭据改为
+构造函数参数，不再依赖模块级硬编码。v7: UserTalking 与首包之间加 0.5s 间隔
+（官方 App 实测时序）——中继台靠该信令建链，首包紧跟会吞掉开头字。
+v6: 发包节奏改匀速 120ms/包。此前照抄下行抓包的"600ms批5包"上送，
+生产实测手机/中继台都卡顿丢字且卡顿点各自不同——突发让接收端浅 jitter buffer
+溢出/下溢（实时对讲追求低延迟 buffer 很浅，不同设备处理策略不同→卡顿点不同）。
+官方手机上行本是实时编码匀速节奏；600ms 批是下行/无线链路的聚合现象，不能反推
+上行。另加 TCP_NODELAY 禁 Nagle（小包攒发会叠加节奏抖动）。
+v3 定案包格式: [0x20][varint seq][varint len=180] + 180字节Opus = 185字节
+（v1 len 编码 0x81B4→436 倍速；v2 误加上行 session→纯噪声。详见 HANDOFF.md）。
+announce_once() 供 announce.py 调用。
 依赖（仅系统库，无需 pip）:
     apt-get install -y libopus0 libmpg123-0
-
 用法:
     # 本地管线自测（不联网）: 解码→编码→统计
     python3 direct_announce.py --mp3 xx.mp3 --dry-run
-    # 完整播报（默认 totalkd.allptt.com:59638 TLS）
+    # 完整播报（默认 totalkd.allptt.com:59638 TLS，参数取自 config.json）
     python3 direct_announce.py --mp3 xx.mp3
 """
 import argparse
 import array
-import os
 import ctypes
 import ctypes.util
+import json
+import os
 import socket
 import ssl
 import struct
 import threading
 import time
-
-HOST = "totalkd.allptt.com"
-PORT = 59638
-# 平台账号：从环境变量 TALK_USERNAME / TALK_PASSWORD 读取（announce.py 同名配置）
-USERNAME = os.environ.get("TALK_USERNAME", "")
-PASSWORD = os.environ.get("TALK_PASSWORD", "")
-# 客户端画像
-# UserState.f22=os, f23=os_version, f24=release(App版本), f25=model(机型)
-RELEASE = "V2.8.5"
-OS_NAME = "Android"
-OS_VERSION = "16"
-MODEL = "PKT110"
-
-# ---------------- protobuf 编解码 ----------------
+# ====================== 配置加载 ======================
+# 配置来源优先级：环境变量 HAM_BOT_CONFIG 指定路径 > 脚本同目录 config.json
+DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+def load_config(path=None):
+    """加载 JSON 配置文件。找不到或不合法时返回空 dict（代码内置默认值兜底）。
+    返回 (配置dict, 实际使用的配置路径)。"""
+    p = path or os.environ.get("HAM_BOT_CONFIG") or DEFAULT_CONFIG
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}, p
+        return data, p
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}, p
+CFG, CFG_PATH = load_config()
+def cfg_get(*path, default=None):
+    """从配置 dict 按路径取值，缺失返回 default。"""
+    node = CFG
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return default
+        node = node[key]
+    return node
+_talk = cfg_get("talk", default={}) or {}
+_client = _talk.get("client_profile", {}) or {}
+HOST = _talk.get("host", "totalkd.allptt.com")
+PORT = _talk.get("port", 59638)
+USE_TLS = _talk.get("use_tls", True)
+USERNAME = _talk.get("username", "")
+PASSWORD = _talk.get("password", "")
+RELEASE = _client.get("release", "V2.8.5")
+OS_NAME = _client.get("os_name", "Android")
+OS_VERSION = _client.get("os_version", "16")
+MODEL = _client.get("model", "PKT110")
+# ---------------- protobuf 编解码（与 validate_client.py 同源已验证） ----------------
 def varint_enc(n):
     out = bytearray()
     while True:
@@ -44,7 +87,6 @@ def varint_enc(n):
         out.append(b | (0x80 if n else 0))
         if not n:
             return bytes(out)
-
 def varint_dec(data, i):
     result, shift = 0, 0
     while i < len(data):
@@ -55,20 +97,18 @@ def varint_dec(data, i):
             return result, i
         shift += 7
     raise ValueError("varint 越界")
-
 def enc_uint(field, value):
     return varint_enc(field << 3) + varint_enc(value)
-
 def enc_str(field, value):
     raw = value.encode("utf-8")
     return varint_enc((field << 3) | 2) + varint_enc(len(raw)) + raw
-
 def build_version():
     """Version 上报：release/os 是服务器侧"登录类型"显示的数据源（UserState
-    f22/f23/f24 广播给频道成员）。"web" 被显示为"浏览器登陆"。"""
+    f22/f23/f24 广播给频道成员）。v12 前沿用网页客户端 "web" 被显示为"浏览器
+    登陆"；v13 对齐频道内真实手机 App 画像（peek_release.py 实测 BI9BZW）。
+    version 号沿用 1.2.4 编码（服务器已验证接受）。"""
     return (enc_uint(1, (1 << 16) | (2 << 8) | 4) +
             enc_str(2, RELEASE) + enc_str(3, OS_NAME) + enc_str(4, OS_VERSION))
-
 def build_login(username, password, ent_id=None, model=None):
     # ent_id 省略时编码整体不含该字段（与网页客户端一致；显式=0 会报 Ent not exist）
     p = enc_str(1, username) + enc_str(2, password)
@@ -77,17 +117,14 @@ def build_login(username, password, ent_id=None, model=None):
     if model:
         p += enc_str(6, model)   # 设备型号（UserState f25 广播；该组织未开设备白名单）
     return p
-
 def build_apply_mic(apply):
     return varint_enc(2 << 3) + varint_enc(1 if apply else 0)
-
 def build_user_talking(session, talking):
     """UserTalking 上报（ID=15）。官方客户端抢麦成功后立即上报 talking=true，
     松 PTT 上报 talking=false；服务器广播给频道成员（UI 显示说话人）并
     触发录音/中继台链路。实测字段: f1=自己session, f2=talking, f9=voice_cast=0。
-    （缺失此上报=不显示说话人+中继台不转发）"""
+    （2026-08-29 listen_capture --all 抓包确认，缺失此上报=不显示说话人+中继台不转发）"""
     return enc_uint(1, session) + enc_uint(2, 1 if talking else 0) + enc_uint(9, 0)
-
 def decode_pb(data, limit=30):
     out, i = [], 0
     try:
@@ -114,17 +151,14 @@ def decode_pb(data, limit=30):
     except Exception:
         pass
     return out
-
 def pb_dict(payload):
     d = {}
     for f, v in decode_pb(payload, limit=64):
         if f not in d:
             d[f] = v
     return d
-
 def frame(msg_type, payload):
     return struct.pack(">HI", msg_type, len(payload)) + payload
-
 # ---------------- libopus 编码器（ctypes 直调，已验证） ----------------
 def load_lib(names):
     name = ctypes.util.find_library(names[0])
@@ -134,13 +168,11 @@ def load_lib(names):
         except OSError:
             continue
     return None
-
 class OpusEncoder:
     OPUS_APPLICATION_VOIP = 2048
     OPUS_SET_BITRATE = 4002
     OPUS_SET_VBR = 4006
-
-    def __init__(self, rate=48000, channels=1, bitrate=12000):
+    def __init__(self, rate=48000, channels=1, bitrate=None):
         lib = load_lib(["opus", "libopus.so.0", "libopus.so"])
         if lib is None:
             raise RuntimeError("未找到 libopus，请先执行: apt-get install -y libopus0")
@@ -158,9 +190,10 @@ class OpusEncoder:
         if err.value != 0 or not raw:
             raise RuntimeError("opus_encoder_create 失败: err=%s" % err.value)
         self.state = ctypes.c_void_p(raw)
-        lib.opus_encoder_ctl(self.state, self.OPUS_SET_BITRATE, bitrate)  # 12000bps
+        if bitrate is None:
+            bitrate = cfg_get("audio", "opus_bitrate", default=12000)
+        lib.opus_encoder_ctl(self.state, self.OPUS_SET_BITRATE, bitrate)  # 12kbps
         lib.opus_encoder_ctl(self.state, self.OPUS_SET_VBR, 0)           # CBR
-
     def encode_frame(self, pcm_bytes):
         """960样本 int16 LE (1920字节) → Opus 帧（CBR 12kbps 下应恰为 30 字节）"""
         n_in = len(pcm_bytes) // 2
@@ -170,7 +203,6 @@ class OpusEncoder:
         if n < 0:
             raise RuntimeError("opus_encode 错误码 %d" % n)
         return ctypes.string_at(ctypes.addressof(out), n)
-
 # ---------------- libmpg123 解码器（ctypes 直调） ----------------
 class Mpg123Decoder:
     """mp3 → PCM s16le 单声道 48kHz。libmpg123 内部完成下混+重采样。"""
@@ -178,7 +210,6 @@ class Mpg123Decoder:
     MONO = 1                # MPG123_MONO
     OK, DONE, ERR = 0, -12, -1
     NEW_FORMAT = -11        # "下次调用格式变化"提示，非错误（首次read必触发）
-
     def __init__(self):
         lib = load_lib(["mpg123", "libmpg123.so.0", "libmpg123.so"])
         if lib is None:
@@ -201,7 +232,6 @@ class Mpg123Decoder:
                                          ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
         self.lib = lib
         lib.mpg123_init()
-
     def decode(self, path, want_rate=48000):
         """返回 (PCM s16le 单声道字节流, 源采样率)，已重采样到 want_rate。
         注意: libmpg123 只支持降采样不做上采样——强制 format(48000) 会把 24kHz
@@ -238,7 +268,14 @@ class Mpg123Decoder:
             return resample_linear(pcm, rate.value, want_rate), rate.value
         finally:
             self.lib.mpg123_delete(mh)
-
+def dry_validate_mp3(path, min_seconds=0.15):
+    """libmpg123 完整解码 dry-run 校验：识别头部损坏 + 尾部截断不完整。
+    与播报共用同一个解码器，校验通过=播报必然能解码。"""
+    try:
+        pcm, _ = Mpg123Decoder().decode(str(path))
+        return len(pcm) >= 48000 * 2 * min_seconds   # 至少 min_seconds 秒有效音频
+    except Exception:
+        return False
 def resample_linear(pcm, src_rate, dst_rate=48000):
     """s16le 单声道 PCM 线性插值重采样（语音足够；24k→48k 频谱无损感）"""
     if src_rate == dst_rate or not pcm:
@@ -259,15 +296,12 @@ def resample_linear(pcm, src_rate, dst_rate=48000):
         out.append(int(samples[i0] * (1.0 - frac) + samples[i1] * frac))
         pos += step
     return out.tobytes()
-
 # ---------------- 音频管线 ----------------
 FRAME_BYTES = 960 * 2          # Opus 帧：960样本 int16 = 20ms @48kHz
-PACKET_PERIOD = 0.12           # 每包音频时长：6帧×20ms=120ms；发包间隔与此对齐
-                              # （v6: 匀速=官方实时编码天然节奏；批突发致接收端丢字）
-LEAD_DELAY = 0.5               # UserTalking(talking=true) 到首包的间隔（官方 App 实测
-                              # ~0.5s=真人按PTT到开口的反应时间；中继台靠此信令建链，
-                              # v7: 缺间隔会吞掉开头字）
-
+PACKET_PERIOD = cfg_get("timing", "packet_period", default=0.12)  # 每包120ms匀速
+LEAD_DELAY = cfg_get("timing", "lead_delay", default=0.5)         # UserTalking→首包 0.5s
+TAIL_FLUSH = cfg_get("timing", "tail_flush", default=0.3)         # 发包后尾巴冲刷
+TRIM_SILENCE = cfg_get("audio", "trim_silence", default=True)     # 头尾静音裁剪开关
 def m_varint_enc(n):
     """Mumble UDP 语音包头 varint 编码（前缀式，区别于 protobuf varint）"""
     if n < 0x80:
@@ -279,10 +313,37 @@ def m_varint_enc(n):
     if n < 0x10000000:
         return bytes([0xE0 | (n >> 24), (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF])
     raise ValueError("varint 值过大: %d" % n)
-
+def trim_silence(pcm, threshold=None, min_ms=None):
+    """s16le 单声道 48kHz PCM 头尾静音截断，各保留 min_ms 余量。"""
+    if threshold is None:
+        threshold = cfg_get("audio", "trim_threshold", default=200)
+    if min_ms is None:
+        min_ms = cfg_get("audio", "trim_min_ms", default=50)
+    if not pcm:
+        return pcm
+    samples = array.array('h')
+    samples.frombytes(pcm)
+    n = len(samples)
+    keep = int(48000 * min_ms / 1000)
+    start = 0
+    for i in range(n):
+        if abs(samples[i]) > threshold:
+            start = max(0, i - keep)
+            break
+    else:
+        return b""
+    end = n
+    for i in range(n - 1, -1, -1):
+        if abs(samples[i]) > threshold:
+            end = min(n, i + keep + 1)
+            break
+    return samples[start:end].tobytes()
 def build_audio(mp3_path):
     """mp3 → (语音包列表, 总帧数)。帧不足30字节补零，尾包不足6帧补零帧。"""
     pcm, src_rate = Mpg123Decoder().decode(mp3_path)
+    if TRIM_SILENCE:
+        pcm = trim_silence(pcm)
+        print("已裁切头尾静音（trim_silence on）")
     print("mp3 解码: 源 %dHz → 重采样 48000Hz 单声道" % src_rate)
     if len(pcm) < FRAME_BYTES:
         raise RuntimeError("mp3 解码结果为空（%.1fKB），文件损坏或路径错误" % (len(pcm) / 1024))
@@ -308,7 +369,6 @@ def build_audio(mp3_path):
         head = bytes([0x20]) + m_varint_enc(200 + i) + m_varint_enc(180)
         packets.append(head + b"".join(chunk))
     return packets, len(frames)
-
 # ---------------- 连接与消息循环（与 validate_client.py 同源已验证） ----------------
 class Client:
     def __init__(self, host, port, use_tls):
@@ -321,10 +381,8 @@ class Client:
             ctx.verify_mode = ssl.CERT_NONE
             self.sock = ctx.wrap_socket(self.sock, server_hostname=host)
         self.buf = b""
-
     def send(self, msg_type, payload):
         self.sock.sendall(frame(msg_type, payload))
-
     def pump(self, seconds):
         msgs = []
         end = time.time() + seconds
@@ -349,7 +407,6 @@ class Client:
                 msgs.append((t, self.buf[6:6 + l]))
                 self.buf = self.buf[6 + l:]
         return msgs
-
     def drain(self, idle_rounds=2):
         """非阻塞尽量读空当前可读数据并解析成消息（守护线程高频泵用）。
         连续 idle_rounds 轮（每轮50ms超时）无新数据即返回，单次耗时<100ms。"""
@@ -376,7 +433,6 @@ class Client:
                 msgs.append((t, self.buf[6:6 + l]))
                 self.buf = self.buf[6 + l:]
         return msgs
-
     def wait_for(self, seconds, wanted_types):
         end = time.time() + seconds
         while time.time() < end:
@@ -384,13 +440,11 @@ class Client:
                 if t in wanted_types:
                     return t, p
         return None, None
-
     def close(self):
         try:
             self.sock.close()
         except Exception:
             pass
-
 def login(c, username, password, ent_id=None, model=None):
     """Version+Login → 等 ServerSync。Reject type=0 是平台自定义的登录成功通知，忽略。"""
     c.send(0, build_version())
@@ -403,14 +457,12 @@ def login(c, username, password, ent_id=None, model=None):
             if t == 6 and pb_dict(p).get(1) != 0:
                 raise RuntimeError("登录被拒: %s" % pb_dict(p))
     raise RuntimeError("10秒内未收到 ServerSync")
-
 # ---------------- 主入口（函数化，供 announce.py 调度器调用） ----------------
 class DirectAnnouncer:
     """直连播报会话，支持分步执行供 announce.py 预建链复用：
     connect() 建链+登录 → take_mic() 抢麦+上报开始说话 → play(packets) 匀速发包+放麦。
     announce_once() 是一步到位的便捷组合（CLI / 容错兜底用）。
-    凭据由构造函数传入。"""
-
+    凭据由构造函数传入，不依赖模块级硬编码。"""
     def __init__(self, host=HOST, port=PORT, use_tls=True,
                  username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL):
         self.host, self.port, self.use_tls = host, port, use_tls
@@ -418,14 +470,12 @@ class DirectAnnouncer:
         self.model = model
         self.c = None
         self.session = None
-
     def connect(self):
         """建链（TCP+TLS）+ 登录，拿回 session id"""
         self.c = Client(self.host, self.port, self.use_tls)
         print("已连接 %s:%d (%s)" % (self.host, self.port, "TLS" if self.use_tls else "明文"))
         self.session = login(self.c, self.username, self.password, self.ent_id, self.model)
         print("登录成功 session=%s" % self.session)
-
     def take_mic(self):
         """抢麦 + 上报开始说话（UI显示说话人/中继台建链触发）"""
         c = self.c
@@ -436,7 +486,6 @@ class DirectAnnouncer:
             raise RuntimeError("抢麦失败: %s" % (d or "6秒无响应"))
         c.send(15, build_user_talking(self.session, True))
         print("抢麦成功，已上报 UserTalking(talking=true)")
-
     def play(self, packets, verbose=True):
         """UserTalking 之后先等 LEAD_DELAY（官方时序 0.5s，中继台靠该间隔建链），
         再匀速发包(120ms/包)→尾巴冲刷→上报停止说话→放麦→收回执。成功返回 True。
@@ -447,7 +496,7 @@ class DirectAnnouncer:
         time.sleep(LEAD_DELAY)
         start = time.time()
         n_sent = 0
-        for i, pkt in enumerate(packets):     # 匀速 120ms/包
+        for i, pkt in enumerate(packets):     # 匀速 120ms/包（官方实时编码节奏，v6）
             c.send(1, pkt)
             n_sent += 1
             if verbose and n_sent % 50 == 0:
@@ -456,35 +505,31 @@ class DirectAnnouncer:
             delay = target - time.time()
             if delay > 0:
                 time.sleep(delay)
-
-        time.sleep(0.3)                 # 尾巴冲刷（官方同款300ms）
+        time.sleep(TAIL_FLUSH)                 # 尾巴冲刷（官方同款300ms，可配置）
         c.send(15, build_user_talking(self.session, False))  # 上报停止说话
         c.send(14, build_apply_mic(False))
         if verbose:
             print("发包完成，已放麦（耗时 %.1f秒）" % (time.time() - start))
-        for t, p in c.pump(0.5):        # 自己session的UserTalking广播(含服务器录音url)=完全认可
+        for t, p in c.pump(0.5):        # 收回执（v8: 3s→0.5s，回执即刻到达，仅诊断用）：
+                                        # 自己session的UserTalking广播(含服务器录音url)=完全认可
             if t in (14, 15) and verbose:
                 print("    <- %s: %s" % ("ApplyMic" if t == 14 else "UserTalking", pb_dict(p)))
         return True
-
     def close(self):
         if self.c:
             self.c.close()
             self.c = None
-
-
 class PersistentAnnouncer:
     """常驻直连会话（v11.1）：守护线程小粒度循环（每0.5s 醒一次，锁内 Ping 保活
-    + drain 读空下行，单次锁持有<100ms）。
-
-    线程安全设计：
+    + drain 读空下行，单次锁持有<100ms）。服务器画像 = 长在线用户（拟真防风控）。
+    线程安全设计（v11.1 修正，v11 的 ensure_session 直接碰 socket 与守护线程
+    pump 竞争，回显被抢走导致健康检查等满超时+误重建，首包晚 8 秒）：
     - 所有 socket IO 只在守护线程锁内发生，且锁内复检 busy（防 TOCTOU）
     - ensure_session() 纯状态查询不碰 socket：健康判据 = _last_ok（守护线程
       最近收到 Ping 回显的时刻）距今 ≤8s；ping 周期 2.5s，3 个周期容错
     - 播报独占（busy）期间守护线程完全不碰 socket
     被顶（UserRemove ID=20 带自己 session）→ 事件回调 + 退避重连（翻倍至30min
     上限防互踢风暴）；断线异常 → 守护线程自动重连，失败 10s 后再试。"""
-
     def __init__(self, host=HOST, port=PORT, use_tls=True,
                  username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL,
                  ping_interval=2.5, on_event=None):
@@ -501,7 +546,6 @@ class PersistentAnnouncer:
         self._backoff = 30.0               # 被顶重连退避秒数
         self._last_ping = 0.0
         self._last_ok = 0.0                # 最近一次收到 Ping 回显的时刻
-
     # ---- 生命周期 ----
     def start(self):
         with self._lock:
@@ -511,7 +555,6 @@ class PersistentAnnouncer:
         self._thread = threading.Thread(target=self._keeper, daemon=True,
                                         name="native-link-keeper")
         self._thread.start()
-
     def stop(self):
         self._stop.set()
         if self._thread:
@@ -520,7 +563,6 @@ class PersistentAnnouncer:
             if self._sess:
                 self._sess.close()
                 self._sess = None
-
     def _rebuild(self):
         """建立新连接替换旧的（须持锁调用）"""
         s = DirectAnnouncer(**self._cfg)
@@ -533,7 +575,6 @@ class PersistentAnnouncer:
         self._sess = s
         self._last_ok = 0.0                        # 等首个 Ping 回显到达后才算健康
         return s
-
     # ---- 守护线程 ----
     def _keeper(self):
         while not self._stop.is_set():
@@ -575,7 +616,6 @@ class PersistentAnnouncer:
                 continue
             if self._sess is None:                 # 异常断开/被顶退避后 → 重连
                 self._reconnect_safe()
-
     def _reconnect_safe(self):
         ok = False
         with self._lock:
@@ -592,14 +632,12 @@ class PersistentAnnouncer:
                 self._emit("dead", "重连失败: %s" % e)
         if not ok:
             time.sleep(10)
-
     def _emit(self, kind, detail):
         if self._on_event:
             try:
                 self._on_event(kind, detail)
             except Exception:
                 pass
-
     # ---- 播报接口 ----
     def ensure_session(self):
         """返回健康的独占会话；不健康返回 None（调用方走临时短链兜底）。
@@ -612,12 +650,9 @@ class PersistentAnnouncer:
                 self._busy.set()
                 return s
         return None
-
     def release(self):
         """播报结束，连接归还守护线程继续保活"""
         self._busy.clear()
-
-
 def announce_once(mp3_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
                   username=USERNAME, password=PASSWORD, verbose=True):
     """完整播报一次（一步到位）：编码→登录→抢麦→延迟LEAD_DELAY→匀速发包→放麦。
@@ -627,7 +662,6 @@ def announce_once(mp3_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
         print("音频就绪: %.1f秒 → %d 帧 → %d 包（每%.0fms一包，预计上台 %.1f秒）" %
               (n_frames * 0.02, n_frames, len(packets),
                PACKET_PERIOD * 1000, len(packets) * PACKET_PERIOD))
-
     s = DirectAnnouncer(host, port, use_tls, username, password, ent_id)
     try:
         s.connect()
@@ -636,7 +670,6 @@ def announce_once(mp3_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
         return True
     finally:
         s.close()
-
 def main():
     ap = argparse.ArgumentParser(description="滔滔直连播报客户端")
     ap.add_argument("--mp3", required=True, help="播报 mp3 文件路径")
@@ -644,9 +677,26 @@ def main():
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--tls", action="store_true", default=True)
     ap.add_argument("--ent-id", type=int, default=None)
+    ap.add_argument("--config", default=None,
+                    help="配置文件路径（默认取环境变量 HAM_BOT_CONFIG 或同目录 config.json）")
     ap.add_argument("--dry-run", action="store_true", help="只跑本地音频管线，不联网")
     args = ap.parse_args()
-
+    if args.config:
+        # 重载配置：更新模块级 CFG 与派生常量（全局 dict 刷新，避免 import 期绑定）
+        new_cfg, _ = load_config(args.config)
+        _t = new_cfg.get("talk", {}) or {}
+        _cl = _t.get("client_profile", {}) or {}
+        g = globals()
+        g["CFG"] = new_cfg
+        g["HOST"] = _t.get("host", "totalkd.allptt.com")
+        g["PORT"] = _t.get("port", 59638)
+        g["USE_TLS"] = _t.get("use_tls", True)
+        g["USERNAME"] = _t.get("username", "")
+        g["PASSWORD"] = _t.get("password", "")
+        g["RELEASE"] = _cl.get("release", "V2.8.5")
+        g["OS_NAME"] = _cl.get("os_name", "Android")
+        g["OS_VERSION"] = _cl.get("os_version", "16")
+        g["MODEL"] = _cl.get("model", "PKT110")
     if args.dry_run:
         packets, n_frames = build_audio(args.mp3)
         print("管线自测: %.1f秒 → %d 帧 → %d 包" % (n_frames * 0.02, n_frames, len(packets)))
@@ -654,9 +704,7 @@ def main():
         lens = set(len(p) for p in packets)
         print("包长集合: %s（应全为185）" % sorted(lens))
         return
-
     ok = announce_once(args.mp3, args.host, args.port, args.tls, args.ent_id)
     print("\n===== %s =====" % ("播报完成" if ok else "播报失败"))
-
 if __name__ == "__main__":
     main()
