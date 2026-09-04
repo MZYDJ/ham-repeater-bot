@@ -26,6 +26,10 @@
     "start_hour": 7,
     "end_hour": 22
   },
+  "test": {
+    "enabled": false,
+    "count": 1
+  },
   "timing": {
     "native_prep_lead": 2.5,
     "native_mic_lead": 0.5,
