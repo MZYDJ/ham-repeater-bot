@@ -6,12 +6,14 @@
 覆盖：字母解释法解码/呼号校验/信号提取/去重、Mumble varint 编解码、
 UDP 语音包解析（含回声过滤）、Opus 编解码往返、VAD 切段、WAV 落盘、配置回退。
 """
+import csv
 import http.client
 import os
 import struct
 import sys
 import tempfile
 import time
+import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -371,6 +373,42 @@ def test_info_followup():
     check("友台1 条目未被污染",
           sess._checked_in[0][4] == "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦",
           f"entry={sess._checked_in[0]}")
+    # 结构化字段已在点名中永久化（CSV 导出数据源）
+    check("结构化字段记录", sess._fields.get("BH3XX", {}).get("qth") == "咸阳市渭城区"
+          and sess._fields.get("BH3XX", {}).get("device") == "泉盛K6"
+          and sess._fields.get("BH3XX", {}).get("power") == "5 瓦"
+          and sess._fields.get("BG9ABC", {}).get("qth") == "咸阳市",
+          f"fields={sess._fields}")
+
+
+def test_export_csv():
+    print("[点名记录 CSV 导出]")
+    sess = net_control.NetControlSession(link=None)
+    sess._teardown_dir = None
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    sess._speak = lambda text: None
+    sess._started_at = datetime.datetime(2026, 9, 18, 19, 45, 0)
+    sess._asr_text = lambda pcm: "这里是BH3XX，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    sess._asr_text = lambda pcm: "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    sess._asr_text = lambda pcm: "这里是BG9ABC"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    with tempfile.TemporaryDirectory() as td:
+        out = sess._export_csv(path=str(Path(td) / "点名记录_20260918_194500.csv"))
+        check("导出返回路径", out is not None and out.endswith("点名记录_20260918_194500.csv"),
+              f"out={out}")
+        rows = list(csv.reader(open(out, encoding="utf-8-sig")))
+        check("表头正确", rows[0] == ["序号", "呼号", "信号报告", "QTH", "设备",
+                                     "天线", "功率", "抄收时间", "原始转录", "补充原文"],
+              f"header={rows[0]}")
+        check("数据行数", len(rows) == 3, f"rows={rows}")
+        check("友台1 结构化列", rows[1][1] == "BH3XX" and rows[1][2] == "59"
+              and rows[1][3] == "咸阳市渭城区" and rows[1][4] == "泉盛K6"
+              and rows[1][5] == "原机天线" and rows[1][6] == "5 瓦",
+              f"row={rows[1]}")
+        check("友台2 行", rows[2][1] == "BG9ABC" and rows[2][2] == "",
+              f"row={rows[2]}")
 
 
 def test_report_clean():
@@ -389,15 +427,15 @@ def test_report_fields():
     f = net_control.extract_report_fields
     r = f("我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦功率发射")
     d = dict(r)
-    check("QTH/设备/天线/功率全提取", d.get("QTH") == "咸阳市渭城区"
-          and d.get("设备") == "泉盛K6" and d.get("天线") == "原机天线"
-          and d.get("功率") == "5 瓦", f"{r}")
+    check("QTH/设备/天线/功率全提取", d.get("qth") == "咸阳市渭城区"
+          and d.get("device") == "泉盛K6" and d.get("antenna") == "原机天线"
+          and d.get("power") == "5 瓦", f"{r}")
     r = f("Q T H 咸阳，设备是即时通，天线原机天线，5W")
     d = dict(r)
-    check("Q T 展开/阿拉伯功率", d.get("QTH") == "咸阳" and d.get("设备") == "即时通"
-          and d.get("功率") == "5 瓦", f"{r}")
+    check("Q T 展开/阿拉伯功率", d.get("qth") == "咸阳" and d.get("device") == "即时通"
+          and d.get("power") == "5 瓦", f"{r}")
     r = f("信号五九")
-    check("信号报告提取", dict(r).get("信号") == "59", f"{r}")
+    check("信号报告提取", dict(r).get("signal") == "59", f"{r}")
     r = f("主控是否抄收")
     check("询问语无字段", r == [], f"{r}")
     r = f("那主播")
@@ -478,7 +516,7 @@ def main():
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
                test_info_followup, test_report_clean, test_report_fields,
-               test_wait_channel_idle, test_templates]:
+               test_wait_channel_idle, test_export_csv, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
