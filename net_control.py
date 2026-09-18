@@ -30,6 +30,7 @@ import array
 import base64
 import contextlib
 import datetime
+import http.client
 import json
 import logging
 import queue
@@ -254,7 +255,8 @@ def pcm_to_wav_bytes(pcm16, rate=16000):
 class VoiceCapture:
     """话音检测与语音段切分：喂入 48kHz 单声道 PCM（下行 Opus 解码后），
     按 20ms 帧算能量，检测"起讲→讲话→静音收尾"，输出 16kHz 单声道完整段。
-    带自适应噪声底；on_segment(pcm16, dur_s, wav_path) 在喂入线程中回调。"""
+    带自适应噪声底；on_segment(pcm16, dur_s, wav_path, session) 在喂入线程中回调，
+    session 为段来源讲话人标识（点名状态机据此把补充信息段归入当前友台）。"""
     FRAME_S = 960 * 2                                # 20ms @48k int16 字节数
 
     def __init__(self, threshold=None, silence_end_ms=None, min_segment_ms=None,
@@ -271,6 +273,7 @@ class VoiceCapture:
         self._silence_s = 0.0
         self._noise = 0.0
         self._seq = 0
+        self._seg_session = None        # 当前段来源 session（讲话人标识，点名上下文关联用）
 
     def _rms(self, frame):
         s = array.array('h')
@@ -282,9 +285,15 @@ class VoiceCapture:
     def _active_thr(self):
         return max(float(self.threshold), self._noise * 3.0, 300.0)
 
-    def feed(self, pcm48):
+    def feed(self, pcm48, session=None):
+        """喂入 48kHz 单声道 PCM。session 为该批语音的远端来源标识：
+        讲话人切换（session 变化）时先收尾当前段再开新段，保证每个切出的
+        语音段归属单一 session（点名状态机据此把"补充信息段"归入当前友台）。"""
         if not pcm48:
             return
+        if (self._speaking and session is not None
+                and self._seg_session is not None and session != self._seg_session):
+            self._finalize()                       # 换人：先收尾上一位的段
         for off in range(0, len(pcm48) - self.FRAME_S + 1, self.FRAME_S):
             frame = pcm48[off:off + self.FRAME_S]
             rms = self._rms(frame)
@@ -298,6 +307,7 @@ class VoiceCapture:
                     self._speaking = True
                     self._silence_s = 0.0
                     self._buf48 = bytearray(frame)
+                    self._seg_session = session
             else:
                 self._buf48 += frame
                 if active:
@@ -311,9 +321,11 @@ class VoiceCapture:
 
     def _finalize(self):
         pcm48 = bytes(self._buf48)
+        session = self._seg_session
         self._speaking = False
         self._buf48 = bytearray()
         self._silence_s = 0.0
+        self._seg_session = None
         dur = len(pcm48) / (48000 * 2)
         if dur < self.min_segment_ms / 1000:
             return
@@ -330,7 +342,7 @@ class VoiceCapture:
                 logger.warning(f"应答录音落盘失败: {e}")
         if self.on_segment:
             try:
-                self.on_segment(pcm16, dur, wav_path)
+                self.on_segment(pcm16, dur, wav_path, session)
             except Exception as e:
                 logger.warning(f"应答段回调异常: {e}")
 
@@ -344,7 +356,17 @@ class VoiceCapture:
 # ====================== ASR 客户端（qwen3-asr-flash，OpenAI 兼容） ======================
 class AsrClient:
     """非流式转写：OpenAI 兼容 /chat/completions，System Message 传实体词表
-    （点名名单、解释法词表、已抄收呼号）提升呼号识别。纯 urllib，无新增依赖。"""
+    （点名名单、解释法词表、已抄收呼号）提升呼号识别。纯标准库，无新增依赖。
+
+    连接复用：持有一个 http.client.HTTPSConnection 长连接（keep-alive），
+    点名期间多次 ASR 共用同一条 TCP+TLS，省去每次请求的握手开销
+    （此前每次 transcribe 都新建连接——用户实测"每次 ASR 都要重新发送一次 TCP"）。
+
+    官方文档（2026-09-17 更新）确认 system 消息受支持且必须放 messages 第一位，
+    仅千问3-ASR-Flash 支持，用于提供上下文/实体词表。但实测带 system 返回 400
+    （InternalError.Algo.InvalidParameter: ... does not support this input）。
+    自动降级链：带 system → 去 system → 再去 asr_options，保证点名不中断；
+    --asr-probe 可逐变体探测 system 的正确格式（content 字符串/数组/纯词表）。"""
 
     def __init__(self, api_key="", model="qwen3-asr-flash",
                  base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -355,14 +377,33 @@ class AsrClient:
         self.enable_itn = enable_itn
         self.language = language
         self.timeout = timeout
+        self._conn = None                       # 复用的 HTTPS 长连接（懒创建）
+        self._conn_host = None
+        self._conn_port = None
 
-    def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True):
+    # ---------- 请求体构造（sys_style 供 system 词表格式探测） ----------
+    def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True,
+                    sys_style="str"):
+        """构造请求体。sys_style：
+        - "str"  ：system.content 为纯字符串（带指令性引导语，生产默认）
+        - "bare" ：system.content 仅为词表本身（文档称 system 用于上下文/实体词表，
+                   "不支持设置模型角色等传统系统提示词"，指令语可能是 400 诱因）
+        - "list" ：system.content 为 [{"type":"text","text":...}]（对齐多模态结构）
+        - "none" ：不带 system（降级路径）"""
         uri = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
         messages = []
-        if context_words:
-            ctx = ("业余无线电点名应答转写。以下为背景实体词表，请优先正确识别："
-                   + "、".join(context_words))
-            messages.append({"role": "system", "content": ctx})
+        if context_words and sys_style != "none":
+            vocab = "、".join(context_words)
+            if sys_style == "list":
+                sys_content = [{"type": "text", "text":
+                                "业余无线电点名应答转写。以下为背景实体词表，"
+                                "请优先正确识别：" + vocab}]
+            elif sys_style == "bare":
+                sys_content = vocab
+            else:
+                sys_content = ("业余无线电点名应答转写。以下为背景实体词表，"
+                               "请优先正确识别：" + vocab)
+            messages.append({"role": "system", "content": sys_content})
         messages.append({"role": "user",
                          "content": [{"type": "input_audio",
                                       "input_audio": {"data": uri}}]})
@@ -374,39 +415,68 @@ class AsrClient:
             body["asr_options"] = asr_opts
         return body
 
-    def transcribe(self, wav_bytes, context_words=None):
-        # 自动降级重试：qwen3-asr-flash 的 OpenAI 兼容实现"仅允许设置一组消息"，
-        # 带 system 词表消息时可能报 400（does not support this input）。
-        # 第一次失败→去掉 system 重试；再失败→去掉 asr_options 重试。
+    # ---------- 长连接请求 ----------
+    def _request(self, body, retry_conn=True):
+        """POST JSON 到 /chat/completions，复用长连接。返回 (status, body_bytes)。
+        响应体必须读完（http.client 才能继续复用连接）；连接被服务端关闭
+        （空闲超时/断链）时重建一次重试。"""
+        from urllib.parse import urlparse
+        u = urlparse(self.base_url)
+        path = u.path.rstrip("/") + "/chat/completions"
+        if self._conn is None or (u.hostname, u.port or 443) != (self._conn_host, self._conn_port):
+            self._conn = http.client.HTTPSConnection(
+                u.hostname, u.port or 443, timeout=self.timeout)
+            self._conn_host, self._conn_port = u.hostname, u.port or 443
+        conn = self._conn
+        req_body = json.dumps(body).encode("utf-8")
+        headers = {"Authorization": "Bearer " + self.api_key,
+                   "Content-Type": "application/json",
+                   "Connection": "keep-alive"}
+        try:
+            conn.request("POST", path, body=req_body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()                  # 读完 body 才能复用连接
+            return resp.status, data
+        except (http.client.HTTPException, OSError) as e:
+            if retry_conn:
+                # 长连接被服务端关闭（空闲超时等）→ 重建后重试一次（幂等 POST，安全）
+                logger.info(f"ASR 长连接失效，重建重试（{type(e).__name__}）")
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                return self._request(body, retry_conn=False)
+            raise
+
+    def transcribe(self, wav_bytes, context_words=None, sys_style=None):
+        # 自动降级重试：qwen3-asr-flash 的 OpenAI 兼容实现带 system 词表消息时
+        # 实测报 400（does not support this input）。链：带 system → 去 system →
+        # 再去 asr_options。sys_style 显式传入时（--asr-probe）不降级、按指定格式试。
         for attempt in (1, 2, 3):
+            style = sys_style if sys_style is not None else (
+                "str" if attempt == 1 else "none")
             body = self._build_body(
                 wav_bytes,
-                context_words if attempt == 1 else None,
-                with_asr_opts=(attempt <= 2))
-            req = urllib.request.Request(
-                self.base_url + "/chat/completions",
-                data=json.dumps(body).encode("utf-8"),
-                headers={"Authorization": "Bearer " + self.api_key,
-                         "Content-Type": "application/json"},
-                method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    out = json.loads(resp.read().decode("utf-8"))
+                context_words if style != "none" else None,
+                with_asr_opts=(attempt <= 2),
+                sys_style=style)
+            status, data = self._request(body)
+            detail = data.decode("utf-8", "replace")
+            if status == 200:
+                out = json.loads(detail)
                 break
-            except urllib.error.HTTPError as e:
-                # 把服务端错误正文带进日志（Key/模型未开通/地域/音频无效各自报错不同）
-                detail = e.read().decode("utf-8", "replace")[:600]
-                logger.error(f"ASR HTTP {e.code}: {detail}")
-                if (e.code == 400 and attempt < 3
-                        and ("does not support this input" in detail
-                             or "InvalidParameter" in detail)):
-                    if attempt == 1:
-                        logger.warning("ASR 400：尝试去掉 system 词表消息重试"
-                                       "（OpenAI 兼容可能仅支持单组 user 消息）")
-                    else:
-                        logger.warning("ASR 400：尝试去掉 asr_options 重试")
-                    continue
-                raise
+            logger.error(f"ASR HTTP {status}: {detail[:600]}")
+            if (status == 400 and attempt < 3 and sys_style is None
+                    and ("does not support this input" in detail
+                         or "InvalidParameter" in detail)):
+                if attempt == 1:
+                    logger.warning("ASR 400：尝试去掉 system 词表消息重试"
+                                   "（OpenAI 兼容可能仅支持单组 user 消息）")
+                else:
+                    logger.warning("ASR 400：尝试去掉 asr_options 重试")
+                continue
+            raise RuntimeError(f"ASR HTTP {status}: {detail[:200]}")
         else:
             raise RuntimeError("ASR 请求连续失败")
         content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -524,12 +594,17 @@ class NetControlSession:
         self._stop = threading.Event()
         self._thread = None
         self._seg_queue = queue.Queue(maxsize=64)
-        self._checked_in = []                   # [(call, signal, wav, raw)]
+        self._checked_in = []  # [(call, signal, wav, raw, info)]  info=后续补充信息（QTH/设备等）
         self._checked_calls = set()
         self._dups = 0
         self._failed = 0
         self._retry_pending = False
         self._retry_left = int(nc_cfg("max_retry", default=1))
+        # "当前正在点名"的友台上下文：抄收呼号后保留，后续不带呼号的补充段
+        # （QTH/设备/天线/功率等）按来源 session 归入该友台，不再当"未抄收"。
+        self._current_call = None           # 当前台上友台呼号（大写）
+        self._current_session = None        # 抄收该呼号的语音段来源 session
+        self._current_entry = None          # 指向 _checked_in 中该友台的条目（引用）
         self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
         self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
@@ -646,10 +721,10 @@ class NetControlSession:
                 logger.info(f"已到点名总时长，且连续 {quiet_end:.0f}s 无应答，收尾")
                 break
             try:
-                pcm16, dur, wav = self._seg_queue.get(timeout=1.0)
+                pcm16, dur, wav, session = self._seg_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            self._process_segment(pcm16, dur, wav)
+            self._process_segment(pcm16, dur, wav, session)
 
     def _run_roster(self):
         roster = [str(x).upper() for x in (nc_cfg("roster", default=[]) or [])]
@@ -665,19 +740,20 @@ class NetControlSession:
             self._speak(self._fmt(nc_cfg("roster_call_text", default="请{call_phonetic}回答。Over"),
                                   call=call, call_phonetic=callsign_phonetic(call)))
             try:
-                pcm16, dur, wav = self._seg_queue.get(
+                pcm16, dur, wav, session = self._seg_queue.get(
                     timeout=float(nc_cfg("roster_call_timeout", default=12)))
             except queue.Empty:
                 self._speak(self._fmt(nc_cfg("no_reply_text",
                                              default="无人应答，继续下一位。")))
                 continue
-            self._process_segment(pcm16, dur, wav)
+            self._process_segment(pcm16, dur, wav, session)
         logger.info("固定名单点名结束")
 
     # ---------- 应答处理 ----------
-    def _process_segment(self, pcm16, dur, wav):
+    def _process_segment(self, pcm16, dur, wav, session=None):
         self._last_activity = time.time()
-        logger.info(f"收到应答段 {dur:.1f}s（{Path(wav).name if wav else '未落盘'}）")
+        logger.info(f"收到应答段 {dur:.1f}s（{Path(wav).name if wav else '未落盘'}）"
+                    f"{' session=' + str(session) if session is not None else ''}")
         raw = self._asr_text(pcm16)
         logger.info(f"ASR: {raw}")
         res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
@@ -692,17 +768,40 @@ class NetControlSession:
                                   call=call, call_phonetic=callsign_phonetic(call)))
             return
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
-            self._checked_in.append((call, signal or "", wav or "", raw or ""))
+            entry = [call, signal or "", wav or "", raw or "", ""]
+            self._checked_in.append(entry)
             self._checked_calls.add(call.upper())
             self._retry_pending = False
             self._retry_left = int(nc_cfg("max_retry", default=1))  # 关键：成功抄收后恢复额度，
             # 否则下一个新友台首次未抄收也会被静默（实测 17:26:53 起机器人哑巴的根因）
+            # 保存"当前友台"上下文：后续不带呼号的补充段按 session 归入该友台
+            self._current_call = call.upper()
+            self._current_session = session
+            self._current_entry = entry
             ack = self._fmt(nc_cfg("ack_text", default=
                 "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
                 "请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over"),
                 call=call, call_phonetic=callsign_phonetic(call), report=signal or "")
             logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
             self._speak(ack)
+            return
+        # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
+        # 点名流程中友台报完呼号后，补充 QTH/设备/天线/功率时通常不再重复呼号
+        # （17:26:51 实测段"我的QTH在咸阳市…设备即时通…五瓦功率发射"即此场景）。
+        # 归入条件：已有当前友台 且 段来源 session 与其一致（session 缺失时保守归入）。
+        if (self._current_call is not None
+                and (session is None or self._current_session is None
+                     or session == self._current_session)):
+            info = raw or ""
+            prev_info = self._current_entry[4] or ""
+            self._current_entry[4] = (prev_info + " " + info).strip()
+            if signal and not self._current_entry[1]:
+                self._current_entry[1] = signal
+            logger.info(f"{self._current_call} 补充信息：{info}")
+            self._speak(self._fmt(nc_cfg("info_ack_text", default=
+                "抄收，{call_phonetic}，您的信息已记录，请下一位友台。Over"),
+                call=self._current_call,
+                call_phonetic=callsign_phonetic(self._current_call)))
             return
         # 低置信度：请求重复（限次）
         if self._retry_pending or self._retry_left <= 0:
@@ -717,7 +816,7 @@ class NetControlSession:
         target = call or ""
         report_kw = ("QTH", "qth", "Q T", "Q T H", "设备", "天线", "功率", "瓦", "信号")
         if any(k in (raw or "") for k in report_kw):
-            # 友台已报位置/设备等详细信息但呼号缺失 → 确认抄收并礼貌请其补报呼号
+            # 友台已报位置/设备等详细信息但呼号缺失（且非当前友台）→ 确认抄收并礼貌请其补报呼号
             logger.info(f"置信度 {score}，已识别报告内容但缺呼号，请求补报呼号"
                         f"（剩余额度 {self._retry_left}）")
             self._speak(self._fmt(nc_cfg("repeat_report_text", default=
@@ -763,7 +862,8 @@ class NetControlSession:
                 save_dir = None
         self._capture = VoiceCapture(
             save_dir=save_dir,
-            on_segment=lambda pcm16, dur, wav: self._seg_queue.put((pcm16, dur, wav)))
+            on_segment=lambda pcm16, dur, wav, session: self._seg_queue.put(
+                (pcm16, dur, wav, session)))
         if self.link is not None:
             self.link._on_downlink = self._on_downlink      # 注册下行分发（点名期间）
         logger.info(f"接收侧就绪（VAD 阈值 {self._capture.threshold}，"
@@ -805,7 +905,7 @@ class NetControlSession:
                         self._decoder = direct_announce.OpusDecoder()
                     pcm = self._decoder.decode(voice["opus"])
                     if pcm:
-                        self._capture.feed(pcm)
+                        self._capture.feed(pcm, voice["session"])
             elif msg_type == 15:
                 # UserTalking: f1=session, f2=talking(0/1)
                 d = direct_announce.pb_dict(payload)
@@ -935,6 +1035,11 @@ def main():
     ap.add_argument("--asr-test", nargs="?", const="", metavar="WAV",
                     help="ASR 接口自测：传 WAV 文件路径，或留空用 2 秒合成音测试"
                          "（打印完整识别结果/服务端错误正文，用于排查 Key/模型/地域/音频问题）")
+    ap.add_argument("--asr-probe", nargs="?", const="", metavar="WAV",
+                    help="system 词表格式探测：依次用 5 种请求变体调用 ASR，"
+                         "打印各自 HTTP 状态码与错误正文/识别结果，定位带 system 词表"
+                         "报 400 的正确姿势（str=字符串+引导语 / list=content数组 / "
+                         "bare=纯词表 / none=无system基线 / no-opts=无asr_options）")
     args = ap.parse_args()
     if args.decode:
         res = decode_callsign(args.decode)
@@ -983,6 +1088,51 @@ def main():
             print("若为 HTTP 400/404：检查 api_key、模型名、地域支持（美国地域不支持"
                   "OpenAI 兼容模式）；若是音频类报错请换用真实录音文件重试，"
                   "例如：python3 net_control.py --asr-test /app/net_records/seg_xxx.wav")
+        return
+    if args.asr_probe is not None:
+        if args.asr_probe:
+            wav_bytes = Path(args.asr_probe).read_bytes()
+        else:
+            import math
+            pcm16 = bytearray()
+            for i in range(16000 * 2):              # 2 秒 1kHz 正弦 16bit @16k
+                v = int(12000 * math.sin(2 * math.pi * 1000 * i / 16000))
+                pcm16 += struct.pack("<h", v)
+            wav_bytes = pcm_to_wav_bytes(bytes(pcm16))
+        client = AsrClient(
+            api_key=nc_cfg("asr", "api_key", default=""),
+            model=nc_cfg("asr", "model", default="qwen3-asr-flash"),
+            base_url=nc_cfg("asr", "base_url",
+                            default="https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            enable_itn=nc_cfg("asr", "enable_itn", default=True),
+            language=nc_cfg("asr", "language", default=""))
+        print(f"system 词表格式探测: model={client.model} 音频={len(wav_bytes)}B")
+        print(f"base_url={client.base_url}  api_key={'已配置' if client.api_key else '空'}\n")
+        variants = [
+            ("V1 str+opts    ", "str", True),
+            ("V2 list+opts   ", "list", True),
+            ("V3 bare+opts   ", "bare", True),
+            ("V4 none+opts   ", "none", True),
+            ("V5 str+no-opts ", "str", False),
+        ]
+        vocab = ["BRAVO", "HOTEL", "BH3XX", "BG9ABC", "泉盛", "咸阳市"]
+        for label, style, with_opts in variants:
+            body = client._build_body(wav_bytes, context_words=vocab,
+                                      with_asr_opts=with_opts, sys_style=style)
+            status, data = client._request(body)
+            detail = data.decode("utf-8", "replace")
+            if status == 200:
+                try:
+                    out = json.loads(detail)
+                    content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    print(f"{label} → HTTP 200  识别: {content!r}")
+                except Exception as e:
+                    print(f"{label} → HTTP 200  解析失败: {e}")
+            else:
+                print(f"{label} → HTTP {status}  {detail[:240]}")
+        print("\n结论：V1 若 400 而 V4 成功 → system 是触发点；"
+              "再对比 V2/V3/V5 可定位正确格式。找到后把 net_control 的 ASR 词表"
+              "请求改用该格式（改 _build_body 默认 sys_style）。")
         return
     ap.print_help()
 
