@@ -686,6 +686,7 @@ class NetControlSession:
             logger.info(f"重复抄收 {call}，跳过")
             self._dups += 1
             self._retry_pending = False
+            self._retry_left = int(nc_cfg("max_retry", default=1))  # 有效应答，恢复重复请求额度
             self._speak(self._fmt(nc_cfg("dup_text", default="{call_phonetic} 已经抄收过，"
                                                              "请下一位友台。"),
                                   call=call, call_phonetic=callsign_phonetic(call)))
@@ -694,6 +695,8 @@ class NetControlSession:
             self._checked_in.append((call, signal or "", wav or "", raw or ""))
             self._checked_calls.add(call.upper())
             self._retry_pending = False
+            self._retry_left = int(nc_cfg("max_retry", default=1))  # 关键：成功抄收后恢复额度，
+            # 否则下一个新友台首次未抄收也会被静默（实测 17:26:53 起机器人哑巴的根因）
             ack = self._fmt(nc_cfg("ack_text", default=
                 "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
                 "请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over"),
@@ -706,14 +709,24 @@ class NetControlSession:
             logger.warning(f"未抄收（{'/'.join(res['reasons'])}）文本: {raw}")
             self._failed += 1
             self._retry_pending = False
+            if raw and raw.strip():
+                logger.info("重复请求额度已用尽，静默等待下一位友台")
             return
         self._retry_pending = True
         self._retry_left -= 1
         target = call or ""
-        logger.info(f"置信度 {score}，请求重复呼号")
-        self._speak(self._fmt(nc_cfg("repeat_text", default=
-            "{call_phonetic}，请重复一遍您的呼号。"), call=target,
-            call_phonetic=callsign_phonetic(target) or "上一位友台"))
+        report_kw = ("QTH", "qth", "Q T", "Q T H", "设备", "天线", "功率", "瓦", "信号")
+        if any(k in (raw or "") for k in report_kw):
+            # 友台已报位置/设备等详细信息但呼号缺失 → 确认抄收并礼貌请其补报呼号
+            logger.info(f"置信度 {score}，已识别报告内容但缺呼号，请求补报呼号"
+                        f"（剩余额度 {self._retry_left}）")
+            self._speak(self._fmt(nc_cfg("repeat_report_text", default=
+                "抄收您的位置与设备信息，请再报一次您的呼号，Over")))
+        else:
+            logger.info(f"置信度 {score}，请求重复呼号（剩余额度 {self._retry_left}）")
+            self._speak(self._fmt(nc_cfg("repeat_text", default=
+                "{call_phonetic}，请重复一遍您的呼号。"), call=target,
+                call_phonetic=callsign_phonetic(target) or "上一位友台"))
 
     def _speak_summary(self):
         n = len(self._checked_in)

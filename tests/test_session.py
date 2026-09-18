@@ -4,7 +4,7 @@
 点名会话状态机测试（离线，桩 ASR/TTS）。
 运行：python3 tests/test_session.py
 覆盖：正常抄收→确认、重复抄收→提示跳过、低置信度→请重复（限次）→未抄收、
-     固定名单模式超时跳过、开放模式窗口结束汇总、开场白占位符与到点安静收尾。
+     固定名单模式超时跳过、开放模式窗口结束汇总。
 """
 import sys
 from pathlib import Path
@@ -54,10 +54,11 @@ def test_open_flow():
         "Bravo Hotel Three X-ray X-ray 信号五九",   # 正常抄收
         "Bravo Hotel Three X-ray X-ray 信号五九",   # 重复
         "信号很好",                                  # 低置信度 → 请重复
-        "BG9ABC",                                   # 重复请求后仍未解释法 → 但直读合法 → 抄收
-        "这个听不清",                                # 低置信度（重试已用完）→ 未抄收
+        "BG9ABC",                                   # 重复请求后直读合法呼号 → 抄收（额度恢复）
+        "这个听不清",                                # 下一位友台低置信度 → 额度已恢复，再次请重复
+        "还是听不清",                                # 连续低置信度（额度用尽）→ 未抄收
     ])
-    for _ in range(5):
+    for _ in range(6):
         sess._process_segment(b"\x00" * 32000, 1.0, "")
     check("抄收 BH3XX", [c for c, *_ in sess._checked_in] == ["BH3XX", "BG9ABC"])
     check("重复计数", sess._dups == 1)

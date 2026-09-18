@@ -197,6 +197,41 @@ def test_config_defaults():
     check("默认解释词可用", net_control.PHONETIC_ITU["bravo"] == "B")
 
 
+def test_retry_reset():
+    print("[重试额度恢复（成功抄收后不再哑巴）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._teardown_dir = None
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda text: spoken.append(text)
+
+    # 段1：友台报了完整信息但无呼号 → 应请求补报呼号（额度 1→0）
+    sess._asr_text = lambda pcm: "我的QTH是在咸阳市，设备即时通，天线原机天线，五瓦功率发射"
+    sess._process_segment(b"\x00" * 32000, 1.0, None)
+    check("无呼号段触发引导播报", len(spoken) == 1 and "呼号" in spoken[0],
+          f"spoken={spoken}")
+    check("引导后额度已用尽", sess._retry_left == 0)
+
+    # 段2：下一位友台成功抄收 → 额度恢复
+    sess._asr_text = lambda pcm: "这里是BH3XX，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None)
+    check("成功抄收", len(spoken) == 2 and "Bravo Hotel Three X-ray X-ray" in spoken[1],
+          f"spoken={spoken}")
+    check("抄收后额度恢复", sess._retry_left == 1 and not sess._retry_pending,
+          f"retry_left={sess._retry_left}")
+
+    # 段3：又一个新友台无呼号 → 必须再次有引导播报（回归：旧代码此处静默）
+    sess._asr_text = lambda pcm: "这里是，我的设备是泉盛K6，天线原机天线，五瓦"
+    sess._process_segment(b"\x00" * 32000, 1.0, None)
+    check("抄收后新友台无呼号仍有引导", len(spoken) == 3 and "呼号" in spoken[2],
+          f"spoken={spoken}")
+
+    # 段4：连续无呼号（额度已尽）→ 静默但计数
+    sess._process_segment(b"\x00" * 32000, 1.0, None)
+    check("额度用尽后静默", len(spoken) == 3 and sess._failed == 1,
+          f"spoken={spoken} failed={sess._failed}")
+
+
 def test_templates():
     print("[话术模板（TTS 占位符）]")
     check("解释法回读", callsign_phonetic("BH3XX") == "Bravo Hotel Three X-ray X-ray")
@@ -229,7 +264,7 @@ def main():
     print("== 点名主播离线单元测试 ==")
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
-               test_asr_body, test_config_defaults, test_templates]:
+               test_asr_body, test_config_defaults, test_retry_reset, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
