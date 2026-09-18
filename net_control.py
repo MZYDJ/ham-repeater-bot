@@ -253,6 +253,8 @@ def callsign_phonetic(call):
 
 FIELD_LABEL = {"qth": "QTH", "device": "设备", "antenna": "天线",
                "power": "功率", "signal": "信号"}
+# 点名应答应记录的核心结构化字段（抄收后若缺失则主动追问，每字段最多问一次）
+REQUIRED_FIELDS = ("signal", "qth", "device", "antenna", "power")
 
 
 def extract_report_fields(text):
@@ -785,6 +787,7 @@ class NetControlSession:
         self._play_lock = threading.Lock()  # 发射串行化：嵌套播报排队，不并发抢麦
         self._decoder = None
         self._capture = None
+        self._asked_fields = {}      # call → set(已追问过的缺失字段)：结构化追问每字段最多一次
         self._net_ctx = {}          # 话术模板上下文（_run 启动时填充）
         self._started_at = None
         self.summary = {}
@@ -1034,6 +1037,7 @@ class NetControlSession:
                             break
                     self._checked_calls.discard(cur.upper())
                     self._fields.pop(cur.upper(), None)
+                    self._asked_fields.pop(cur.upper(), None)   # 纠正替换：追问计数随旧记录清除
                     self._checkin_times.pop(cur.upper(), None)
                     self._current_call = None     # 由 _do_checkin 重建上下文
                     self._current_session = None
@@ -1053,6 +1057,9 @@ class NetControlSession:
                 # （排除纠正词：'不正确'含'正确'子串，先命中 correct 分支；
                 #   长度放宽到 12 以容纳'呼号正确，没问题'等完整确认）
                 logger.info(f"{self._current_call} 确认收到: {info}")
+                # 确认后若核心结构化字段仍缺失 → 追问缺失项（每字段最多一次）
+                if self._ask_missing(self._current_call):
+                    return
                 self._speak(self._fmt(nc_cfg("confirm_text", default=
                     "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
                     call=self._current_call,
@@ -1086,6 +1093,9 @@ class NetControlSession:
                         call_phonetic=callsign_phonetic(self._current_call),
                         info=info))
                 self._flush_csv()          # 实时落盘：结构化字段更新即写入
+                # 结构化信息仍未记全 → 追问缺失项（每字段最多问一次），齐了才请下一位
+                if self._ask_missing(self._current_call):
+                    return
                 return
             # 无结构化字段的文本分类：
             if any(k in kw for k in ask_kw):
@@ -1111,7 +1121,8 @@ class NetControlSession:
         # LLM 兜底（可选，llm.enabled=true）：确定性解码低置信度/未解出呼号且
         # 文本非空时，先让 LLM 尝试修复呼号与信号——命中直接按抄收处理，
         # 避免"请重复"空耗一轮；失败/未启用则原样走低置信度流程
-        if (call is None or score < thr) and clean_report_text(raw):
+        if (call is None or score < thr) and clean_report_text(raw) \
+                and self._looks_like_report(raw):
             fix = self._llm_fix(raw, res)
             if fix:
                 call2, sig2, score2 = fix["callsign"], fix["signal"], fix["score"]
@@ -1149,6 +1160,33 @@ class NetControlSession:
                 "{call_phonetic}，请重复一遍您的呼号。"), call=target,
                 call_phonetic=callsign_phonetic(target) or "上一位友台"))
 
+    def _missing_fields(self, call):
+        """返回该友台尚未记录的核心结构化字段列表（signal/qth/device/antenna/power）。
+        "没有天线""没有功率"等已作为值记录 → 视为已填，不再追问。"""
+        call = (call or "").upper()
+        fd = self._fields.get(call, {}) or {}
+        return [k for k in REQUIRED_FIELDS
+                if not str(fd.get(k) or "").strip()]
+
+    def _ask_missing(self, call):
+        """结构化信息未记全 → 主动追问缺失项（每字段每友台最多问一次，防无限循环）。
+        返回 True=已追问（调用方应 return）；False=无未问过的缺失字段。"""
+        call = (call or "").upper()
+        if not call:
+            return False
+        asked = self._asked_fields.setdefault(call, set())
+        missing = [k for k in self._missing_fields(call) if k not in asked]
+        if not missing:
+            return False
+        for k in missing:
+            asked.add(k)
+        labels = "、".join(FIELD_LABEL.get(k, k) for k in missing)
+        logger.info(f"{call} 结构化信息缺失，追问: {labels}")
+        self._speak(self._fmt(nc_cfg("missing_ask_text", default=
+            "抄收，{call_phonetic}，信息已记录，请再补充您的{missing}，Over"),
+            call=call, call_phonetic=callsign_phonetic(call), missing=labels))
+        return True
+
     def _do_checkin(self, call, signal, wav, raw, session, score):
         """抄收一位友台：入册 + 恢复额度 + 建立当前友台上下文 + 播确认 + 实时落盘。"""
         entry = [call, signal or "", wav or "", raw or "", ""]
@@ -1167,6 +1205,7 @@ class NetControlSession:
         self._current_call = call.upper()
         self._current_session = session
         self._current_entry = entry
+        self._asked_fields.setdefault(call.upper(), set())  # 结构化追问独立计数
         ack = self._fmt(nc_cfg("ack_text", default=
             "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
             "请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over"),
@@ -1174,6 +1213,25 @@ class NetControlSession:
         logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
         self._speak(ack)
         self._flush_csv()          # 实时落盘：新友台抄收即写入
+
+    def _looks_like_report(self, raw):
+        """LLM 兜底触发预检：只有文本"看起来像"点名应答（含解释法词/呼号特征/
+        信息关键词）才值得调 LLM——过滤 ASR 幻觉垃圾（"不让我就去死"、
+        "少回答那这个就到这为止"等），实测垃圾文本也触发 LLM 白等 5s 拖慢点名。"""
+        t = (raw or "").upper()
+        if not t.strip():
+            return False
+        if re.search(r"\b(?:ALPHA|BRAVO|CHARLIE|DELTA|ECHO|FOXTROT|GOLF|HOTEL|"
+                     r"INDIA|JULIET|KILO|LIMA|MIKE|NOVEMBER|OSCAR|PAPA|QUEBEC|"
+                     r"ROMEO|SIERRA|TANGO|UNIFORM|VICTOR|WHISKEY|XRAY|YANKEE|"
+                     r"ZULU|NINER)\b", t):
+            return True
+        if re.search(r"[A-Z]{1,3}\d[A-Z]{0,3}", t):
+            return True
+        if any(k in t for k in ("呼号", "这里是", "QTH", "设备", "天线",
+                                "功率", "信号", "抄收", "主控", "点名")):
+            return True
+        return False
 
     def _llm_fix(self, raw, res):
         """低置信度时用 LLM 兜底修复呼号/信号（net_control.llm.enabled=true 时）。
@@ -1210,9 +1268,9 @@ class NetControlSession:
                 target=lambda: box.__setitem__("d", self._llm.extract(raw)),
                 daemon=True)
             tt.start()
-            tt.join(timeout=5)
+            tt.join(timeout=3)
             if tt.is_alive():
-                logger.warning("LLM 兜底超时（5s），放弃本次修复")
+                logger.warning("LLM 兜底超时（3s），放弃本次修复")
                 self._llm_fails += 1
                 return None
             d = box.get("d", {})
