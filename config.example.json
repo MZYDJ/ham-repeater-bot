@@ -54,5 +54,74 @@
   "notify": {
     "webhook_url": "",
     "webhook_log_level": "WARNING"
+  },
+  "net_control": {
+    "enabled": false,
+    "weekday": [
+      0
+    ],
+    "hour": 20,
+    "minute": 0,
+    "net": {
+      "net_name": "应急通讯演练台网点名",
+      "repeater_call": "BR9AB",
+      "ctrl_call": "BI9BZW",
+      "ctrl_phonetic": "Bravo India Nine Bravo Zulu Whiskey",
+      "main_qth": "咸阳市渭城区塔尔坡",
+      "main_device": "泉盛K6",
+      "main_antenna": "原机天线",
+      "main_power": "5瓦",
+      "frequency": "",
+      "offset": "",
+      "tone": ""
+    },
+    "opening_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是每周{weekday}晚{net_name}，我是今晚主控{ctrl_call}，今天是{date}，现在是北京时间{time}，我的QTH位于{main_qth}，所用设备{main_device}，{main_antenna}，{main_power}功率发射，现在开始台网点名，请抄收到信号的友台依次上台报告你的呼号、QTH、使用设备、天线、功率以及抄收到主控台的信号报告，这里是{ctrl_phonetic} {ctrl_call}，Over",
+    "listen_after_open_seconds": 60,
+    "max_net_seconds": 1800,
+    "quiet_end_seconds": 10,
+    "grace_seconds": 300,
+    "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
+    "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
+    "info_ack_text": "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over",
+    "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",
+    "dup_text": "{call_phonetic} 已经抄收过，请下一位友台。",
+    "no_reply_text": "无人应答，继续下一位。",
+    "summary_text": "本次点名共抄收{n}位友台：{calls}。",
+    "closing_text": "CQ CQ CQ，现在是北京时间{time}，{net_name}到此结束，我是本次主控{ctrl_call}，本次参与台网点名的共有{n}位友台，非常感谢各位友台积极参与，接下来各位友台可以自由通联，73！",
+    "ask_ack_text": "抄收，{call_phonetic}，您的呼号已记录，请报告您的QTH、使用设备、天线、功率，Over",
+    "tx_wait_timeout": 30,
+    "vad_threshold": 800,
+    "silence_end_ms": 1000,
+    "min_segment_ms": 400,
+    "max_segment_ms": 15000,
+    "use_talking_gate": true,
+    "asr_min_seconds": 1.0,
+    "callsign_regex": "^B[A-Z]\\d[A-Z]{1,3}$",
+    "confidence_threshold": 60,
+    "max_retry": 1,
+    "extra_vocab": [],
+    "save_audio": true,
+    "audio_dir": "/app/net_records",
+    "roster_mode": false,
+    "roster": [],
+    "roster_call_text": "请{call_phonetic}回答。Over",
+    "roster_call_timeout": 12,
+    "roster_max_seconds": 1800,
+    "asr": {
+      "api_key": "",
+      "model": "qwen3-asr-flash",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "enable_itn": true,
+      "language": ""
+    },
+    "llm": {
+      "enabled": false,
+      "api_key": "",
+      "model": "glm-4.5-flash",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+    },
+    "ptt_release_delay_ms": 1000,
+    "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",
+    "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over"
   }
 }

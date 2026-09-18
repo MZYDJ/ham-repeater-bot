@@ -203,6 +203,70 @@ class OpusEncoder:
         if n < 0:
             raise RuntimeError("opus_encode 错误码 %d" % n)
         return ctypes.string_at(ctypes.addressof(out), n)
+class OpusDecoder:
+    """Opus 解码器（ctypes 直调 libopus0）：链路下行语音包 → PCM s16le 单声道 48kHz。
+    点名主播接收侧用，与 OpusEncoder 镜像。libopus0 已在镜像内，无新增依赖。
+    线程安全：decode/close 互斥（点名会话 teardown 时 keeper 线程可能正在
+    decode，直接 destroy 会 use-after-free 触发 libopus 内部断言崩溃——
+    日志特征: "assertion failed: st->channels == 1 || st->channels == 2"）。"""
+    def __init__(self, rate=48000, channels=1):
+        lib = load_lib(["opus", "libopus.so.0", "libopus.so"])
+        if lib is None:
+            raise RuntimeError("未找到 libopus，请先执行: apt-get install -y libopus0")
+        lib.opus_decoder_create.restype = ctypes.c_void_p
+        lib.opus_decoder_create.argtypes = [ctypes.c_int, ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_int)]
+        lib.opus_decode.restype = ctypes.c_int
+        lib.opus_decode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte),
+                                    ctypes.c_int32, ctypes.POINTER(ctypes.c_int16),
+                                    ctypes.c_int32, ctypes.c_int]
+        lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
+        self.lib = lib
+        self._lock = threading.Lock()
+        err = ctypes.c_int(0)
+        raw = lib.opus_decoder_create(rate, channels, ctypes.byref(err))
+        if err.value != 0 or not raw:
+            raise RuntimeError("opus_decoder_create 失败: err=%s" % err.value)
+        self.state = ctypes.c_void_p(raw)
+    def decode(self, opus_bytes):
+        """Opus 包 → PCM s16le 单声道字节流（48kHz）。
+
+        平台关键事实：下行 180B 语音包是发送端**逐帧编码后串联**的
+        6 个独立 20ms Opus 帧（build_audio：每帧 30B CBR，6 帧拼一包），
+        并非 RFC 多帧包。若把 180B 整体喂给 opus_decode，只会解出首帧
+        （960 样本=20ms），其余 150B 被忽略 → 录音变成约 6 倍速+跳变
+        （capture_downlink.py 实测：整包解码全部只出 960 样本）。
+        修复：按 30B 帧切分、逐帧解码、拼接输出。尾帧不足 30B 补零
+        （与发送端尾包补零一致）；无效帧输出静音帧，时长不塌陷。"""
+        with self._lock:
+            if self.state is None or self.lib is None:
+                return b""
+            if not opus_bytes:
+                return b""
+            frame_size = 30
+            data = opus_bytes
+            tail = len(data) % frame_size
+            if tail:
+                data = data + b"\x00" * (frame_size - tail)
+            out = bytearray()
+            for off in range(0, len(data), frame_size):
+                frame = data[off:off + frame_size]
+                buf_in = (ctypes.c_ubyte * frame_size).from_buffer_copy(frame)
+                buf_out = (ctypes.c_int16 * 5760)()
+                n = self.lib.opus_decode(self.state, buf_in, frame_size,
+                                         buf_out, 5760, 0)
+                if n < 0:
+                    n = 960               # 无效/补零帧 → 一帧静音，时长不塌陷
+                out += ctypes.string_at(ctypes.addressof(buf_out), n * 2)
+            return bytes(out)
+    def close(self):
+        with self._lock:
+            try:
+                if self.state is not None:
+                    self.lib.opus_decoder_destroy(self.state)
+            except Exception:
+                pass
+            self.state = None
 # ---------------- libmpg123 解码器（ctypes 直调） ----------------
 class Mpg123Decoder:
     """mp3 → PCM s16le 单声道 48kHz。libmpg123 内部完成下混+重采样。"""
@@ -313,6 +377,52 @@ def m_varint_enc(n):
     if n < 0x10000000:
         return bytes([0xE0 | (n >> 24), (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF])
     raise ValueError("varint 值过大: %d" % n)
+def m_varint_dec(data, i):
+    """Mumble UDP 语音包头 varint 解码（前缀式，与 m_varint_enc 镜像）。"""
+    b = data[i]
+    if b < 0x80:
+        return b, i + 1
+    if b < 0xC0:
+        return ((b & 0x3F) << 8) | data[i + 1], i + 2
+    if b < 0xE0:
+        return ((b & 0x1F) << 16) | (data[i + 1] << 8) | data[i + 2], i + 3
+    if b < 0xF0:
+        return ((b & 0x0F) << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3], i + 4
+    raise ValueError("Mumble varint 越界")
+def parse_udp_voice_multi(payload, own_session=None):
+    """解析下行 UDPTunnel 载荷中的**全部**语音包（服务器按批转发，
+    一个载荷可能串联多个连续语音包，如 600ms 批 5 包×120ms）。
+    若只取第一个包，其余包被丢弃会导致录音变成倍速+断续。
+    返回 list of dict(session, seq, opus)。"""
+    out = []
+    i = 0
+    n = len(payload) if payload else 0
+    while i + 2 <= n:
+        if (payload[i] & 0xE0) != 0x20:
+            break                          # 非 Opus 语音，停止
+        try:
+            session, j = m_varint_dec(payload, i + 1)
+            seq, j = m_varint_dec(payload, j)
+            ln, j = m_varint_dec(payload, j)
+        except (ValueError, IndexError):
+            break
+        if ln <= 0 or j + ln > n:
+            break
+        if own_session is None or session != own_session:
+            out.append({"session": session, "seq": seq,
+                        "opus": payload[j:j + ln]})
+        i = j + ln
+    return out
+
+
+def parse_udp_voice(payload, own_session=None):
+    """解析链路下行语音包（UDPTunnel 内层，msg_type=1）。
+    标准 Mumble 下行格式: [0x20][varint session][varint seq][varint len][Opus数据]。
+    返回 dict(session, seq, opus) 或 None（非语音/长度异常/自己回声）。
+    own_session 传入时丢弃自己的回声包（防点名把播报内容识别成应答）。
+    兼容单包调用：内部走 parse_udp_voice_multi 取第一个。"""
+    pkts = parse_udp_voice_multi(payload, own_session)
+    return pkts[0] if pkts else None
 def trim_silence(pcm, threshold=None, min_ms=None):
     """s16le 单声道 48kHz PCM 头尾静音截断，各保留 min_ms 余量。"""
     if threshold is None:
@@ -486,10 +596,12 @@ class DirectAnnouncer:
             raise RuntimeError("抢麦失败: %s" % (d or "6秒无响应"))
         c.send(15, build_user_talking(self.session, True))
         print("抢麦成功，已上报 UserTalking(talking=true)")
-    def play(self, packets, verbose=True):
+    def play(self, packets, verbose=True, abort_check=None):
         """UserTalking 之后先等 LEAD_DELAY（官方时序 0.5s，中继台靠该间隔建链），
         再匀速发包(120ms/包)→尾巴冲刷→上报停止说话→放麦→收回执。成功返回 True。
-        必须在 take_mic() 之后调用。"""
+        必须在 take_mic() 之后调用。
+        abort_check：每批发包前调用的回调（返回 True 表示信道被他人占用/抢台，
+        立即停止发包并放麦让位，返回 False）。用于点名播报时检测他人讲话。"""
         c = self.c
         if verbose:
             print("延迟 %.0fms 后开始发包" % (LEAD_DELAY * 1000))
@@ -497,6 +609,13 @@ class DirectAnnouncer:
         start = time.time()
         n_sent = 0
         for i, pkt in enumerate(packets):     # 匀速 120ms/包（官方实时编码节奏，v6）
+            if abort_check is not None and abort_check():
+                # 他人抢台/讲话 → 立即放麦让位（不发送剩余包，避免与对方抢信道）
+                c.send(15, build_user_talking(self.session, False))
+                c.send(14, build_apply_mic(False))
+                if verbose:
+                    print("播报被抢占，已放麦让位（已发 %d/%d 包）" % (n_sent, len(packets)))
+                return False
             c.send(1, pkt)
             n_sent += 1
             if verbose and n_sent % 50 == 0:
@@ -532,12 +651,13 @@ class PersistentAnnouncer:
     上限防互踢风暴）；断线异常 → 守护线程自动重连，失败 10s 后再试。"""
     def __init__(self, host=HOST, port=PORT, use_tls=True,
                  username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL,
-                 ping_interval=2.5, on_event=None):
+                 ping_interval=2.5, on_event=None, on_downlink=None):
         self._cfg = dict(host=host, port=port, use_tls=use_tls,
                          username=username, password=password, ent_id=ent_id,
                          model=model)
         self._ping_interval = ping_interval
         self._on_event = on_event          # on_event(kind, detail)：removed/reconnected/dead
+        self._on_downlink = on_downlink    # on_downlink(msg_type, payload)：下行泵每帧回调（点名接收侧用）
         self._sess = None                  # 当前 DirectAnnouncer
         self._lock = threading.Lock()      # 串行化 socket IO 与会话获取
         self._busy = threading.Event()     # 播报独占标志
@@ -579,7 +699,21 @@ class PersistentAnnouncer:
     def _keeper(self):
         while not self._stop.is_set():
             time.sleep(0.5)
-            if self._busy.is_set():                # 播报独占期间让路
+            if self._busy.is_set():
+                # 播报独占期间仍泵下行（只读不写：socket 全双工，与播报线程 send 并发安全），
+                # 供点名接收侧做"他人抢台检测"——若 busy 时完全停泵，
+                # 播报期间友台说话会完全听不到（实测 19:46 抢台被无视的根因）
+                s = self._sess
+                if s is not None and s.c is not None:
+                    try:
+                        for t, p in s.c.drain():
+                            if self._on_downlink is not None:
+                                try:
+                                    self._on_downlink(t, p)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                 continue
             removed = False
             with self._lock:
@@ -596,6 +730,11 @@ class PersistentAnnouncer:
                                 self._last_ok = time.time()
                             elif t == 20 and pb_dict(p).get(1) == s.session:
                                 removed = True     # 自己被顶（同账号别处登录）
+                            if self._on_downlink is not None:
+                                try:
+                                    self._on_downlink(t, p)   # 分发下行帧（点名接收侧消费）
+                                except Exception:
+                                    pass
                     except Exception:
                         try:
                             s.close()
@@ -642,10 +781,11 @@ class PersistentAnnouncer:
     def ensure_session(self):
         """返回健康的独占会话；不健康返回 None（调用方走临时短链兜底）。
         纯状态查询（不碰 socket，与守护线程零竞争）：健康判据 = 守护线程最近
-        8 秒内收到过 Ping 回显。返回的会话处于独占态，播完必须 release()。"""
+        8 秒内收到过 Ping 回显。返回的会话处于独占态，播完必须 release()。
+        忙锁已占用时返回 None（点名与播报互斥：同一时刻只允许一个发射者）。"""
         with self._lock:
             s = self._sess
-            if (s is not None and s.c is not None
+            if (not self._busy.is_set() and s is not None and s.c is not None
                     and time.time() - self._last_ok <= 8.0):
                 self._busy.set()
                 return s

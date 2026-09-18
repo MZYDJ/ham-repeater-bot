@@ -87,5 +87,105 @@
                            // 留空 = 禁用告警；填了则日志达到指定级别时推送到群里
     "webhook_log_level": "WARNING"  // 触发推送的最低日志级别：
                                     // WARNING=仅告警+错误；ERROR=仅错误；INFO=全部
+  },
+
+  // ==================== net_control：点名主播（可选，默认关闭） ====================
+  // 功能：纯ASR + 本地状态机 + LLM信息提取（可选） + 独立TTS 的自动点名主持。
+  // 接收侧复用常驻链路下行（Opus解码+VAD切段），播报与点名共享 busy 锁互斥；
+  // 点名进行中会跳过整点播报。ASR 走阿里云百炼 qwen3-asr-flash（OpenAI兼容接口）。
+  // 字母解释法呼号：ASR 带词表上下文 → 词表确定性解码 → 呼号格式校验 → 已抄收去重 →
+  // 低置信度播报"请重复一遍呼号"（限次）。所有字段均可缺省，代码内置默认值兜底。
+  "net_control": {
+    "enabled": false,           // true=启用点名；false=完全不启动（默认，不影响播报）
+    "weekday": [0],             // 点名日期：空[]=每天；[0]=周一（0=周一 ... 6=周日）
+    "hour": 20,                 // 点名开始小时（24小时制）
+    "minute": 0,                // 点名开始分钟
+    // ---- 点名台网信息（话术模板的 {占位符} 来源，全部可缺省）----
+    "net": {
+      "net_name": "应急通讯演练台网点名",
+      "repeater_call": "BR9AB",   // 中继台呼号
+      "ctrl_call": "BI9BZW",      // 主控呼号
+      "ctrl_phonetic": "Bravo India Nine Bravo Zulu Whiskey",  // 主控呼号解释法（TTS 读单词更稳）
+      "main_qth": "咸阳市渭城区塔尔坡",
+      "main_device": "泉盛K6",
+      "main_antenna": "原机天线",
+      "main_power": "5瓦",
+      "frequency": "",            // 填了可拼进开场白（铜川变体示例见注释）
+      "offset": "",
+      "tone": ""
+    },
+    // ---- 话术模板（TTS 优化要点：呼号写解释法英文单词 {call_phonetic}；
+    // 时间写"北京时间{time}"；频率/亚音/功率用中文单位；保留 CQ/Over/73）----
+    // 动态占位符：{date}今天日期 {weekday}星期 {time}北京时间 {net_name} {repeater_call}
+    // {ctrl_call} {ctrl_phonetic} {main_qth} {main_device} {main_antenna} {main_power}
+    // {frequency} {offset} {tone} | 应答级：{call} {call_phonetic} {report} {n} {calls}
+    "opening_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是每周{weekday}晚{net_name}，我是今晚主控{ctrl_call}，今天是{date}，现在是北京时间{time}，我的QTH位于{main_qth}，所用设备{main_device}，{main_antenna}，{main_power}功率发射，现在开始台网点名，请抄收到信号的友台依次上台报告你的呼号、QTH、使用设备、天线、功率以及抄收到主控台的信号报告，这里是{ctrl_phonetic} {ctrl_call}，Over",
+    // 铜川变体开场白（把 frequency/offset/tone 填上后，可整段替换 opening_text）：
+    // "CQ CQ CQ，这里是{ctrl_phonetic} {ctrl_call}，现在是{net_name}时间，铜川业余无线电中继台所用频率{frequency}兆赫，下差{offset}兆赫，发射亚音{tone}赫兹，现在是北京时间{time}，请抄收到信号的友台报告你的呼号、QTH、使用设备、天线、功率以及抄收到主控台的信号报告，这里是{ctrl_phonetic} {ctrl_call}，Over"
+    "listen_after_open_seconds": 60,  // 开放点名模式：最短收听窗口秒数（开场后至少听这么久）
+    "max_net_seconds": 1800,          // 点名总时长（秒）上限，默认 1800=30 分钟。
+                                      // 到点后不立即结束：若仍有人在点名，等其说完——
+                                      // 连续 quiet_end_seconds 秒无任何应答才收尾
+    "quiet_end_seconds": 10,          // 到点后连续多少秒无人上台 → 触发最终结束语（默认 10s）
+    "grace_seconds": 300,             // 到点后的硬性宽限（秒）。防止持续有人讲话导致
+                                      // 点名无限延长，宽限耗尽强制收尾（默认 300=5 分钟）
+    "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
+    "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
+    "info_ack_text": "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over",  // 当前友台补充完信息后：按"结构化字段"复诵确认（QTH/设备/天线/功率/信号，{fields} 占位符），不是整句复诵。无结构化字段的废话（"那主播"）静默忽略
+    "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",  // 友台短确认语（"正确/收到/确认"）后的收尾话术
+    "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over",  // 友台纠正（"不对/不正确/错了"）后请其重报
+    "ask_ack_text": "抄收，{call_phonetic}，您的呼号已记录，请报告您的QTH、使用设备、天线、功率，Over",  // 友台询问"是否抄收/在吗"时确认已抄收并引导补报信息
+    "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",
+    "dup_text": "{call_phonetic} 已经抄收过，请下一位友台。",
+    "no_reply_text": "无人应答，继续下一位。",
+    "summary_text": "本次点名共抄收{n}位友台：{calls}。",
+    "closing_text": "CQ CQ CQ，现在是北京时间{time}，{net_name}到此结束，我是本次主控{ctrl_call}，本次参与台网点名的共有{n}位友台，非常感谢各位友台积极参与，接下来各位友台可以自由通联，73！",
+    // ---- 话音检测（VAD）----
+    "vad_threshold": 800,       // 活动音能量阈值（16bit 样本 RMS；链路底噪大时调高）
+    "silence_end_ms": 1000,     // 静音多少毫秒判定"对方说完了"（UserTalking 结束信令+延迟收尾优先于它）。中继台讲话停顿多，600ms 易断句，建议 1000~1500
+    "ptt_release_delay_ms": 1000,  // PTT 抬起（talking=false）后延迟多少毫秒再收尾：中继台断续转发时避免"一句话没说完就断成两段"，窗口内有声音自动取消
+    "tx_wait_timeout": 30,   // 先听后说：主控按下 PTT 前等待信道空闲的最长秒数（当前有人在讲话就等对方讲完；超时仍发射，避免点名被无限拖住）。等待期间会继续识别队列中友台的话
+    "echo_holdoff_seconds": 1.5,  // 中继台回波过滤：自己发射结束后该秒数内的短语音段视为疑似回波
+    "echo_segment_max_seconds": 1.5,  // 回波过滤：超过该时长的段不视为回波（真实友台抢答通常更长；且文本与刚播报/上一段内容连续重合≥70% 才判回波，避免误杀）
+    "talking_stale_seconds": 8,  // 说话信令防自锁：UserTalking 结束信令偶发丢失会导致"信道永久占用"（每次播报前白等 30s），该 session 超过此秒数无新语音包即视为讲完并释放信道
+    "vad_idle_seconds": 2,  // VAD 采集防卡死：正在采集但超过该秒数无新音频帧喂入（对方讲完、链路静默）→ 强制复位说话状态，根治"没人说话却信道占用中"
+    "min_segment_ms": 400,      // 短于此的语音段忽略（防误触发）
+    "max_segment_ms": 15000,    // 单段最长（超过强制截断，防失控）
+    "use_talking_gate": true,   // 说话信令门控：仅采集服务器广播了"开始讲话"的远端语音，
+                                // 可过滤链路底噪误触发的假应答段。若 60s 内从未收到任何
+                                // 说话信令（个别平台不下发）会自动降级为纯 VAD，不丢应答
+    "asr_min_seconds": 1.0,     // 送 ASR 的最短音频（秒）。不足此长的段在内存里补静音
+                                // 到该长度（规避接口对极短/空音频返回 400）
+    // ---- 呼号解码 ----
+    "callsign_regex": "^B[A-Z]\\d[A-Z]{1,3}$",  // 中国内地呼号一般结构；港澳台等可改
+    "confidence_threshold": 60, // 置信度低于此值 → 请求重复
+    "max_retry": 1,             // 每个应答最多请求重复几次
+    "extra_vocab": [],          // 额外实体词（如本地区号习惯读法、常见昵称）
+    // ---- 录音与日志（识别质量闭环）----
+    "save_audio": true,         // 应答语音段落盘（WAV 16k 单声道，供复盘/调优词表）
+    "audio_dir": "/app/net_records",  // 落盘目录（含识别摘要 summary_*.json）
+    // ---- 固定名单模式（可选；开放点名请保持 false）----
+    "roster_mode": false,       // true=按名单逐个点名；false=开放点名（参与者不可预知）
+    "roster": [],               // 固定名单：["BH3XXX","BG9ABC", ...]
+    "roster_call_text": "请{call_phonetic}回答。Over",
+    "roster_call_timeout": 12,  // 固定名单模式：呼叫后等待应答秒数，超时跳过
+    "roster_max_seconds": 1800, // 固定名单模式总时长上限（秒），超时跳过剩余名单
+    // ---- ASR（阿里云百炼 qwen3-asr-flash）----
+    "asr": {
+      "api_key": "",            // 【启用点名时必填】百炼 API Key（sk-...）
+      "model": "qwen3-asr-flash",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "enable_itn": true,       // 数字归一化："五九"→"59"（信号报告需要）
+      "language": ""            // 留空=自动识别；确定中文可填 zh
+    },
+    // ---- LLM 信息提取（可选，默认关闭；主路径为词表确定性解码）----
+    "llm": {
+      "enabled": false,         // true=低置信度时调 LLM 修复呼号/提取信号（api_key 必填，否则自动禁用）
+      "api_key": "",            // 智谱 API Key
+      "model": "glm-4.5-flash", // 免费模型
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "timeout": 8,             // 单次调用限时（秒）；放线程限时，超时放弃不拖点名
+      "max_calls": 3            // 每轮点名最多调用次数（防慢接口拖死流程）
+    }
   }
 }

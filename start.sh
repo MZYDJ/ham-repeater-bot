@@ -19,8 +19,10 @@ if [ -z "${HAM_BOT_CONFIG}" ] && [ ! -f /app/config.json ]; then
 fi
 echo "=============================="
 
-# 持久目录授权
-chown -R audiouser:audiouser /app/tts_cache /app/logs || true
+# 持久目录授权（含点名录音/摘要目录 net_records；容器以非 root 的 audiouser 运行，
+# /app 为宿主挂载目录，须显式建目录并授权，否则 net_records 落盘会 Permission denied）
+mkdir -p /app/tts_cache /app/logs /app/net_records
+chown -R audiouser:audiouser /app/tts_cache /app/logs /app/net_records || true
 
 # 切换普通用户执行
 exec su audiouser -s /bin/bash -c "
