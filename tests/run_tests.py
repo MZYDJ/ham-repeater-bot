@@ -680,6 +680,44 @@ def test_tts_synth_drains_queue():
         _da.build_audio = orig_build
 
 
+def test_correct_extract_and_replace():
+    print("[纠正分支：直接提取正确信息并替换抄收]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    # 先抄收 BG9AFF
+    sess._asr_text = lambda p: "这里是BG9AFF"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 友台纠正：含正确呼号但 decode 解不出（B9BFZ 缺 G）→ LLM 提取 → 替换旧抄收
+    class FakeLLM:
+        def extract(self, text):
+            return {"callsign": "BG9BFZ", "signal": "59", "copied": True, "note": ""}
+    sess._llm = FakeLLM()
+    sess._asr_text = lambda p: "呼号不正确，我的呼号是B九BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("替换后仅剩新呼号", [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"checked={sess._checked_in}")
+    check("旧呼号已移除", "BG9AFF" not in sess._checked_calls)
+    check("上下文切换", sess._current_call == "BG9BFZ")
+    check("信号保留", sess._checked_in[0][1] == "59", f"sig={sess._checked_in[0][1]}")
+    # 提取失败（LLM 无结果）→ 请重报
+    class FakeLLM2:
+        def extract(self, text):
+            return {"callsign": "", "signal": "", "copied": True, "note": ""}
+    sess._llm = FakeLLM2()
+    n = len(spoken)
+    sess._asr_text = lambda p: "不正确，请重复"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("提取失败才请重报", len(spoken) == n + 1 and "重复" in spoken[-1],
+          f"spoken={spoken[-1:]}")
+    # 纠正段提取到与当前友台相同的呼号 → 确认无误收尾（不再请重报）
+    sess._llm = FakeLLM()    # 返回 BG9BFZ == 当前友台
+    sess._asr_text = lambda p: "呼号不对，我的呼号是B九BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("确认无误播收尾", "确认无误" in spoken[-1], f"spoken={spoken[-1:]}")
+
+
 def test_templates():
     print("[话术模板（TTS 占位符）]")
     check("解释法回读", callsign_phonetic("BH3XX") == "Bravo Hotel Three X-ray X-ray")
@@ -718,7 +756,8 @@ def main():
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,
                test_ctrl_call_filter, test_same_session_new_call,
                test_echo_other_speaker, test_llm_fallback, test_vad_stuck_release,
-               test_llm_call_cap, test_tts_synth_drains_queue, test_templates]:
+               test_llm_call_cap, test_tts_synth_drains_queue,
+               test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)

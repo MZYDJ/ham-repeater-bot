@@ -893,6 +893,7 @@ class NetControlSession:
             self._seg_text[session] = raw
         res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
         call, signal, score = res["callsign"], res["signal"], res["score"]
+        thr = int(nc_cfg("confidence_threshold", default=60))
         # 空/纯语气词段（放麦尾音、环境声、回波残余）→ 静默：
         # 不播"请重复呼号"、不消耗重复请求额度（实测 20:15 放麦后 0.6s 空段
         # 触发"请重复"→ 30s 等待 → 抢麦失败的连锁）
@@ -941,17 +942,63 @@ class NetControlSession:
                       "能否抄收", "能否超收", "是否超收", "能不能抄收",
                       "是否超时", "超时了吗", "超收了吗", "可以了吗", "好了吗")
             if any(k in kw for k in correct_kw):
-                # 友台纠正（呼号/信息听错）→ 请其重报，不归入信息
-                # （"不正确"必须命中：实测 19:48 友台说"不正确，请重复抄收"
-                #   旧逻辑因 confirm 检查长度限制漏判，被当补充信息复诵）
-                logger.info(f"{self._current_call} 纠正请求: {info}")
+                # 友台纠正（呼号/信息听错）→ 通常紧接着会重复正确的呼号/信息：
+                # **先尝试从本段直接提取**（确定性低分呼号 + LLM 兜底），
+                # 提取成功直接修正抄收，只有提取失败才请对方重报
+                # （实测 21:10 "呼号不正确"段无正确信息→请重报；若含"我的呼号是…"应直接收）
+                new_call, sig2, sc2 = None, None, 0
+                if call is None or score < thr:
+                    fix = self._llm_fix(raw, res)
+                    if fix:
+                        new_call, sig2, sc2 = fix["callsign"], fix["signal"], fix["score"]
+                    elif call:          # 低分但格式合法
+                        new_call, sig2, sc2 = call, signal, score
+                elif call:
+                    new_call, sig2, sc2 = call, signal, score
+                if new_call:
+                    cur = (self._current_call or "").upper()
+                    if new_call.upper() == cur:
+                        # 纠正段确认了当前友台呼号无误 → 收尾确认（不再请重报）
+                        logger.info(f"{self._current_call} 纠正后确认呼号无误: {info}")
+                        self._speak(self._fmt(nc_cfg("correct_confirm_text", default=
+                            "抄收，{call_phonetic}，呼号确认无误，信息已记录，请下一位友台。Over"),
+                            call=self._current_call,
+                            call_phonetic=callsign_phonetic(self._current_call)))
+                        return
+                    if is_duplicate(new_call, self._checked_calls):
+                        logger.info(f"重复抄收 {new_call}（纠正提取），跳过")
+                        self._dups += 1
+                        self._retry_pending = False
+                        self._retry_left = int(nc_cfg("max_retry", default=1))
+                        self._speak(self._fmt(nc_cfg("dup_text", default=
+                            "{call_phonetic} 已经抄收过，请下一位友台。"),
+                            call=new_call, call_phonetic=callsign_phonetic(new_call)))
+                        return
+                    # 替换抄收：纠正=之前抄错，用新呼号替换当前友台旧记录
+                    for i, e in enumerate(self._checked_in):
+                        if e[0].upper() == cur:
+                            self._checked_in.pop(i)
+                            break
+                    self._checked_calls.discard(cur.upper())
+                    self._fields.pop(cur.upper(), None)
+                    self._checkin_times.pop(cur.upper(), None)
+                    self._current_call = None     # 由 _do_checkin 重建上下文
+                    self._current_session = None
+                    self._current_entry = None
+                    logger.info(f"抄收修正: {cur or '无'} → {new_call}（{info}）")
+                    self._do_checkin(new_call, sig2, wav, raw, session, sc2)
+                    return
+                logger.info(f"{self._current_call} 纠正请求（未提取到正确信息）: {info}")
                 self._speak(self._fmt(nc_cfg("correct_text", default=
                     "抱歉，刚才抄收可能有误，请您再重复一遍，Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
                 return
-            if len(info) <= 6 and any(k in kw for k in confirm_kw):
-                # 短确认语（"正确""收到"）→ 确认收尾，请下一位（不归入不重复复诵）
+            if len(info) <= 12 and any(k in kw for k in confirm_kw) \
+                    and not any(k in kw for k in correct_kw):
+                # 短确认语（"正确""收到""没问题"）→ 确认收尾，请下一位
+                # （排除纠正词：'不正确'含'正确'子串，先命中 correct 分支；
+                #   长度放宽到 12 以容纳'呼号正确，没问题'等完整确认）
                 logger.info(f"{self._current_call} 确认收到: {info}")
                 self._speak(self._fmt(nc_cfg("confirm_text", default=
                     "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
@@ -1011,7 +1058,6 @@ class NetControlSession:
         # LLM 兜底（可选，llm.enabled=true）：确定性解码低置信度/未解出呼号且
         # 文本非空时，先让 LLM 尝试修复呼号与信号——命中直接按抄收处理，
         # 避免"请重复"空耗一轮；失败/未启用则原样走低置信度流程
-        thr = int(nc_cfg("confidence_threshold", default=60))
         if (call is None or score < thr) and clean_report_text(raw):
             fix = self._llm_fix(raw, res)
             if fix:
