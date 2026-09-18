@@ -373,24 +373,40 @@ def m_varint_dec(data, i):
     if b < 0xF0:
         return ((b & 0x0F) << 24) | (data[i + 1] << 16) | (data[i + 2] << 8) | data[i + 3], i + 4
     raise ValueError("Mumble varint 越界")
+def parse_udp_voice_multi(payload, own_session=None):
+    """解析下行 UDPTunnel 载荷中的**全部**语音包（服务器按批转发，
+    一个载荷可能串联多个连续语音包，如 600ms 批 5 包×120ms）。
+    若只取第一个包，其余包被丢弃会导致录音变成倍速+断续。
+    返回 list of dict(session, seq, opus)。"""
+    out = []
+    i = 0
+    n = len(payload) if payload else 0
+    while i + 2 <= n:
+        if (payload[i] & 0xE0) != 0x20:
+            break                          # 非 Opus 语音，停止
+        try:
+            session, j = m_varint_dec(payload, i + 1)
+            seq, j = m_varint_dec(payload, j)
+            ln, j = m_varint_dec(payload, j)
+        except (ValueError, IndexError):
+            break
+        if ln <= 0 or j + ln > n:
+            break
+        if own_session is None or session != own_session:
+            out.append({"session": session, "seq": seq,
+                        "opus": payload[j:j + ln]})
+        i = j + ln
+    return out
+
+
 def parse_udp_voice(payload, own_session=None):
     """解析链路下行语音包（UDPTunnel 内层，msg_type=1）。
     标准 Mumble 下行格式: [0x20][varint session][varint seq][varint len][Opus数据]。
     返回 dict(session, seq, opus) 或 None（非语音/长度异常/自己回声）。
-    own_session 传入时丢弃自己的回声包（防点名把播报内容识别成应答）。"""
-    if not payload or len(payload) < 2 or (payload[0] & 0xE0) != 0x20:
-        return None                       # 非 Opus 语音（Ping/CELT/其他信令）
-    try:
-        session, i = m_varint_dec(payload, 1)
-        seq, i = m_varint_dec(payload, i)
-        ln, i = m_varint_dec(payload, i)
-    except (ValueError, IndexError):
-        return None
-    if ln <= 0 or i + ln > len(payload):
-        return None
-    if own_session is not None and session == own_session:
-        return None                       # 自己说话的回声，丢弃
-    return {"session": session, "seq": seq, "opus": payload[i:i + ln]}
+    own_session 传入时丢弃自己的回声包（防点名把播报内容识别成应答）。
+    兼容单包调用：内部走 parse_udp_voice_multi 取第一个。"""
+    pkts = parse_udp_voice_multi(payload, own_session)
+    return pkts[0] if pkts else None
 def trim_silence(pcm, threshold=None, min_ms=None):
     """s16le 单声道 48kHz PCM 头尾静音截断，各保留 min_ms 余量。"""
     if threshold is None:
