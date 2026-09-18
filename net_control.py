@@ -137,6 +137,27 @@ def _map_token(tok, call_re):
                 unk += 1
             i += 1
         return (out if out else None), unk
+    # 长英文串的词表贪心分词：ASR 偶尔无空格连写解释法
+    # （"bravoindianinegolfcharliewhiskey"），整串按未知会丢呼号。
+    # 至少命中 1 个词表词才按解释法串处理（避免普通英文句被逐字污染）。
+    if re.fullmatch(r"[a-z]+", t) and len(t) >= 3:
+        out, matched = "", 0
+        i = 0
+        while i < len(t):
+            hit = False
+            for k in sorted(PHONETIC_ITU, key=len, reverse=True):
+                if t.startswith(k, i):
+                    out += PHONETIC_ITU[k]
+                    i += len(k)
+                    matched += 1
+                    hit = True
+                    break
+            if hit:
+                continue
+            out += t[i].upper()          # 未知字母逐字符透传（保留拼写，便于呼号子串搜索）
+            i += 1
+        if matched >= 1:
+            return out, 0
     return None, 1
 
 

@@ -178,6 +178,15 @@ def test_decode_callsign():
     r = decode_callsign("BH3XX59")               # 信号数字粘连 → 快路径不吞数字
     check("粘连数字不吞入", r["callsign"] == "BH3XX", f"{r}")
     check("大小写归一去重", is_duplicate("bh3xx", {"BH3XX"}))
+    # 纯解释法（用户实测场景：回答呼号只用字母解释法）
+    r = decode_callsign("Bravo India Nine Golf Charlie Whiskey")
+    check("纯解释法提取", r["callsign"] == "BI9GCW" and r["score"] >= 90, f"{r}")
+    r = decode_callsign("BravoIndiaNineGolfCharlieWhiskey")   # ASR 无空格连写
+    check("解释法无空格连写", r["callsign"] == "BI9GCW", f"{r}")
+    r = decode_callsign("Bravo India Nine GolfCharlie Whiskey")  # 部分连写
+    check("解释法部分连写", r["callsign"] == "BI9GCW", f"{r}")
+    r = decode_callsign("please repeat your callsign")
+    check("普通英文句不产生呼号", r["callsign"] is None, f"{r}")
 
 
 def test_asr_body():
