@@ -133,6 +133,7 @@
     "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
     "info_ack_text": "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over",  // 当前友台补充完信息后：按"结构化字段"复诵确认（QTH/设备/天线/功率/信号，{fields} 占位符），不是整句复诵。无结构化字段的废话（"那主播"）静默忽略
     "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",  // 友台短确认语（"正确/收到/确认"）后的收尾话术
+    "missing_ask_text": "抄收，{call_phonetic}，信息已记录，请再补充您的{missing}，Over",  // 结构化信息（信号/QTH/设备/天线/功率）未记全时主动追问缺失项（{missing} 占位符，自动列出未记录字段，如"请再补充您的QTH、功率"）；每字段每友台最多问一次，防无限循环；"没有天线""无"等已作为值记录视为已填
     "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over",  // 友台纠正（"不对/不正确/错了"）后请其重报
     "ask_ack_text": "抄收，{call_phonetic}，您的呼号已记录，请报告您的QTH、使用设备、天线、功率，Over",  // 友台询问"是否抄收/在吗"时确认已抄收并引导补报信息
     "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",

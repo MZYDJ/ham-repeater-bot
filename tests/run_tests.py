@@ -243,6 +243,25 @@ def test_asr_body():
     check("no-opts 变体无 asr_options", "asr_options" not in b_noopts)
 
 
+def test_llm_gate_and_missing_fields():
+    print("[LLM 触发预检 + 结构化追问]")
+    ns = net_control.NetControlSession.__new__(net_control.NetControlSession)
+    ns._fields = {}
+    ns._asked_fields = {}
+    ns._current_call = None
+    check("垃圾文本不触发 LLM", ns._looks_like_report("不让我就去死") is False)
+    check("英文解释法触发", ns._looks_like_report("Bravo Golf Nine Alpha") is True)
+    check("中文呼号触发", ns._looks_like_report("这里是BG九BFZ") is True)
+    check("空文本不触发", ns._looks_like_report("") is False)
+    ns._fields["BG9ABC"] = {"qth": "团结路", "device": "全胜UV二"}
+    missing = ns._missing_fields("BG9ABC")
+    check("缺失字段计算", missing == ["signal", "antenna", "power"],
+          f"missing={missing}")
+    ns._fields["BG9XYZ"] = {"qth": "无", "device": "链路", "antenna": "没有天线",
+                            "power": "无", "signal": "59"}
+    check("无/没有视为已填", ns._missing_fields("BG9XYZ") == [])
+
+
 def test_vocab_echo_reject():
     print("[ASR 词表回显校验（服务端把 system 当输入转写）]")
     from unittest import mock
@@ -331,24 +350,26 @@ def test_retry_reset():
     # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 结构化提取并复诵确认
     sess._asr_text = lambda pcm: "我的设备是泉盛K6，天线原机天线，五瓦"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
-    check("同台补充信息归入", len(spoken) == 3 and "信息已记录" in spoken[2]
+    check("同台补充信息归入", len(spoken) == 4 and "信息已记录" in spoken[2]
           and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
           and "功率 5 瓦" in spoken[2]
           and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
           f"spoken={spoken} entry={sess._current_entry}")
     check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
+    check("缺 QTH 主动追问", "请再补充您的QTH" in spoken[3],
+          f"spoken={spoken}")
 
     # 段4：新 session 无呼号（新友台没报呼号）→ 引导报呼号
     sess._asr_text = lambda pcm: "这里是，我的设备是泉盛K6"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=3)
-    check("新友台无呼号仍引导", len(spoken) == 4 and "呼号" in spoken[3],
+    check("新友台无呼号仍引导", len(spoken) == 5 and "呼号" in spoken[4],
           f"spoken={spoken}")
 
     # 段5：同新 session 连续无呼号（额度尽）→ 静默但计数（用不同文本，
     # 避免与段4 相同文本被回波过滤判为回波）
     sess._asr_text = lambda pcm: "信号很好"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=3)
-    check("额度用尽后静默", len(spoken) == 4 and sess._failed == 1,
+    check("额度用尽后静默", len(spoken) == 5 and sess._failed == 1,
           f"spoken={spoken} failed={sess._failed}")
 
 
@@ -803,7 +824,7 @@ def main():
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_vocab_echo_reject, test_conn_reuse,
-               test_config_defaults, test_retry_reset,
+               test_config_defaults, test_retry_reset, test_llm_gate_and_missing_fields,
                test_info_followup, test_report_clean, test_report_fields,
                test_wait_channel_idle, test_export_csv, test_echo_filter,
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,
