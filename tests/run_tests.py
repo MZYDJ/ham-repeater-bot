@@ -292,7 +292,9 @@ def test_retry_reset():
     check("新友台无呼号仍引导", len(spoken) == 4 and "呼号" in spoken[3],
           f"spoken={spoken}")
 
-    # 段5：同新 session 连续无呼号（额度尽）→ 静默但计数
+    # 段5：同新 session 连续无呼号（额度尽）→ 静默但计数（用不同文本，
+    # 避免与段4 相同文本被回波过滤判为回波）
+    sess._asr_text = lambda pcm: "信号很好"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=3)
     check("额度用尽后静默", len(spoken) == 4 and sess._failed == 1,
           f"spoken={spoken} failed={sess._failed}")
@@ -482,6 +484,109 @@ def test_wait_channel_idle():
           f"ok={ok} dt={dt:.2f}")
 
 
+def test_echo_filter():
+    print("[中继台回波过滤 _is_echo]")
+    sess = net_control.NetControlSession(link=None)
+    sess._speak = lambda t: None
+    check("未发射过非回波", not sess._is_echo("", 0.6))
+    sess._last_tx_end = time.time()
+    sess._last_spoken_text = "这里是BI9BZW，抄收你的信号，请报告QTH"
+    check("窗口内短空段→回波", sess._is_echo("", 0.5), f"last={sess._last_tx_end}")
+    check("文本重合→回波", sess._is_echo("抄收你的信号", 0.8))
+    check("文本不重合→非回波", not sess._is_echo("这里是BH3XX信号59", 0.8))
+    check("段太长→非回波", not sess._is_echo("", 3.0))
+    sess._last_tx_end = time.time() - 10
+    check("超时窗外→非回波", not sess._is_echo("", 0.5))
+    # 端到端：放麦后紧接的空段不触发"请重复呼号"、不耗额度
+    sess._last_tx_end = time.time()
+    sess._asr_text = lambda p: ""
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._process_segment(b"\x00" * 32000, 0.6, None, session=1)
+    check("回波段静默不播报", spoken == [], f"spoken={spoken}")
+    check("额度未消耗", sess._retry_left == 1, f"left={sess._retry_left}")
+
+
+def test_wait_idle_consumes_queue():
+    print("[等待发射期间继续识别]")
+    sess = net_control.NetControlSession(link=None)
+    sess._asr_text = lambda p: "这里是BG9ABC，信号59"
+    sess._seg_queue.put((b"\x00" * 32000, 1.0, None, 3))
+    sess._speak = lambda t: None
+    calls = {"n": 0}
+
+    def fake_speaking():
+        calls["n"] += 1
+        return calls["n"] < 3          # 前两次有人讲，第三次空闲
+
+    sess._someone_speaking = fake_speaking
+    sess._wait_channel_idle()
+    check("等待期间消费队列并抄收",
+          [c for c, *_ in sess._checked_in] == ["BG9ABC"],
+          f"checked={sess._checked_in}")
+    check("当前友台已切换", sess._current_call == "BG9ABC", f"call={sess._current_call}")
+
+
+def test_mixed_callsign_decode():
+    print("[中英混合呼号解码（BJ九EFU / BI九DGI）]")
+    r = net_control.decode_callsign("主控主控，这里是BJ九EFU，BJ九EFU，能否超收")
+    check("BJ九EFU 解出 BJ9EFU", r["callsign"] == "BJ9EFU" and r["score"] >= 60,
+          f"{r}")
+    r = net_control.decode_callsign(
+        "总控总控，这里是BI九DGI，这里是BI九DGI，Bravo India Nine，这是塔克，India，是否可以操作")
+    check("BI九DGI 解出 BI9DGI（不被 Bravo…India 干扰）",
+          r["callsign"] == "BI9DGI" and r["score"] >= 60, f"{r}")
+
+
+def test_ctrl_call_filter():
+    print("[主控自身呼号过滤]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._asr_text = lambda p: "这里是B I九B Z W，2.03 10"
+    sess._process_segment(b"\x00" * 32000, 6.7, None, session=1)
+    check("主控呼号不抄收不播报", spoken == [] and sess._checked_in == [],
+          f"spoken={spoken} checked={sess._checked_in}")
+
+
+def test_same_session_new_call():
+    print("[同 session 友台补报新呼号不被补充信息吞]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._asr_text = lambda p: "这里是BH3XX"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    sess._asr_text = lambda p: "我的QTH在咸阳市"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    # 同 session 新友台补报完整呼号 → 应重新抄收而非归入 BH3XX 补充信息
+    sess._asr_text = lambda p: "这里是BJ九EFU，能否超收"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("新呼号被抄收", [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"],
+          f"checked={sess._checked_in}")
+    check("上下文切换", sess._current_call == "BJ9EFU",
+          f"call={sess._current_call}")
+
+
+def test_echo_other_speaker():
+    print("[对方讲完后的回波过滤]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    sess._asr_text = lambda p: "主控主控，这里是BH3XX"
+    sess._process_segment(b"\x00" * 32000, 2.4, None, session=7)
+    # 紧接的短段且文本与上一段重合 → 判回波
+    sess._asr_text = lambda p: "这里是BH3XX"
+    sess._process_segment(b"\x00" * 32000, 0.6, None, session=7)
+    check("对方回波被过滤", [c for c, *_ in sess._checked_in] == ["BH3XX"],
+          f"checked={sess._checked_in}")
+    # 紧接但文本不同（真实抢答）→ 不误杀
+    sess._asr_text = lambda p: "这里是BG9ABC"
+    sess._process_segment(b"\x00" * 32000, 0.8, None, session=7)
+    check("不同文本不误杀", [c for c, *_ in sess._checked_in] == ["BH3XX", "BG9ABC"],
+          f"checked={sess._checked_in}")
+
+
 def test_templates():
     print("[话术模板（TTS 占位符）]")
     check("解释法回读", callsign_phonetic("BH3XX") == "Bravo Hotel Three X-ray X-ray")
@@ -516,7 +621,10 @@ def main():
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
                test_info_followup, test_report_clean, test_report_fields,
-               test_wait_channel_idle, test_export_csv, test_templates]:
+               test_wait_channel_idle, test_export_csv, test_echo_filter,
+               test_wait_idle_consumes_queue, test_mixed_callsign_decode,
+               test_ctrl_call_filter, test_same_session_new_call,
+               test_echo_other_speaker, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
