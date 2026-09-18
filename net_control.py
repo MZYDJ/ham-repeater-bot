@@ -29,6 +29,7 @@ import argparse
 import array
 import base64
 import contextlib
+import csv
 import datetime
 import http.client
 import json
@@ -248,43 +249,47 @@ def callsign_phonetic(call):
     return " ".join(out)
 
 
+FIELD_LABEL = {"qth": "QTH", "device": "设备", "antenna": "天线",
+               "power": "功率", "signal": "信号"}
+
+
 def extract_report_fields(text):
     """从补充信息段提取结构化字段（点名确认/记录用）：
-    返回有序 [(字段标签, 值)]，仅含实际提取到的字段。
-    - QTH/设备/天线/功率/信号报告 五类核心信息
+    返回有序 [(内部key, 值)]，仅含实际提取到的字段。
+    - QTH/设备/天线/功率/信号报告 五类核心信息（key=qth/device/antenna/power/signal）
     - 提取不到任何字段 → 空列表（调用方不重复复诵，改走确认/纠正/静默分支）"""
     fields = []
     # QTH：ASR 常展开为 "Q T H"，覆盖 QTH/Q T H/位置/地址/所在地
     m = re.search(r"(?:QTH|Q\s*T\s*H|位置|地址|所在地)(?:[是在位于]|的|是)?"
                   r"\s*([^，。；,;.!！?？\s]{2,24})", text, re.I)
     if m and not re.search(r"[A-Za-z]\d[A-Za-z]{1,3}", m.group(1)):
-        fields.append(("QTH", m.group(1).strip()))
+        fields.append(("qth", m.group(1).strip()))
     # 设备
     m = re.search(r"(?:设备|机器|电台|手台|车台)(?:是|为|的|的是|用的)?"
                   r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
     if m:
-        fields.append(("设备", m.group(1).strip()))
+        fields.append(("device", m.group(1).strip()))
     # 天线：两种常见语序——"天线原机天线"（天线在前）与"原机天线/八木天线"（天线在后）。
     # 优先"天线在前"（避免把"天线原机天线"误切为 xxx天线），再试"天线在后"。
     m = re.search(r"天线(?:是|为|的|用的)?\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,12})",
                   text, re.I)
     if m:
-        fields.append(("天线", m.group(1).strip()))
+        fields.append(("antenna", m.group(1).strip()))
     else:
         m = re.search(r"([\u4e00-\u9fffA-Za-z0-9\-]{2,6})天线", text)
         if m:
-            fields.append(("天线", m.group(1) + "天线"))
+            fields.append(("antenna", m.group(1) + "天线"))
     # 功率：阿拉伯数字 + 中文数字（"5瓦/五瓦"），不带单位读法（瓦）
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:瓦|W)", text, re.I) or \
         re.search(r"([零一二两三四五六七八九洞幺])\s*瓦", text)
     if m:
         p = m.group(1)
         p = CN_DIGITS.get(p, p)          # 中文数字转阿拉伯
-        fields.append(("功率", f"{p} 瓦"))
+        fields.append(("power", f"{p} 瓦"))
     # 信号报告（"信号五九"→59）
     sig = extract_signal(text)
     if sig:
-        fields.append(("信号", sig))
+        fields.append(("signal", sig))
     return fields
 
 
@@ -705,6 +710,9 @@ class NetControlSession:
         self._current_call = None           # 当前台上友台呼号（大写）
         self._current_session = None        # 抄收该呼号的语音段来源 session
         self._current_entry = None          # 指向 _checked_in 中该友台的条目（引用）
+        # 结构化字段永久化：呼号 → {qth, device, antenna, power, signal}（CSV 导出用）
+        self._fields = {}
+        self._checkin_times = {}            # 呼号 → 抄收时刻 ISO 串（CSV 导出用）
         self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
         self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
@@ -872,6 +880,12 @@ class NetControlSession:
             entry = [call, signal or "", wav or "", raw or "", ""]
             self._checked_in.append(entry)
             self._checked_calls.add(call.upper())
+            # 呼号段若已含结构化信息（"我的QTH在…"）一并记录
+            fd = dict(extract_report_fields(raw))
+            if fd or signal:
+                fd.setdefault("signal", signal or "")
+                self._fields.setdefault(call.upper(), {}).update(fd)
+            self._checkin_times[call.upper()] = datetime.datetime.now().isoformat(timespec="seconds")
             self._retry_pending = False
             self._retry_left = int(nc_cfg("max_retry", default=1))  # 关键：成功抄收后恢复额度，
             # 否则下一个新友台首次未抄收也会被静默（实测 17:26:53 起机器人哑巴的根因）
@@ -932,9 +946,15 @@ class NetControlSession:
                 self._current_entry[4] = (prev_info + " " + info).strip()
                 if signal and not self._current_entry[1]:
                     self._current_entry[1] = signal
-                field_str = "、".join(f"{label} {v}" for label, v in fields)
+                field_str = "、".join(
+                    f"{FIELD_LABEL.get(k, k)} {v}" for k, v in fields)
                 logger.info(f"{self._current_call} 补充信息（结构化 {len(fields)} 项）："
                             f"{field_str}")
+                # 结构化字段永久化（CSV 导出用；信号报告并入字段表）
+                fd = dict(fields)
+                if self._current_entry[1]:
+                    fd.setdefault("signal", self._current_entry[1])
+                self._fields.setdefault(self._current_call, {}).update(fd)
                 tmpl = nc_cfg("info_ack_text", default=
                     "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over")
                 if "{fields}" in tmpl:
@@ -1219,6 +1239,45 @@ class NetControlSession:
             if s is not None and self.link is not None:
                 self.link.release()
 
+    def _export_csv(self, path=None):
+        """点名记录永久化导出：每次点名一个 CSV 文件，文件名按点名开始时间。
+        每行一位友台，列=呼号/信号报告/QTH/设备/天线/功率/抄收时间/原始转录/补充原文。
+        UTF-8 with BOM（Excel/WPS 直接打开中文不乱码），脚本可用 csv 模块直接解析。
+        返回导出路径；失败返回 None（不阻断点名收尾）。"""
+        try:
+            if path is None:
+                audio_dir = nc_cfg("audio_dir", default="/app/net_records")
+                Path(audio_dir).mkdir(parents=True, exist_ok=True)
+                stamp = (self._started_at.strftime("%Y%m%d_%H%M%S")
+                         if self._started_at
+                         else datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+                path = str(Path(audio_dir) / f"点名记录_{stamp}.csv")
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            header = ["序号", "呼号", "信号报告", "QTH", "设备", "天线", "功率",
+                      "抄收时间", "原始转录", "补充原文"]
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(header)
+                for i, (call, signal, wav, raw, info) in enumerate(self._checked_in, 1):
+                    fd = self._fields.get(call.upper(), {})
+                    w.writerow([
+                        i,
+                        call,
+                        signal or fd.get("signal", ""),
+                        fd.get("qth", ""),
+                        fd.get("device", ""),
+                        fd.get("antenna", ""),
+                        fd.get("power", ""),
+                        self._checkin_times.get(call.upper(), ""),
+                        raw or "",
+                        info or "",
+                    ])
+            logger.info(f"点名记录已导出: {path}（{len(self._checked_in)} 位友台）")
+            return path
+        except Exception as e:
+            logger.warning(f"点名记录导出失败: {e}")
+            return None
+
     def _teardown(self):
         if self.link is not None and self.link._on_downlink is self._on_downlink:
             self.link._on_downlink = None           # 归还下行分发（不打扰播报）
@@ -1235,6 +1294,7 @@ class NetControlSession:
                 json.dump(self.summary, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"点名摘要落盘失败: {e}")
+        self._export_csv()          # 点名记录 CSV 永久化（按点名开始时间命名，每次点名一个文件）
         self.done.set()
         if self.on_done:
             try:
