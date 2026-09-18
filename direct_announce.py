@@ -205,7 +205,10 @@ class OpusEncoder:
         return ctypes.string_at(ctypes.addressof(out), n)
 class OpusDecoder:
     """Opus 解码器（ctypes 直调 libopus0）：链路下行语音包 → PCM s16le 单声道 48kHz。
-    点名主播接收侧用，与 OpusEncoder 镜像。libopus0 已在镜像内，无新增依赖。"""
+    点名主播接收侧用，与 OpusEncoder 镜像。libopus0 已在镜像内，无新增依赖。
+    线程安全：decode/close 互斥（点名会话 teardown 时 keeper 线程可能正在
+    decode，直接 destroy 会 use-after-free 触发 libopus 内部断言崩溃——
+    日志特征: "assertion failed: st->channels == 1 || st->channels == 2"）。"""
     def __init__(self, rate=48000, channels=1):
         lib = load_lib(["opus", "libopus.so.0", "libopus.so"])
         if lib is None:
@@ -219,6 +222,7 @@ class OpusDecoder:
                                     ctypes.c_int32, ctypes.c_int]
         lib.opus_decoder_destroy.argtypes = [ctypes.c_void_p]
         self.lib = lib
+        self._lock = threading.Lock()
         err = ctypes.c_int(0)
         raw = lib.opus_decoder_create(rate, channels, ctypes.byref(err))
         if err.value != 0 or not raw:
@@ -227,20 +231,26 @@ class OpusDecoder:
     def decode(self, opus_bytes):
         """Opus 包 → PCM s16le 单声道字节流。
         缓冲按 120ms（6×20ms 帧，5760 样本 @48k）预留，返回实际解码样本数。"""
-        n_in = len(opus_bytes)
-        if n_in == 0:
-            return b""
-        buf_in = (ctypes.c_ubyte * n_in).from_buffer_copy(opus_bytes)
-        out = (ctypes.c_int16 * 5760)()
-        n = self.lib.opus_decode(self.state, buf_in, n_in, out, 5760, 0)
-        if n < 0:
-            raise RuntimeError("opus_decode 错误码 %d" % n)
-        return ctypes.string_at(ctypes.addressof(out), n * 2)
+        with self._lock:
+            if self.state is None or self.lib is None:
+                return b""
+            n_in = len(opus_bytes)
+            if n_in == 0:
+                return b""
+            buf_in = (ctypes.c_ubyte * n_in).from_buffer_copy(opus_bytes)
+            out = (ctypes.c_int16 * 5760)()
+            n = self.lib.opus_decode(self.state, buf_in, n_in, out, 5760, 0)
+            if n < 0:
+                raise RuntimeError("opus_decode 错误码 %d" % n)
+            return ctypes.string_at(ctypes.addressof(out), n * 2)
     def close(self):
-        try:
-            self.lib.opus_decoder_destroy(self.state)
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                if self.state is not None:
+                    self.lib.opus_decoder_destroy(self.state)
+            except Exception:
+                pass
+            self.state = None
 # ---------------- libmpg123 解码器（ctypes 直调） ----------------
 class Mpg123Decoder:
     """mp3 → PCM s16le 单声道 48kHz。libmpg123 内部完成下混+重采样。"""
