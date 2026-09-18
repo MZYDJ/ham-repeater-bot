@@ -618,6 +618,106 @@ def test_llm_fallback():
           f"checked={sess2._checked_in}")
 
 
+def test_vad_stuck_release():
+    print("[VAD 采集卡死复位]")
+    sess = net_control.NetControlSession(link=None)
+    sess._speak = lambda t: None
+    # 模拟：正在采集但 3s 无新帧（对方讲完、链路静默）→ 判空闲并复位
+    sess._capture = net_control.VoiceCapture(on_segment=lambda *a: None)
+    sess._capture._speaking = True
+    sess._capture.last_feed_at = time.time() - 3
+    check("VAD idle 超时判空闲", not sess._someone_speaking())
+    check("VAD 已复位", sess._capture._speaking is False)
+    # 最近有帧 → 判占用
+    sess._capture._speaking = True
+    sess._capture.last_feed_at = time.time()
+    check("VAD 活跃判占用", sess._someone_speaking())
+
+
+def test_llm_call_cap():
+    print("[LLM 兜底限次（每轮≤3 次，防超时拖死）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    sess._speak = lambda t: None
+
+    class FakeLLM:
+        calls = 0
+        def extract(self, text):
+            type(self).calls += 1
+            return {"callsign": "BG9BFZ", "signal": "", "copied": True, "note": ""}
+
+    sess._llm = FakeLLM()
+    for i in range(4):
+        sess._asr_text = (lambda p, i=i: f"主控主控，这里是B九B F Z 第{i}遍")
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=100 + i)
+    check("LLM 只调 3 次", FakeLLM.calls == 3, f"calls={FakeLLM.calls}")
+
+
+def test_tts_synth_drains_queue():
+    print("[TTS 合成期间继续识别（不阻塞队列）]")
+    import direct_announce as _da
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    orig_synth = net_control.synth_text
+    orig_build = _da.build_audio
+
+    def slow_synth(text):
+        time.sleep(1.2)                    # 模拟慢 TTS（3~20s 的真实场景）
+        return "/tmp/_test_slow.mp3"
+
+    net_control.synth_text = slow_synth
+    _da.build_audio = lambda *a: (_ for _ in ()).throw(RuntimeError("测试跳过播放"))
+    try:
+        # 队列里积压一位友台的段；合成期间应被消费识别
+        sess._asr_text = lambda p: "这里是BG9ABC"
+        sess._seg_queue.put((b"\x00" * 32000, 1.0, None, 42))
+        sess._speak("测试播报文本")
+        check("合成期间消费队列并抄收",
+              [c for c, *_ in sess._checked_in] == ["BG9ABC"],
+              f"checked={sess._checked_in}")
+    finally:
+        net_control.synth_text = orig_synth
+        _da.build_audio = orig_build
+
+
+def test_correct_extract_and_replace():
+    print("[纠正分支：直接提取正确信息并替换抄收]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    # 先抄收 BG9AFF
+    sess._asr_text = lambda p: "这里是BG9AFF"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 友台纠正：含正确呼号但 decode 解不出（B9BFZ 缺 G）→ LLM 提取 → 替换旧抄收
+    class FakeLLM:
+        def extract(self, text):
+            return {"callsign": "BG9BFZ", "signal": "59", "copied": True, "note": ""}
+    sess._llm = FakeLLM()
+    sess._asr_text = lambda p: "呼号不正确，我的呼号是B九BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("替换后仅剩新呼号", [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"checked={sess._checked_in}")
+    check("旧呼号已移除", "BG9AFF" not in sess._checked_calls)
+    check("上下文切换", sess._current_call == "BG9BFZ")
+    check("信号保留", sess._checked_in[0][1] == "59", f"sig={sess._checked_in[0][1]}")
+    # 提取失败（LLM 无结果）→ 请重报
+    class FakeLLM2:
+        def extract(self, text):
+            return {"callsign": "", "signal": "", "copied": True, "note": ""}
+    sess._llm = FakeLLM2()
+    n = len(spoken)
+    sess._asr_text = lambda p: "不正确，请重复"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("提取失败才请重报", len(spoken) == n + 1 and "重复" in spoken[-1],
+          f"spoken={spoken[-1:]}")
+    # 纠正段提取到与当前友台相同的呼号 → 确认无误收尾（不再请重报）
+    sess._llm = FakeLLM()    # 返回 BG9BFZ == 当前友台
+    sess._asr_text = lambda p: "呼号不对，我的呼号是B九BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("确认无误播收尾", "确认无误" in spoken[-1], f"spoken={spoken[-1:]}")
+
+
 def test_templates():
     print("[话术模板（TTS 占位符）]")
     check("解释法回读", callsign_phonetic("BH3XX") == "Bravo Hotel Three X-ray X-ray")
@@ -655,7 +755,9 @@ def main():
                test_wait_channel_idle, test_export_csv, test_echo_filter,
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,
                test_ctrl_call_filter, test_same_session_new_call,
-               test_echo_other_speaker, test_llm_fallback, test_templates]:
+               test_echo_other_speaker, test_llm_fallback, test_vad_stuck_release,
+               test_llm_call_cap, test_tts_synth_drains_queue,
+               test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
