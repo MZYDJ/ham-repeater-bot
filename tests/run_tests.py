@@ -265,10 +265,11 @@ def test_retry_reset():
     check("抄收后额度恢复", sess._retry_left == 1 and not sess._retry_pending,
           f"retry_left={sess._retry_left}")
 
-    # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 归入当前友台，不消耗额度
+    # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 归入当前友台并复诵，不消耗额度
     sess._asr_text = lambda pcm: "我的设备是泉盛K6，天线原机天线，五瓦"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
-    check("同台补充信息归入", len(spoken) == 3 and "信息已记录" in spoken[2]
+    check("同台补充信息归入", len(spoken) == 3 and "您说的是" in spoken[2]
+          and "泉盛K6" in spoken[2]
           and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
           f"spoken={spoken} entry={sess._current_entry}")
     check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
@@ -296,13 +297,37 @@ def test_info_followup():
     # 友台1 报呼号（session=1）
     sess._asr_text = lambda pcm: "这里是BH3XX，信号59"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    # 友台1 补充 QTH/设备（同 session、无呼号）→ 归入 BH3XX
+    # 友台1 补充 QTH/设备（同 session、无呼号）→ 归入 BH3XX 并复诵
     sess._asr_text = lambda pcm: "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     check("补充段归入友台1", sess._current_call == "BH3XX"
           and "QTH" in (sess._current_entry[4] or ""),
           f"call={sess._current_call} entry={sess._current_entry}")
-    check("补充段播报确认", len(spoken) == 2 and "Bravo Hotel Three X-ray X-ray" in spoken[1],
+    check("补充段复诵信息", len(spoken) == 2 and "您说的是" in spoken[1]
+          and "咸阳市" in spoken[1] and "泉盛K6" in spoken[1],
+          f"spoken={spoken}")
+    # 空段（0.5s 环境声）→ 静默忽略，不播报不归入
+    n = len(spoken)
+    sess._asr_text = lambda pcm: ""
+    sess._process_segment(b"\x00" * 32000, 0.5, None, session=1)
+    sess._asr_text = lambda pcm: "。"
+    sess._process_segment(b"\x00" * 32000, 0.5, None, session=1)
+    sess._asr_text = lambda pcm: "嗯"
+    sess._process_segment(b"\x00" * 32000, 0.5, None, session=1)
+    check("空段/语气词不播报不归入", len(spoken) == n
+          and sess._current_entry[4] == "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦",
+          f"spoken={spoken} entry={sess._current_entry}")
+    # 短确认语 → 确认收尾，不归入
+    sess._asr_text = lambda pcm: "正确"
+    sess._process_segment(b"\x00" * 32000, 0.5, None, session=1)
+    check("确认语收尾", len(spoken) == n + 1 and "感谢确认" in spoken[-1],
+          f"spoken={spoken}")
+    check("确认语不归入", sess._current_entry[4] == "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦",
+          f"entry={sess._current_entry}")
+    # 纠正语（无新呼号）→ 请重报
+    sess._asr_text = lambda pcm: "不对，我再说一遍，QTH在西安"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("纠正语请重报", len(spoken) == n + 2 and "重" in spoken[-1],
           f"spoken={spoken}")
     # 友台2 报呼号（session=2）→ 抄收并替换当前友台
     sess._asr_text = lambda pcm: "这里是BG9ABC，信号59"
@@ -318,6 +343,17 @@ def test_info_followup():
     check("友台1 条目未被污染",
           sess._checked_in[0][4] == "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦",
           f"entry={sess._checked_in[0]}")
+
+
+def test_report_clean():
+    print("[补充信息清洗 clean_report_text]")
+    c = net_control.clean_report_text
+    check("Q T 归一", c("我的Q T在咸阳市") == "我的QTH在咸阳市", c("我的Q T在咸阳市"))
+    check("Q T H 归一", "QTH" in c("Q T H 咸阳"))
+    check("W 转瓦", c("5W功率") == "5 瓦功率", c("5W功率"))
+    check("纯标点过滤", c("。") == "" and c("…") == "")
+    check("语气词过滤", c("嗯") == "" and c("嗯嗯") == "")
+    check("保留实质", c("对，我的QTH在咸阳") == "对，我的QTH在咸阳")
 
 
 def test_templates():
@@ -353,7 +389,7 @@ def main():
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
-               test_info_followup, test_templates]:
+               test_info_followup, test_report_clean, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
