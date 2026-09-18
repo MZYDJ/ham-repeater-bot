@@ -80,7 +80,7 @@ def main():
     print("语音包总数: %d" % len(rows))
     print("包长集合: %s" % dict(Counter(r[1] for r in rows)))
     print("session 集合: %s" % dict(Counter(r[2] for r in rows)))
-    print("seq 增量分布: %s" % dict(Counter(r[4] - r2[4] for r, r2 in zip(rows, rows[1:]) if r[4] and r2[4])))
+    print("seq 增量分布: %s" % dict(Counter(r[3] - r2[3] for r, r2 in zip(rows, rows[1:]) if r[3] and r2[3])))
     print("解码样本分布: %s" % dict(Counter(str(r[5]) for r in rows)))
     # 间隔统计
     its = [rows[i][0] - rows[i - 1][0] for i in range(1, len(rows))]
@@ -88,16 +88,16 @@ def main():
         its.sort()
         print("到达间隔: 中位 %.3fs 均值 %.3fs 最小 %.3fs 最大 %.3fs" %
               (its[len(its) // 2], sum(its) / len(its), its[0], its[-1]))
-    # 结论提示
+    # 结论提示（解码样本：5760=120ms 一包 6 帧完整解出；960=只解出首帧 20ms）
     samples_counter = Counter(str(r[5]) for r in rows)
     common = samples_counter.most_common(1)
     if common:
         s = common[0][0]
         if s == "5760":
-            print("\n→ 解码样本=5760（120ms/包，6帧）正常：倍速不是帧结构问题，检查包到达/丢包")
+            print("\n→ 解码样本=5760（120ms/包，6帧逐帧解码正常）→ 倍速已修复")
         elif s.isdigit() and int(s) < 5760:
-            print("\n→ 解码样本=%s（<5760）：每包实际音频不足120ms → 倍速根源在此"
-                  % s)
+            print("\n→ 解码样本=%s（<5760）：每包实际音频不足120ms → 倍速根源"
+                  "（发送端6帧串联，接收端需按30B逐帧解码）" % s)
         else:
             print("\n→ 解码样本异常分布：%s" % dict(samples_counter))
 

@@ -79,11 +79,17 @@ def test_opus_roundtrip():
     check("Opus 往返长度", len(out) == len(pcm_all),
           f"enc={len(opus_all)}B out={len(out)}B in={len(pcm_all)}B")
     check("Opus 非静音", max(out) > 100 or min(out) < -100)
-    # 单帧（20ms）往返
-    pcm20 = bytes(pcm_all[:3840])
+    # 单帧（20ms=960样本）往返：encode → 30B → decode 还原 1920B
+    pcm20 = bytes(pcm_all[:1920])
     opus20 = enc.encode_frame(pcm20)
     out20 = dec.decode(opus20)
     check("Opus 20ms 帧往返", len(out20) == len(pcm20), f"out={len(out20)} in={len(pcm20)}")
+    # 6帧拼接 180B（生产下行形态，发送端逐帧编码后串联）→ decode 还原 6×1920B
+    six = b"".join(enc.encode_frame(bytes(pcm_all[off:off + 1920]))
+                   for off in range(0, 1920 * 6, 1920))
+    out6 = dec.decode(six)
+    check("Opus 6帧拼接往返", len(out6) == 1920 * 6,
+          f"out={len(out6)} in={1920 * 6}")
     dec.close()
 
 

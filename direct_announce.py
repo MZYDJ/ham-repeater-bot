@@ -229,20 +229,36 @@ class OpusDecoder:
             raise RuntimeError("opus_decoder_create 失败: err=%s" % err.value)
         self.state = ctypes.c_void_p(raw)
     def decode(self, opus_bytes):
-        """Opus 包 → PCM s16le 单声道字节流。
-        缓冲按 120ms（6×20ms 帧，5760 样本 @48k）预留，返回实际解码样本数。"""
+        """Opus 包 → PCM s16le 单声道字节流（48kHz）。
+
+        平台关键事实：下行 180B 语音包是发送端**逐帧编码后串联**的
+        6 个独立 20ms Opus 帧（build_audio：每帧 30B CBR，6 帧拼一包），
+        并非 RFC 多帧包。若把 180B 整体喂给 opus_decode，只会解出首帧
+        （960 样本=20ms），其余 150B 被忽略 → 录音变成约 6 倍速+跳变
+        （capture_downlink.py 实测：整包解码全部只出 960 样本）。
+        修复：按 30B 帧切分、逐帧解码、拼接输出。尾帧不足 30B 补零
+        （与发送端尾包补零一致）；无效帧输出静音帧，时长不塌陷。"""
         with self._lock:
             if self.state is None or self.lib is None:
                 return b""
-            n_in = len(opus_bytes)
-            if n_in == 0:
+            if not opus_bytes:
                 return b""
-            buf_in = (ctypes.c_ubyte * n_in).from_buffer_copy(opus_bytes)
-            out = (ctypes.c_int16 * 5760)()
-            n = self.lib.opus_decode(self.state, buf_in, n_in, out, 5760, 0)
-            if n < 0:
-                raise RuntimeError("opus_decode 错误码 %d" % n)
-            return ctypes.string_at(ctypes.addressof(out), n * 2)
+            frame_size = 30
+            data = opus_bytes
+            tail = len(data) % frame_size
+            if tail:
+                data = data + b"\x00" * (frame_size - tail)
+            out = bytearray()
+            for off in range(0, len(data), frame_size):
+                frame = data[off:off + frame_size]
+                buf_in = (ctypes.c_ubyte * frame_size).from_buffer_copy(frame)
+                buf_out = (ctypes.c_int16 * 5760)()
+                n = self.lib.opus_decode(self.state, buf_in, frame_size,
+                                         buf_out, 5760, 0)
+                if n < 0:
+                    n = 960               # 无效/补零帧 → 一帧静音，时长不塌陷
+                out += ctypes.string_at(ctypes.addressof(buf_out), n * 2)
+            return bytes(out)
     def close(self):
         with self._lock:
             try:
