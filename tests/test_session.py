@@ -4,7 +4,7 @@
 点名会话状态机测试（离线，桩 ASR/TTS）。
 运行：python3 tests/test_session.py
 覆盖：正常抄收→确认、重复抄收→提示跳过、低置信度→请重复（限次）→未抄收、
-     固定名单模式超时跳过、开放模式窗口结束汇总。
+     固定名单模式超时跳过、开放模式窗口结束汇总、开场白占位符与到点安静收尾。
 """
 import sys
 from pathlib import Path
@@ -91,10 +91,47 @@ def test_roster_timeout():
     check("播报无人应答", "无人应答" in said, said)
 
 
+def test_opening_fmt_and_timing():
+    print("[开场白占位符 + 总时长/安静结束]")
+    import queue as _q
+    orig_cfg = net_control.nc_cfg
+    def small_cfg(*path, **kw):
+        key = path[0]
+        default = kw.get("default")
+        if key == "listen_after_open_seconds":
+            return 0.1          # 最短窗口
+        if key == "max_net_seconds":
+            return 1            # 总时长 1s
+        if key == "quiet_end_seconds":
+            return 0.1          # 连续安静 0.1s 即收尾
+        if key == "grace_seconds":
+            return 2
+        if key == "save_audio":
+            return False        # 测试环境不落盘
+        return orig_cfg(*path, **kw)
+    net_control.nc_cfg = small_cfg
+    try:
+        tts = SpyTTS()
+        sess = NetControlSession(link=None, tts_func=tts)
+        sess._asr = FakeAsr([])
+        sess._run()                             # 同步跑完整会话（开场→窗口→汇总）
+    finally:
+        net_control.nc_cfg = orig_cfg
+    if not tts.said:
+        check("开场白已播报", False, "无任何播报")
+        return
+    opening = tts.said[0]
+    check("开场白占位符已替换", "{" not in opening and "CQ" in opening, opening)
+    check("开场白含主控呼号", "BI9BZW" in opening, opening)
+    has_closing = any("到此结束" in t or "73" in t for t in tts.said)
+    check("到点安静后已收尾", has_closing, str(tts.said))
+
+
 def main():
     print("== 点名会话状态机测试 ==")
     test_open_flow()
     test_roster_timeout()
+    test_opening_fmt_and_timing()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
 

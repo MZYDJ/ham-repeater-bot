@@ -187,8 +187,10 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
 5. 播报：Edge-TTS 合成（全文 md5 缓存 + libmpg123 校验，与播报同款）→ 复用链路抢麦发包
 
 **两种点名模式**：
-- 开放点名（默认 `roster_mode=false`）：CQ 开场 → 收听窗口内逐个抄收 → 汇总 → 结束（参与者不可预知，不依赖封闭名单）
-- 固定名单（`roster_mode=true`）：逐个呼叫名单成员 → 超时跳过 → 汇总
+- 开放点名（默认 `roster_mode=false`）：CQ 开场 → 最短收听 `listen_after_open_seconds`（默认 60s）→ 到点名总时长 `max_net_seconds`（默认 1800s=30 分钟）后**不立即结束**：若仍有人在点名（正上麦应答），等其说完，连续 `quiet_end_seconds`（默认 10s）无任何应答才播结束语；`grace_seconds`（默认 300s）为到点后的硬性宽限，防持续讲话无限延长（参与者不可预知，不依赖封闭名单）
+- 固定名单（`roster_mode=true`）：逐个呼叫名单成员 → 超时跳过 → 汇总；总时长受 `roster_max_seconds`（默认 1800s）约束
+
+**应答采集**：默认开启说话信令门控（`use_talking_gate=true`）——只有服务器广播了"开始讲话"（UserTalking）的远端语音才会被采集，链路底噪/杂音不再误触发"应答段"；若 60s 内从未收到任何说话信令（平台不下发）自动降级为纯 VAD，不丢应答。过短音频（< `asr_min_seconds`，默认 1s）会在送 ASR 前补静音，规避接口对极短音频的 400。
 
 **启用步骤**：
 1. `config.json` 中 `net_control.enabled=true`，填 `asr.api_key`（百炼）、点名时段（`weekday/hour/minute`）；可选填 `llm.api_key`
@@ -199,6 +201,7 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
 ```bash
 python3 net_control.py --decode "Bravo Hotel Three X-ray X-ray 信号五九"   # 解释法解码
 python3 net_control.py --opus-roundtrip                                     # Opus 编解码往返
+python3 net_control.py --asr-test                                           # ASR 接口自测（需已配 api_key，留空用合成音）
 python3 tests/run_tests.py && python3 tests/test_session.py                 # 全部单元测试
 ```
 
