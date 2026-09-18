@@ -713,6 +713,9 @@ class NetControlSession:
         # 结构化字段永久化：呼号 → {qth, device, antenna, power, signal}（CSV 导出用）
         self._fields = {}
         self._checkin_times = {}            # 呼号 → 抄收时刻 ISO 串（CSV 导出用）
+        self._csv_path = None               # 实时点名记录 CSV 路径（点名开始即建，持续更新）
+        self._last_tx_end = None            # 最近一次发射结束时刻（中继台回波过滤用）
+        self._last_spoken_text = ""         # 最近一次播报文本（回波文本重合判定用）
         self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
         self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
@@ -782,6 +785,7 @@ class NetControlSession:
         logger.info("点名主播会话开始")
         try:
             self._ensure_capture()
+            self._ensure_csv()          # 实时记录：点名一开始即建 CSV，中断也不丢
             self._speak(self._fmt(nc_cfg("opening_text", default=
                 "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是每周{weekday}晚"
                 "{net_name}，我是今晚主控{ctrl_call}，今天是{date}，现在是北京时间{time}，"
@@ -865,8 +869,18 @@ class NetControlSession:
                     f"{' session=' + str(session) if session is not None else ''}")
         raw = self._asr_text(pcm16)
         logger.info(f"ASR: {raw}")
+        # 中继台回波过滤：自己发射后紧接的短段（回声），先于一切处理丢弃
+        if self._is_echo(raw, dur):
+            logger.info(f"疑似中继台回波，忽略（{raw!r} dur={dur:.1f}s）")
+            return
         res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
         call, signal, score = res["callsign"], res["signal"], res["score"]
+        # 空/纯语气词段（放麦尾音、环境声、回波残余）→ 静默：
+        # 不播"请重复呼号"、不消耗重复请求额度（实测 20:15 放麦后 0.6s 空段
+        # 触发"请重复"→ 30s 等待 → 抢麦失败的连锁）
+        if not call and not clean_report_text(raw):
+            logger.info(f"空/语气词段静默忽略（{raw!r}）")
+            return
         if call and is_duplicate(call, self._checked_calls):
             logger.info(f"重复抄收 {call}，跳过")
             self._dups += 1
@@ -899,6 +913,7 @@ class NetControlSession:
                 call=call, call_phonetic=callsign_phonetic(call), report=signal or "")
             logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
             self._speak(ack)
+            self._flush_csv()          # 实时落盘：新友台抄收即写入
             return
         # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
         # 点名流程中友台报完呼号后，补充 QTH/设备/天线/功率时通常不再重复呼号
@@ -965,6 +980,7 @@ class NetControlSession:
                     self._speak(self._fmt(tmpl, call=self._current_call,
                         call_phonetic=callsign_phonetic(self._current_call),
                         info=info))
+                self._flush_csv()          # 实时落盘：结构化字段更新即写入
                 return
             # 无结构化字段的文本分类：
             if any(k in kw for k in ask_kw):
@@ -1163,16 +1179,36 @@ class NetControlSession:
     def _wait_channel_idle(self):
         """先听后说：抢麦前等待信道空闲。当前无人讲话 → 立即返回；
         有人在讲 → 等待对方讲完（最多 tx_wait_timeout 秒，超时仍发射，
-        避免点名流程被无限拖住）。返回 True 表示可发射。"""
+        避免点名流程被无限拖住）。返回 True 表示可发射。
+
+        等待期间**继续识别**：TTS 合成完成、等待发射的窗口里，友台可能接连
+        上麦（多人排队），此时不能停泵丢段——循环里同步消费 _seg_queue 并
+        _process_segment：识别到谁就点名谁（抄收→成为当前友台→对其播报），
+        其余自然排队。识别产生的播报会先完成，再回到本播报。"""
         timeout = float(nc_cfg("tx_wait_timeout", default=30))
         if not self._someone_speaking():
             return True
-        logger.info(f"信道占用中，等待对方讲完再播报（最多 {timeout:.0f}s）…")
+        logger.info(f"信道占用中，等待对方讲完再播报（最多 {timeout:.0f}s），"
+                    f"期间继续识别…")
         deadline = time.time() + timeout
         while time.time() < deadline and not self._stop.is_set():
             if not self._someone_speaking():
                 logger.info("信道已空闲，开始播报")
                 return True
+            # 等待期间继续识别：消费队列中积压的语音段（多人接连说话不丢）
+            consumed = 0
+            try:
+                while True:
+                    pcm16, dur, wav, session = self._seg_queue.get_nowait()
+                    self._process_segment(pcm16, dur, wav, session)
+                    consumed += 1
+            except queue.Empty:
+                pass
+            if consumed:
+                logger.info(f"等待期间已识别 {consumed} 段（友台轮流点名）")
+                if not self._someone_speaking():
+                    logger.info("信道已空闲，开始播报")
+                    return True
             time.sleep(0.2)
         logger.warning(f"等待信道空闲超时（{timeout:.0f}s），仍尝试播报")
         return True
@@ -1182,6 +1218,7 @@ class NetControlSession:
             return
         text = text.strip()
         logger.info(f"点名播报: {text}")
+        self._last_spoken_text = text      # 回波过滤：与紧随其后收到的短段比对
         mp3 = ""
         try:
             mp3 = self.tts_func(text) if self.tts_func else synth_text(text)
@@ -1238,45 +1275,114 @@ class NetControlSession:
         finally:
             if s is not None and self.link is not None:
                 self.link.release()
+            self._last_tx_end = time.time()    # 发射结束时刻（回波过滤窗口起点）
+
+    # ---------- 点名记录 CSV 实时落盘 ----------
+    # 点名一开始就创建文件（写表头），此后每次抄收/补充信息立即全量重写。
+    # 这样即使点名会话被中断（kill/容器重启），记录也已持久化——实测 seg 录音
+    # 是实时写的所以看得到，而 summary_*.json 只在会话正常结束时才写，
+    # 被中断就没有，这是"看不到 summary"的根因。
+    CSV_HEADER = ["序号", "呼号", "信号报告", "QTH", "设备", "天线", "功率",
+                  "抄收时间", "原始转录", "补充原文"]
+
+    def _csv_path_for(self):
+        audio_dir = nc_cfg("audio_dir", default="/app/net_records")
+        Path(audio_dir).mkdir(parents=True, exist_ok=True)
+        stamp = (self._started_at.strftime("%Y%m%d_%H%M%S")
+                 if self._started_at
+                 else datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        return str(Path(audio_dir) / f"点名记录_{stamp}.csv")
+
+    def _ensure_csv(self):
+        """点名开始时创建 CSV（写表头）。失败不阻断点名。"""
+        if self._csv_path:
+            return self._csv_path
+        try:
+            p = self._csv_path_for()
+            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                csv.writer(f).writerow(self.CSV_HEADER)
+            self._csv_path = p
+            logger.info(f"点名记录已创建: {p}")
+        except Exception as e:
+            logger.warning(f"点名记录 CSV 创建失败: {e}")
+            self._csv_path = None
+        return self._csv_path
+
+    def _csv_rows(self):
+        rows = []
+        for i, (call, signal, wav, raw, info) in enumerate(self._checked_in, 1):
+            fd = self._fields.get(call.upper(), {})
+            rows.append([i, call, signal or fd.get("signal", ""),
+                         fd.get("qth", ""), fd.get("device", ""),
+                         fd.get("antenna", ""), fd.get("power", ""),
+                         self._checkin_times.get(call.upper(), ""),
+                         raw or "", info or ""])
+        return rows
+
+    def _flush_csv(self):
+        """全量重写点名记录 CSV（表头+当前全部行）。返回路径或 None。"""
+        p = self._ensure_csv()
+        if not p:
+            return None
+        try:
+            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(self.CSV_HEADER)
+                w.writerows(self._csv_rows())
+            logger.info(f"点名记录已更新: {p}（{len(self._checked_in)} 位友台）")
+            return p
+        except Exception as e:
+            logger.warning(f"点名记录 CSV 写入失败: {e}")
+            return None
 
     def _export_csv(self, path=None):
-        """点名记录永久化导出：每次点名一个 CSV 文件，文件名按点名开始时间。
-        每行一位友台，列=呼号/信号报告/QTH/设备/天线/功率/抄收时间/原始转录/补充原文。
-        UTF-8 with BOM（Excel/WPS 直接打开中文不乱码），脚本可用 csv 模块直接解析。
-        返回导出路径；失败返回 None（不阻断点名收尾）。"""
+        """导出点名记录 CSV（path=None 用实时文件；测试可显式传路径）。
+        UTF-8 with BOM（Excel/WPS 直接打开中文不乱码）。返回路径或 None。"""
+        if path is None:
+            return self._flush_csv()
         try:
-            if path is None:
-                audio_dir = nc_cfg("audio_dir", default="/app/net_records")
-                Path(audio_dir).mkdir(parents=True, exist_ok=True)
-                stamp = (self._started_at.strftime("%Y%m%d_%H%M%S")
-                         if self._started_at
-                         else datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-                path = str(Path(audio_dir) / f"点名记录_{stamp}.csv")
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            header = ["序号", "呼号", "信号报告", "QTH", "设备", "天线", "功率",
-                      "抄收时间", "原始转录", "补充原文"]
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(header)
-                for i, (call, signal, wav, raw, info) in enumerate(self._checked_in, 1):
-                    fd = self._fields.get(call.upper(), {})
-                    w.writerow([
-                        i,
-                        call,
-                        signal or fd.get("signal", ""),
-                        fd.get("qth", ""),
-                        fd.get("device", ""),
-                        fd.get("antenna", ""),
-                        fd.get("power", ""),
-                        self._checkin_times.get(call.upper(), ""),
-                        raw or "",
-                        info or "",
-                    ])
+                w.writerow(self.CSV_HEADER)
+                w.writerows(self._csv_rows())
             logger.info(f"点名记录已导出: {path}（{len(self._checked_in)} 位友台）")
             return path
         except Exception as e:
             logger.warning(f"点名记录导出失败: {e}")
             return None
+
+    def _is_echo(self, raw, dur):
+        """中继台回波过滤：自己发射后紧接的短段大概率是自身语音经中继台
+        转发回来的回声（ASR 空，或文本与刚播报内容高度重合）。三重判定：
+        时间窗口内（echo_holdoff_seconds 默认 1.5s）+ 段长较短（≤1.5s）
+        + 文本为空或与最近播报文本重合度 ≥50%。"""
+        if self._last_tx_end is None:
+            return False
+        if time.time() - self._last_tx_end > float(nc_cfg("echo_holdoff_seconds", default=1.5)):
+            return False
+        if dur > float(nc_cfg("echo_segment_max_seconds", default=1.5)):
+            return False
+        if not (raw or "").strip():
+            return True
+        last = self._last_spoken_text or ""
+        if last:
+            # 回波文本是刚播报文本的连续子串/近似连续（中继台截断的回声）。
+            # 用"最长连续公共子串占短文本比例"判定——避免"这里是…信号…"
+            # 这类通框架词造成字符集重合误判（真实友台抢答也会带这些词）。
+            short, long_ = (raw, last) if len(raw) <= len(last) else (last, raw)
+            best = 0
+            for i in range(len(short)):
+                for j in range(len(long_)):
+                    k = 0
+                    while (i + k < len(short) and j + k < len(long_)
+                           and short[i + k] == long_[j + k]):
+                        k += 1
+                    if k > best:
+                        best = k
+            if best and best / max(1, len(short)) >= 0.7:
+                return True
+        return False
 
     def _teardown(self):
         if self.link is not None and self.link._on_downlink is self._on_downlink:
@@ -1294,7 +1400,7 @@ class NetControlSession:
                 json.dump(self.summary, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"点名摘要落盘失败: {e}")
-        self._export_csv()          # 点名记录 CSV 永久化（按点名开始时间命名，每次点名一个文件）
+        self._flush_csv()          # 点名记录 CSV 实时落盘（点名开始即建，此处收尾刷新一次）
         self.done.set()
         if self.on_done:
             try:
