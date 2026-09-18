@@ -216,6 +216,31 @@ def test_asr_body():
     check("no-opts 变体无 asr_options", "asr_options" not in b_noopts)
 
 
+def test_vocab_echo_reject():
+    print("[ASR 词表回显校验（服务端把 system 当输入转写）]")
+    from unittest import mock
+    import direct_announce as _da
+    echo = ('{"choices":[{"message":{"content":"业余无线电点名应答转写。'
+            '以下为背景实体词表，请优先正确识别：alpha、bravo。"}}]}')
+    ok = '{"choices":[{"message":{"content":"这里是BH3XX"}}]}'
+    client = AsrClient(api_key="sk-test")
+
+    def fake_req(body, retry_conn=True):
+        has_sys = any(m.get("role") == "system" for m in body.get("messages", []))
+        return (200, (echo.encode() if has_sys else ok.encode()))
+
+    client._request = fake_req
+    with mock.patch.dict(_da.CFG,
+                         {"net_control": {"asr": {"sys_style": "list"}}}):
+        text = client.transcribe(b"\x00" * 16000, context_words=["BRAVO", "BH3XX"])
+    check("词表回显被拒并降级重试", text == "这里是BH3XX", f"text={text}")
+    # 默认 none（不带 system）正常返回
+    client2 = AsrClient(api_key="sk-test")
+    client2._request = lambda body, retry_conn=True: (200, ok.encode())
+    check("正常结果不受影响",
+          client2.transcribe(b"\x00" * 16000) == "这里是BH3XX")
+
+
 def test_conn_reuse():
     print("[ASR 长连接复用（keep-alive）]")
     from unittest import mock
@@ -750,7 +775,8 @@ def main():
     print("== 点名主播离线单元测试 ==")
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
-               test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
+               test_asr_body, test_vocab_echo_reject, test_conn_reuse,
+               test_config_defaults, test_retry_reset,
                test_info_followup, test_report_clean, test_report_fields,
                test_wait_channel_idle, test_export_csv, test_echo_filter,
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,

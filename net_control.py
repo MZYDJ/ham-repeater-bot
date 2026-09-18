@@ -465,10 +465,14 @@ class VoiceCapture:
 
 
 # ====================== ASR 客户端（qwen3-asr-flash，OpenAI 兼容） ======================
+# system 词表"回显"特征：服务端把 system 词表当输入文本转写时，返回内容
+# 必然包含这些引导语（实测 2026-09-18 21:55:22 完整回显）。
+VOCAB_MARKERS = ("以下为背景实体词表", "业余无线电点名应答转写", "请优先正确识别")
+
+
 class AsrClient:
     """非流式转写：OpenAI 兼容 /chat/completions，System Message 传实体词表
     （点名名单、解释法词表、已抄收呼号）提升呼号识别。纯标准库，无新增依赖。
-
     连接复用：持有一个 http.client.HTTPSConnection 长连接（keep-alive），
     点名期间多次 ASR 共用同一条 TCP+TLS，省去每次请求的握手开销
     （此前每次 transcribe 都新建连接——用户实测"每次 ASR 都要重新发送一次 TCP"）。
@@ -491,6 +495,7 @@ class AsrClient:
         self._conn = None                       # 复用的 HTTPS 长连接（懒创建）
         self._conn_host = None
         self._conn_port = None
+        self._lock = threading.Lock()           # 长连接非线程安全，串行化所有请求
 
     # ---------- 请求体构造（sys_style 供 system 词表格式探测） ----------
     def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True,
@@ -561,12 +566,19 @@ class AsrClient:
             raise
 
     def transcribe(self, wav_bytes, context_words=None, sys_style=None):
+        # 并发保护：发射/识别线程化后存在多路径调用风险，长连接必须串行
+        with self._lock:
+            return self._transcribe_locked(wav_bytes, context_words, sys_style)
+
+    def _transcribe_locked(self, wav_bytes, context_words=None, sys_style=None):
         # 自动降级重试：system 词表实测须用数组格式（list），字符串格式报 400
         # （does not support this input）。链：list → 去 system → 再去 asr_options。
         # sys_style 显式传入时（--asr-probe）不降级、按指定格式试。
+        # 生产默认 asr.sys_style="none"（实测 list 格式偶发被服务端"词表回显"——
+        # 服务端把 system 词表当输入文本转写返回，见 21:55:22 日志）。
         for attempt in (1, 2, 3):
             style = sys_style if sys_style is not None else (
-                "list" if attempt == 1 else "none")
+                nc_cfg("asr", "sys_style", default="none") if attempt == 1 else "none")
             body = self._build_body(
                 wav_bytes,
                 context_words if style != "none" else None,
@@ -576,7 +588,22 @@ class AsrClient:
             detail = data.decode("utf-8", "replace")
             if status == 200:
                 out = json.loads(detail)
-                break
+                content = (out.get("choices") or [{}])[0].get(
+                    "message", {}).get("content", "")
+                # 官方响应 content 标注为 array（示例为字符串），两种都兼容
+                if isinstance(content, list):
+                    content = "".join(
+                        str(x.get("text", "")) if isinstance(x, dict) else str(x)
+                        for x in content)
+                content = content.strip()
+                # 词表回显校验：返回内容含词表引导语特征 = 服务端把 system
+                # 词表当输入转写（21:55:22 实测），判定无效 → 去掉 system 重试
+                if style != "none" and content and any(
+                        m in content for m in VOCAB_MARKERS):
+                    logger.warning("ASR 返回词表回显（system 被服务端当输入转写），"
+                                   "去掉词表重试")
+                    continue
+                return content
             logger.error(f"ASR HTTP {status}: {detail[:600]}")
             if (status == 400 and attempt < 3 and sys_style is None
                     and ("does not support this input" in detail
@@ -590,13 +617,6 @@ class AsrClient:
             raise RuntimeError(f"ASR HTTP {status}: {detail[:200]}")
         else:
             raise RuntimeError("ASR 请求连续失败")
-        content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        # 官方响应 content 标注为 array（示例为字符串），两种都兼容
-        if isinstance(content, list):
-            content = "".join(
-                str(x.get("text", "")) if isinstance(x, dict) else str(x)
-                for x in content)
-        return content.strip()
 
 
 # ====================== LLM 客户端（可选，GLM-4.5-Flash） ======================
@@ -1336,7 +1356,7 @@ class NetControlSession:
            静音累计只在有新音频帧喂入时推进——对方讲完、链路静默后不再有帧，
            _speaking 会无限卡 True（实测"没人说话却等 30s"的根因之一）。
            故加 feed 活性检测：最近 vad_idle_seconds（默认 2s）无新帧即复位。"""
-        stale = float(nc_cfg("talking_stale_seconds", default=8))
+        stale = float(nc_cfg("talking_stale_seconds", default=4))
         for s in list(self._talking_sessions):
             last = self._talking_active.get(s, 0)
             if time.time() - last > stale:
