@@ -268,10 +268,15 @@ def extract_report_fields(text):
                   r"\s*([^，。；,;.!！?？\s]{2,24})", text, re.I)
     if m and not re.search(r"[A-Za-z]\d[A-Za-z]{1,3}", m.group(1)):
         fields.append(("qth", m.group(1).strip()))
-    # 设备
+    # 设备：覆盖"设备是手机/电台为K6/用的是手机/使用手机/用手机"等句式。
+    # 先匹配"设备/机器/电台/手台/车台"关键词（"我使用的设备是手机"→手机），
+    # 再兜底"用/使用"句式（"用的是手机"→手机）；排除疑问词防误取。
     m = re.search(r"(?:设备|机器|电台|手台|车台)(?:是|为|的|的是|用的)?"
                   r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
-    if m:
+    if not m:
+        m = re.search(r"(?:用的是|使用的是|用|使用)(?:的)?(?:是)?"
+                      r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
+    if m and not re.search(r"什么|哪个|怎样|怎么|多少|干嘛|干吗", m.group(1)):
         fields.append(("device", m.group(1).strip()))
     # 天线：两种常见语序——"天线原机天线"（天线在前）与"原机天线/八木天线"（天线在后）。
     # 优先"天线在前"（避免把"天线原机天线"误切为 xxx天线），再试"天线在后"。
@@ -989,15 +994,19 @@ class NetControlSession:
                 logger.info(f"{self._current_call} 空补充段忽略（{raw!r}）")
                 return
             kw = info.lower()
-            correct_kw = ("不对", "不正确", "错了", "不是", "纠正", "说错",
+            correct_kw = ("不对", "不正确", "错了", "纠正", "说错",
                           "重报", "听错", "抄错", "读错")
             confirm_kw = ("正确", "确认", "对的", "没问题", "收到了", "是的",
                           "对对对", "收到收到")
+            # "不是"单独判断：排除反问/抱怨句式（"不是已经说过了吗？"），
+            # 仅"不是"+具体内容（"不是，我的呼号是…"）才算纠正
+            correct_hit = any(k in kw for k in correct_kw) or (
+                "不是" in kw and not re.search(r"不是(?:已经|早就|刚|刚才|说|问|记|都|早就)", kw))
             ask_kw = ("是否抄收", "抄收到了吗", "抄收了吗", "是否收到",
                       "听得到吗", "听清了吗", "主控在吗", "在吗",
                       "能否抄收", "能否超收", "是否超收", "能不能抄收",
                       "是否超时", "超时了吗", "超收了吗", "可以了吗", "好了吗")
-            if any(k in kw for k in correct_kw):
+            if correct_hit:
                 # 友台纠正（呼号/信息听错）→ 通常紧接着会重复正确的呼号/信息：
                 # **先尝试从本段直接提取**（确定性低分呼号 + LLM 兜底），
                 # 提取成功直接修正抄收，只有提取失败才请对方重报
@@ -1077,6 +1086,13 @@ class NetControlSession:
                     f"{FIELD_LABEL.get(k, k)} {v}" for k, v in fields)
                 logger.info(f"{self._current_call} 补充信息（结构化 {len(fields)} 项）："
                             f"{field_str}")
+                # 重复值抑制：提取的字段值全部与已记录相同（如再次报"没有天线"）
+                # → 静默忽略，不重复复诵刷屏（实测 22:41:06 重复播"天线 没有天线"）
+                old = self._fields.get(self._current_call, {}) or {}
+                is_dup = all(str(old.get(k, "")) == v for k, v in fields)
+                if is_dup:
+                    logger.info(f"{self._current_call} 重复补充信息忽略（已记录）: {field_str}")
+                    return
                 # 结构化字段永久化（CSV 导出用；信号报告并入字段表）
                 fd = dict(fields)
                 if self._current_entry[1]:
