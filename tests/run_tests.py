@@ -15,6 +15,7 @@ import tempfile
 import time
 import datetime
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -140,6 +141,32 @@ def test_voice_capture():
           f"segs4={[(round(d,1), w) for d, w in segs4]}")
     cap4.force_finalize()                        # 无活动段时无副作用
     check("空段无副作用", len(segs4) == 1)
+
+    # 链路静默收尾：feed 停后（对方讲完、无新帧），pump 按实际时间推进切段
+    segs5 = []
+    cap5 = VoiceCapture(threshold=2000, silence_end_ms=400, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs5.append((d, w)))
+    cap5.feed(bytes(tone[:9600]))                # 200ms 音，说完后不再喂帧（链路静默）
+    cap5.pump()                                  # 立即 pump：idle≈0，不收尾
+    check("静默未满不切段", len(segs5) == 0)
+    with mock.patch("net_control.time.time", return_value=cap5.last_feed_at + 1.0):
+        cap5.pump()                              # 静默 1s > 400ms → 切段
+    check("链路静默时间驱动切段", len(segs5) == 1 and 0.08 <= segs5[0][0] <= 0.12,
+          f"segs5={[(round(d,2), w) for d, w in segs5]}")
+
+    # PTT 抬起延迟窗口：defer 未耗尽时 pump 不切段；耗尽后切
+    segs6 = []
+    cap6 = VoiceCapture(threshold=2000, silence_end_ms=200, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs6.append((d, w)))
+    cap6.feed(bytes(tone[:9600]))
+    cap6.force_finalize(defer_ms=600)            # 600ms 延迟收尾（防断续）
+    with mock.patch("net_control.time.time", return_value=cap6.last_feed_at + 0.2):
+        cap6.pump()                              # 延迟窗口内（0.2s<0.6s）：不切
+    check("PTT 延迟窗口内不切段", len(segs6) == 0)
+    with mock.patch("net_control.time.time", return_value=cap6.last_feed_at + 1.0):
+        cap6.pump()                              # 1s：延迟耗尽 + 静音 0.4s>0.2s → 切
+    check("延迟耗尽后切段", len(segs6) == 1,
+          f"segs6={[(round(d,2), w) for d, w in segs6]}")
 
 
 def test_wav_and_resample():

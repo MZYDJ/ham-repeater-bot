@@ -112,7 +112,8 @@
       "model": "qwen3-asr-flash",
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "enable_itn": true,
-      "language": ""
+      "language": "",
+      "sys_style": "none"
     },
     "llm": {
       "enabled": false,
