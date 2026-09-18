@@ -104,7 +104,7 @@ def test_voice_capture():
 
     segs = []
     cap = VoiceCapture(threshold=2000, silence_end_ms=400, min_segment_ms=300,
-                       save_dir=None, on_segment=lambda p, d, w: segs.append((d, w)))
+                       save_dir=None, on_segment=lambda p, d, w, s: segs.append((d, w)))
     cap.feed(bytes(silence[:4800]))
     cap.feed(bytes(tone))
     cap.feed(bytes(silence))
@@ -114,7 +114,7 @@ def test_voice_capture():
 
     segs2 = []
     cap2 = VoiceCapture(threshold=2000, silence_end_ms=400, min_segment_ms=300,
-                        save_dir=None, on_segment=lambda p, d, w: segs2.append((d, w)))
+                        save_dir=None, on_segment=lambda p, d, w, s: segs2.append((d, w)))
     cap2.feed(bytes(tone[:4800]))                # 100ms 短音 → 低于 min_segment，丢弃
     cap2.feed(bytes(silence[:9600]))
     check("短音被过滤", len(segs2) == 0)
@@ -122,7 +122,7 @@ def test_voice_capture():
     segs3 = []
     cap3 = VoiceCapture(threshold=2000, silence_end_ms=400, min_segment_ms=300,
                         max_segment_ms=1000, save_dir=None,
-                        on_segment=lambda p, d, w: segs3.append((d, w)))
+                        on_segment=lambda p, d, w, s: segs3.append((d, w)))
     cap3.feed(bytes(tone))                       # 3s 音 → 1s 强制截断
     cap3.feed(bytes(silence[:9600]))
     check("超长段强制截断", len(segs3) >= 1 and segs3[0][0] <= 1.1,
@@ -130,7 +130,7 @@ def test_voice_capture():
 
     segs4 = []
     cap4 = VoiceCapture(threshold=2000, silence_end_ms=5000, min_segment_ms=50,
-                        save_dir=None, on_segment=lambda p, d, w: segs4.append((d, w)))
+                        save_dir=None, on_segment=lambda p, d, w, s: segs4.append((d, w)))
     cap4.feed(bytes(tone[:9600]))                # 100ms 音（未达静音阈值 5s）
     cap4.force_finalize()                        # UserTalking 结束信令 → 立即切段
     check("结束信令立即切段", len(segs4) == 1 and 0.08 <= segs4[0][0] <= 0.12,
@@ -205,31 +205,74 @@ def test_retry_reset():
     spoken = []
     sess._speak = lambda text: spoken.append(text)
 
-    # 段1：友台报了完整信息但无呼号 → 应请求补报呼号（额度 1→0）
+    # 段1：无当前友台时友台直接报信息但无呼号 → 引导补报呼号（额度 1→0）
     sess._asr_text = lambda pcm: "我的QTH是在咸阳市，设备即时通，天线原机天线，五瓦功率发射"
-    sess._process_segment(b"\x00" * 32000, 1.0, None)
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     check("无呼号段触发引导播报", len(spoken) == 1 and "呼号" in spoken[0],
           f"spoken={spoken}")
     check("引导后额度已用尽", sess._retry_left == 0)
 
-    # 段2：下一位友台成功抄收 → 额度恢复
+    # 段2：下一位友台成功抄收（session=2）→ 额度恢复 + 当前友台上下文建立
     sess._asr_text = lambda pcm: "这里是BH3XX，信号59"
-    sess._process_segment(b"\x00" * 32000, 1.0, None)
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
     check("成功抄收", len(spoken) == 2 and "Bravo Hotel Three X-ray X-ray" in spoken[1],
           f"spoken={spoken}")
     check("抄收后额度恢复", sess._retry_left == 1 and not sess._retry_pending,
           f"retry_left={sess._retry_left}")
 
-    # 段3：又一个新友台无呼号 → 必须再次有引导播报（回归：旧代码此处静默）
-    sess._asr_text = lambda pcm: "这里是，我的设备是泉盛K6，天线原机天线，五瓦"
-    sess._process_segment(b"\x00" * 32000, 1.0, None)
-    check("抄收后新友台无呼号仍有引导", len(spoken) == 3 and "呼号" in spoken[2],
+    # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 归入当前友台，不消耗额度
+    sess._asr_text = lambda pcm: "我的设备是泉盛K6，天线原机天线，五瓦"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("同台补充信息归入", len(spoken) == 3 and "信息已记录" in spoken[2]
+          and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
+          f"spoken={spoken} entry={sess._current_entry}")
+    check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
+
+    # 段4：新 session 无呼号（新友台没报呼号）→ 引导报呼号
+    sess._asr_text = lambda pcm: "这里是，我的设备是泉盛K6"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=3)
+    check("新友台无呼号仍引导", len(spoken) == 4 and "呼号" in spoken[3],
           f"spoken={spoken}")
 
-    # 段4：连续无呼号（额度已尽）→ 静默但计数
-    sess._process_segment(b"\x00" * 32000, 1.0, None)
-    check("额度用尽后静默", len(spoken) == 3 and sess._failed == 1,
+    # 段5：同新 session 连续无呼号（额度尽）→ 静默但计数
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=3)
+    check("额度用尽后静默", len(spoken) == 4 and sess._failed == 1,
           f"spoken={spoken} failed={sess._failed}")
+
+
+def test_info_followup():
+    print("[补充信息归入当前友台（点名流程无呼号段）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._teardown_dir = None
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda text: spoken.append(text)
+
+    # 友台1 报呼号（session=1）
+    sess._asr_text = lambda pcm: "这里是BH3XX，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    # 友台1 补充 QTH/设备（同 session、无呼号）→ 归入 BH3XX
+    sess._asr_text = lambda pcm: "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("补充段归入友台1", sess._current_call == "BH3XX"
+          and "QTH" in (sess._current_entry[4] or ""),
+          f"call={sess._current_call} entry={sess._current_entry}")
+    check("补充段播报确认", len(spoken) == 2 and "Bravo Hotel Three X-ray X-ray" in spoken[1],
+          f"spoken={spoken}")
+    # 友台2 报呼号（session=2）→ 抄收并替换当前友台
+    sess._asr_text = lambda pcm: "这里是BG9ABC，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("新友台替换上下文", sess._current_call == "BG9ABC" and sess._current_session == 2
+          and [c for c, *_ in sess._checked_in] == ["BH3XX", "BG9ABC"],
+          f"call={sess._current_call}")
+    # 友台2 补充（session=2、无呼号）→ 归入友台2 的条目
+    sess._asr_text = lambda pcm: "我的QTH在咸阳市"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("补充段归入友台2", sess._checked_in[1][4] == "我的QTH在咸阳市",
+          f"entry={sess._checked_in[1]}")
+    check("友台1 条目未被污染",
+          sess._checked_in[0][4] == "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦",
+          f"entry={sess._checked_in[0]}")
 
 
 def test_templates():
@@ -264,7 +307,8 @@ def main():
     print("== 点名主播离线单元测试 ==")
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
-               test_asr_body, test_config_defaults, test_retry_reset, test_templates]:
+               test_asr_body, test_config_defaults, test_retry_reset,
+               test_info_followup, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)

@@ -254,7 +254,8 @@ def pcm_to_wav_bytes(pcm16, rate=16000):
 class VoiceCapture:
     """话音检测与语音段切分：喂入 48kHz 单声道 PCM（下行 Opus 解码后），
     按 20ms 帧算能量，检测"起讲→讲话→静音收尾"，输出 16kHz 单声道完整段。
-    带自适应噪声底；on_segment(pcm16, dur_s, wav_path) 在喂入线程中回调。"""
+    带自适应噪声底；on_segment(pcm16, dur_s, wav_path, session) 在喂入线程中回调，
+    session 为段来源讲话人标识（点名状态机据此把补充信息段归入当前友台）。"""
     FRAME_S = 960 * 2                                # 20ms @48k int16 字节数
 
     def __init__(self, threshold=None, silence_end_ms=None, min_segment_ms=None,
@@ -271,6 +272,7 @@ class VoiceCapture:
         self._silence_s = 0.0
         self._noise = 0.0
         self._seq = 0
+        self._seg_session = None        # 当前段来源 session（讲话人标识，点名上下文关联用）
 
     def _rms(self, frame):
         s = array.array('h')
@@ -282,9 +284,15 @@ class VoiceCapture:
     def _active_thr(self):
         return max(float(self.threshold), self._noise * 3.0, 300.0)
 
-    def feed(self, pcm48):
+    def feed(self, pcm48, session=None):
+        """喂入 48kHz 单声道 PCM。session 为该批语音的远端来源标识：
+        讲话人切换（session 变化）时先收尾当前段再开新段，保证每个切出的
+        语音段归属单一 session（点名状态机据此把"补充信息段"归入当前友台）。"""
         if not pcm48:
             return
+        if (self._speaking and session is not None
+                and self._seg_session is not None and session != self._seg_session):
+            self._finalize()                       # 换人：先收尾上一位的段
         for off in range(0, len(pcm48) - self.FRAME_S + 1, self.FRAME_S):
             frame = pcm48[off:off + self.FRAME_S]
             rms = self._rms(frame)
@@ -298,6 +306,7 @@ class VoiceCapture:
                     self._speaking = True
                     self._silence_s = 0.0
                     self._buf48 = bytearray(frame)
+                    self._seg_session = session
             else:
                 self._buf48 += frame
                 if active:
@@ -311,9 +320,11 @@ class VoiceCapture:
 
     def _finalize(self):
         pcm48 = bytes(self._buf48)
+        session = self._seg_session
         self._speaking = False
         self._buf48 = bytearray()
         self._silence_s = 0.0
+        self._seg_session = None
         dur = len(pcm48) / (48000 * 2)
         if dur < self.min_segment_ms / 1000:
             return
@@ -330,7 +341,7 @@ class VoiceCapture:
                 logger.warning(f"应答录音落盘失败: {e}")
         if self.on_segment:
             try:
-                self.on_segment(pcm16, dur, wav_path)
+                self.on_segment(pcm16, dur, wav_path, session)
             except Exception as e:
                 logger.warning(f"应答段回调异常: {e}")
 
@@ -524,12 +535,17 @@ class NetControlSession:
         self._stop = threading.Event()
         self._thread = None
         self._seg_queue = queue.Queue(maxsize=64)
-        self._checked_in = []                   # [(call, signal, wav, raw)]
+        self._checked_in = []  # [(call, signal, wav, raw, info)]  info=后续补充信息（QTH/设备等）
         self._checked_calls = set()
         self._dups = 0
         self._failed = 0
         self._retry_pending = False
         self._retry_left = int(nc_cfg("max_retry", default=1))
+        # "当前正在点名"的友台上下文：抄收呼号后保留，后续不带呼号的补充段
+        # （QTH/设备/天线/功率等）按来源 session 归入该友台，不再当"未抄收"。
+        self._current_call = None           # 当前台上友台呼号（大写）
+        self._current_session = None        # 抄收该呼号的语音段来源 session
+        self._current_entry = None          # 指向 _checked_in 中该友台的条目（引用）
         self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
         self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
@@ -646,10 +662,10 @@ class NetControlSession:
                 logger.info(f"已到点名总时长，且连续 {quiet_end:.0f}s 无应答，收尾")
                 break
             try:
-                pcm16, dur, wav = self._seg_queue.get(timeout=1.0)
+                pcm16, dur, wav, session = self._seg_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
-            self._process_segment(pcm16, dur, wav)
+            self._process_segment(pcm16, dur, wav, session)
 
     def _run_roster(self):
         roster = [str(x).upper() for x in (nc_cfg("roster", default=[]) or [])]
@@ -665,19 +681,20 @@ class NetControlSession:
             self._speak(self._fmt(nc_cfg("roster_call_text", default="请{call_phonetic}回答。Over"),
                                   call=call, call_phonetic=callsign_phonetic(call)))
             try:
-                pcm16, dur, wav = self._seg_queue.get(
+                pcm16, dur, wav, session = self._seg_queue.get(
                     timeout=float(nc_cfg("roster_call_timeout", default=12)))
             except queue.Empty:
                 self._speak(self._fmt(nc_cfg("no_reply_text",
                                              default="无人应答，继续下一位。")))
                 continue
-            self._process_segment(pcm16, dur, wav)
+            self._process_segment(pcm16, dur, wav, session)
         logger.info("固定名单点名结束")
 
     # ---------- 应答处理 ----------
-    def _process_segment(self, pcm16, dur, wav):
+    def _process_segment(self, pcm16, dur, wav, session=None):
         self._last_activity = time.time()
-        logger.info(f"收到应答段 {dur:.1f}s（{Path(wav).name if wav else '未落盘'}）")
+        logger.info(f"收到应答段 {dur:.1f}s（{Path(wav).name if wav else '未落盘'}）"
+                    f"{' session=' + str(session) if session is not None else ''}")
         raw = self._asr_text(pcm16)
         logger.info(f"ASR: {raw}")
         res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
@@ -692,17 +709,40 @@ class NetControlSession:
                                   call=call, call_phonetic=callsign_phonetic(call)))
             return
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
-            self._checked_in.append((call, signal or "", wav or "", raw or ""))
+            entry = [call, signal or "", wav or "", raw or "", ""]
+            self._checked_in.append(entry)
             self._checked_calls.add(call.upper())
             self._retry_pending = False
             self._retry_left = int(nc_cfg("max_retry", default=1))  # 关键：成功抄收后恢复额度，
             # 否则下一个新友台首次未抄收也会被静默（实测 17:26:53 起机器人哑巴的根因）
+            # 保存"当前友台"上下文：后续不带呼号的补充段按 session 归入该友台
+            self._current_call = call.upper()
+            self._current_session = session
+            self._current_entry = entry
             ack = self._fmt(nc_cfg("ack_text", default=
                 "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
                 "请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over"),
                 call=call, call_phonetic=callsign_phonetic(call), report=signal or "")
             logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
             self._speak(ack)
+            return
+        # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
+        # 点名流程中友台报完呼号后，补充 QTH/设备/天线/功率时通常不再重复呼号
+        # （17:26:51 实测段"我的QTH在咸阳市…设备即时通…五瓦功率发射"即此场景）。
+        # 归入条件：已有当前友台 且 段来源 session 与其一致（session 缺失时保守归入）。
+        if (self._current_call is not None
+                and (session is None or self._current_session is None
+                     or session == self._current_session)):
+            info = raw or ""
+            prev_info = self._current_entry[4] or ""
+            self._current_entry[4] = (prev_info + " " + info).strip()
+            if signal and not self._current_entry[1]:
+                self._current_entry[1] = signal
+            logger.info(f"{self._current_call} 补充信息：{info}")
+            self._speak(self._fmt(nc_cfg("info_ack_text", default=
+                "抄收，{call_phonetic}，您的信息已记录，请下一位友台。Over"),
+                call=self._current_call,
+                call_phonetic=callsign_phonetic(self._current_call)))
             return
         # 低置信度：请求重复（限次）
         if self._retry_pending or self._retry_left <= 0:
@@ -717,7 +757,7 @@ class NetControlSession:
         target = call or ""
         report_kw = ("QTH", "qth", "Q T", "Q T H", "设备", "天线", "功率", "瓦", "信号")
         if any(k in (raw or "") for k in report_kw):
-            # 友台已报位置/设备等详细信息但呼号缺失 → 确认抄收并礼貌请其补报呼号
+            # 友台已报位置/设备等详细信息但呼号缺失（且非当前友台）→ 确认抄收并礼貌请其补报呼号
             logger.info(f"置信度 {score}，已识别报告内容但缺呼号，请求补报呼号"
                         f"（剩余额度 {self._retry_left}）")
             self._speak(self._fmt(nc_cfg("repeat_report_text", default=
@@ -763,7 +803,8 @@ class NetControlSession:
                 save_dir = None
         self._capture = VoiceCapture(
             save_dir=save_dir,
-            on_segment=lambda pcm16, dur, wav: self._seg_queue.put((pcm16, dur, wav)))
+            on_segment=lambda pcm16, dur, wav, session: self._seg_queue.put(
+                (pcm16, dur, wav, session)))
         if self.link is not None:
             self.link._on_downlink = self._on_downlink      # 注册下行分发（点名期间）
         logger.info(f"接收侧就绪（VAD 阈值 {self._capture.threshold}，"
@@ -805,7 +846,7 @@ class NetControlSession:
                         self._decoder = direct_announce.OpusDecoder()
                     pcm = self._decoder.decode(voice["opus"])
                     if pcm:
-                        self._capture.feed(pcm)
+                        self._capture.feed(pcm, voice["session"])
             elif msg_type == 15:
                 # UserTalking: f1=session, f2=talking(0/1)
                 d = direct_announce.pb_dict(payload)

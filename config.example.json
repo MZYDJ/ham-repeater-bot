@@ -79,6 +79,8 @@
     "quiet_end_seconds": 10,
     "grace_seconds": 300,
     "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
+    "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
+    "info_ack_text": "抄收，{call_phonetic}，您的信息已记录，请下一位友台。Over",
     "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",
     "dup_text": "{call_phonetic} 已经抄收过，请下一位友台。",
     "no_reply_text": "无人应答，继续下一位。",

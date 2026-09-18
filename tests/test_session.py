@@ -55,11 +55,13 @@ def test_open_flow():
         "Bravo Hotel Three X-ray X-ray 信号五九",   # 重复
         "信号很好",                                  # 低置信度 → 请重复
         "BG9ABC",                                   # 重复请求后直读合法呼号 → 抄收（额度恢复）
-        "这个听不清",                                # 下一位友台低置信度 → 额度已恢复，再次请重复
+        "这个听不清",                                # 新 session 说话人无呼号 → 再请重复
         "还是听不清",                                # 连续低置信度（额度用尽）→ 未抄收
     ])
-    for _ in range(6):
-        sess._process_segment(b"\x00" * 32000, 1.0, "")
+    # session 序列：前 3 段无 session 归属（尚未抄收任何友台）；段4 抄收 BG9ABC（session=1）；
+    # 段5/6 为新说话人（session=2，区别于当前友台）→ 不归入补充信息，走引导/静默
+    for s in [None, None, None, 1, 2, 2]:
+        sess._process_segment(b"\x00" * 32000, 1.0, "", s)
     check("抄收 BH3XX", [c for c, *_ in sess._checked_in] == ["BH3XX", "BG9ABC"])
     check("重复计数", sess._dups == 1)
     check("抄收 BG9ABC", any(c == "BG9ABC" for c, *_ in sess._checked_in))
