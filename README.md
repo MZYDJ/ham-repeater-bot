@@ -174,12 +174,61 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
   "webhook_log_level": "WARNING"   // 推送级别：WARNING=仅告警+错误
 }
 ```
+## 点名主播（net_control，可选）
+在中继台上自动主持业余无线电点名活动：纯 ASR + 本地状态机 + LLM 信息提取（可选）+ 独立 TTS。
+
+**与播报的关系**：复用同一条常驻直连链路（`direct_announce.PersistentAnnouncer`）作为接收侧与发射侧；点名期间跳过整点播报与预热抢麦（`busy` 锁互斥，同一时刻只有一个发射者）。启用点名**不影响**现有定时播报——`net_control.enabled=false`（默认）时完全不走点名路径。
+
+**工作原理**：
+1. 接收：链路下行泵 → Opus 解码（`OpusDecoder`，ctypes 直调镜像内 libopus0）→ 话音检测（VAD）切段 → WAV 落盘（16k 单声道，供复盘）
+2. 识别：阿里云百炼 **qwen3-asr-flash**（OpenAI 兼容非流式接口，System Message 传实体词表提升呼号识别，`enable_itn` 归一化信号报告数字）
+3. 提取：**字母解释法词表确定性解码**（ITU 26 词 + 中文音译变体，config 可扩展）→ 呼号格式校验（快路径原文直读 + 慢路径词表装配）→ 已抄收去重 → 低置信度播报"请重复一遍呼号"（限次）→ 仍失败记未抄收
+4. 可选 LLM 兜底：智谱 **GLM-4.5-Flash**（免费）低置信度修复/备注提取（默认关闭，主路径为确定性解码）
+5. 播报：Edge-TTS 合成（全文 md5 缓存 + libmpg123 校验，与播报同款）→ 复用链路抢麦发包
+
+**两种点名模式**：
+- 开放点名（默认 `roster_mode=false`）：CQ 开场 → 收听窗口内逐个抄收 → 汇总 → 结束（参与者不可预知，不依赖封闭名单）
+- 固定名单（`roster_mode=true`）：逐个呼叫名单成员 → 超时跳过 → 汇总
+
+**启用步骤**：
+1. `config.json` 中 `net_control.enabled=true`，填 `asr.api_key`（百炼）、点名时段（`weekday/hour/minute`）；可选填 `llm.api_key`
+2. 需要**独立的滔滔测试账号**：与播报共用同一账号会互踢（README 明载）
+3. 重启服务，按计划时段自动开始点名；识别摘要与应答录音落盘在 `net_records/`（已 gitignore）
+
+**离线自测**（无需网络/Key）：
+```bash
+python3 net_control.py --decode "Bravo Hotel Three X-ray X-ray 信号五九"   # 解释法解码
+python3 net_control.py --opus-roundtrip                                     # Opus 编解码往返
+python3 tests/run_tests.py && python3 tests/test_session.py                 # 全部单元测试
+```
+
+**话术模板占位符**（`net_control` 段所有话术字段可用；模板按 TTS 优化编写，可直接当语音念）：
+
+| 占位符 | 含义 | 示例值 |
+|---|---|---|
+| `{date}` | 今天日期 | 2026年9月17日 |
+| `{weekday}` | 星期 | 周四 |
+| `{time}` | 北京时间 | 20点00分 |
+| `{net_name}` | 点名活动名 | 应急通讯演练台网点名 |
+| `{repeater_call}` | 中继台呼号 | BR9AB |
+| `{ctrl_call}` / `{ctrl_phonetic}` | 主控呼号/解释法 | BI9BZW / Bravo India Nine... |
+| `{main_qth}` `{main_device}` `{main_antenna}` `{main_power}` | 主控 QTH/设备/天线/功率 | 咸阳市渭城区塔尔坡 / 泉盛K6... |
+| `{frequency}` `{offset}` `{tone}` | 频率/下差/亚音（兆赫/赫兹，可拼进开场白） | 439.775 / 7 / 88.5 |
+| `{call}` / `{call_phonetic}` | 应答方呼号/解释法 | BH3XX / Bravo Hotel Three X-ray X-ray |
+| `{report}` | 信号报告 | 59 |
+| `{n}` / `{calls}` | 抄收人数/呼号列表 | 9 / BH3XX、BG9ABC |
+
+TTS 优化要点：呼号一律用解释法英文单词（`{call_phonetic}`），中文语音读单词比读字母串稳定；时间写"北京时间{time}"；频率/亚音/功率写中文单位（兆赫/赫兹/瓦）；保留 CQ、Over、73 国际惯例词。铜川变体开场白示例见 `config.example.commented.json`。
+
+完整配置字段见 `config.example.commented.json` 的 `net_control` 段（全部带默认值，缺省即兜底）。
+
 ## 数据目录
 `docker-compose.yml` 将项目目录挂载到容器 `/app`，运行时会在 `paths.cache_dir` 与 `paths.log_dir` 指定目录下自动创建子目录：
 | 子目录 | 说明 |
 |--------|------|
 | `tts_cache/` | TTS 合成音频缓存 |
 | `logs/` | 运行日志（自动轮转） |
+| `net_records/` | 点名识别摘要与应答录音（启用 net_control 后生成） |
 ## 运行要求
 - Docker 与 Docker Compose
 - 网络需能访问滔滔链路（allptt.com:59638，TLS）和 Edge-TTS 服务

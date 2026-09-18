@@ -49,6 +49,11 @@ NATIVE_MIC_LEAD = cfg_get("timing", "native_mic_lead", default=0.5)
 # 测试模式配置（配置文件驱动，等价于命令行 -t；命令行 -t 显式指定时优先级更高）
 TEST_ENABLED = cfg_get("test", "enabled", default=False)
 TEST_COUNT = cfg_get("test", "count", default=1)
+# 点名主播配置（net_control 段；enabled=false 时完全不启动）
+NET_ENABLED = cfg_get("net_control", "enabled", default=False)
+NET_WEEKDAY = cfg_get("net_control", "weekday", default=[])   # 空=每天；[4]=周五（0=周一）
+NET_HOUR = cfg_get("net_control", "hour", default=20)
+NET_MINUTE = cfg_get("net_control", "minute", default=0)
 # 企业微信 Webhook 推送配置（为空时自动禁用告警推送）
 WECHAT_WEBHOOK_URL = cfg_get("notify", "webhook_url", default="")
 _LEVEL_STR = cfg_get("notify", "webhook_log_level", default="WARNING")
@@ -313,6 +318,36 @@ def _native_link_start():
         logger.info("常驻直连链路已建立（后台 Ping 保活，服务器画像=长在线用户）")
     except Exception as e:
         logger.warning(f"常驻链路启动失败（播报时现场建链兜底）: {e}")
+# ====================== 点名主播（net_control） ======================
+# 与定时播报共享同一条常驻链路：busy 锁互斥（同一时刻只有一个发射者）；
+# 点名进行中跳过整点播报与预热抢麦。会话运行在独立线程，不阻塞任务队列。
+_net_session = None          # net_control.NetControlSession
+def net_active():
+    return _net_session is not None and _net_session.active
+def _net_start():
+    """按配置启动点名会话（懒加载 net_control，避免模块导入期循环依赖）。"""
+    global _net_session
+    if not NET_ENABLED or net_active():
+        return
+    if _native_link is None:
+        logger.warning("点名需要常驻链路，但常驻链路未就绪，本次点名取消")
+        return
+    try:
+        import net_control
+    except Exception as e:
+        logger.error(f"net_control 模块导入失败: {e}")
+        return
+    sess = net_control.NetControlSession(link=_native_link, tts_func=get_tts_file)
+    sess.start()
+    _net_session = sess
+    logger.info("点名主播会话已启动")
+def _net_stop():
+    global _net_session
+    if _net_session is not None:
+        _net_session.stop()
+        _net_session = None
+def schedule_net_control():
+    task_queue.put("net_control")
 def _next_announce_time(now: datetime.datetime) -> datetime.datetime:
     """下一个准点播报时刻（minute ∈ {0,30}）"""
     t = now.replace(second=0, microsecond=0)
@@ -327,6 +362,9 @@ def _native_prewarm():
        （准点前 NATIVE_PREP_LEAD 建链），再不行留给准点现场流程兜底。
     启动场景（距准点尚远）只做 1。"""
     global _native_session, _native_prebuilt, _native_session_temp
+    if net_active():                         # 点名进行中：跳过整轮预热（含 TTS 预构建）
+        logger.info("点名进行中，跳过预热")
+        return
     if _native_session:                      # 上次预热残留（播报未消费等异常），先清理
         if _native_session_temp:
             _native_session.close()
@@ -349,6 +387,9 @@ def _native_prewarm():
     # 睡到准点前2.5s再动链路：期间常驻连接由守护线程正常 Ping 保活
     # （若提前独占，60s 无 Ping 可能被服务器当空闲连接踢掉）
     time.sleep(max(0, wait - NATIVE_PREP_LEAD))
+    if net_active():                         # 点名进行中：不抢麦、不预建链（播报同样跳过）
+        logger.info("点名进行中，跳过本次预建链/抢麦")
+        return
     s = None
     if _native_link:
         s = _native_link.ensure_session()    # 健康检查/重建（常驻活着则瞬时完成）
@@ -406,6 +447,9 @@ def _announce_native(tts_file: str):
 def announce_task():
     """播报核心逻辑，仅主线程执行"""
     now = datetime.datetime.now()
+    if net_active():
+        logger.info("点名进行中，跳过本次定时播报")
+        return
     announce_text = get_announce_text(now)
     logger.info(f"触发定时播报: {announce_text}")
     try:
@@ -511,6 +555,13 @@ if __name__ == "__main__":
                 minute="5",
                 second=0
             )
+            # 点名主播：按 net_control 配置的时段/星期触发（enabled=false 时跳过）
+            if NET_ENABLED:
+                _net_kw = dict(hour=NET_HOUR, minute=NET_MINUTE, second=0)
+                if NET_WEEKDAY:
+                    _net_kw["day_of_week"] = ",".join(str(int(d)) for d in NET_WEEKDAY)
+                scheduler.add_job(schedule_net_control, "cron", **_net_kw)
+                logger.info(f"点名主播已启用：{'星期' + '/'.join(map(str, NET_WEEKDAY)) if NET_WEEKDAY else '每天'} {NET_HOUR:02d}:{NET_MINUTE:02d} 开始")
             scheduler.start()
             # 启动即补充一次蓄水池（首次部署/缓存清空后尽快备好音频）
             task_queue.put("tts_prefill")
@@ -531,6 +582,8 @@ if __name__ == "__main__":
                         prewarm_task()
                     elif task == "tts_prefill":
                         tts_prefill_task()
+                    elif task == "net_control":
+                        _net_start()       # 点名会话在独立线程运行，此处只负责启动
                 except Exception as e:
                     logger.error(f"队列任务执行异常 task={task}: {str(e)}", exc_info=True)
                 finally:
@@ -538,6 +591,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("接收到停止信号，正在清理资源...")
     finally:
+        _net_stop()
         if _native_link:
             _native_link.stop()
         logger.info("服务已停止")

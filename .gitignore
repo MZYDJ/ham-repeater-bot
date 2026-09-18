@@ -2,6 +2,7 @@
 edge_user_data/
 tts_cache/
 logs/
+net_records/
 
 # 敏感/环境相关配置文件（禁止提交；开源仓库只保留 config.example.json）
 config.json
