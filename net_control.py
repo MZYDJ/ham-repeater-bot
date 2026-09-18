@@ -356,7 +356,7 @@ class AsrClient:
         self.language = language
         self.timeout = timeout
 
-    def _build_body(self, wav_bytes, context_words=None):
+    def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True):
         uri = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
         messages = []
         if context_words:
@@ -367,28 +367,48 @@ class AsrClient:
                          "content": [{"type": "input_audio",
                                       "input_audio": {"data": uri}}]})
         body = {"model": self.model, "messages": messages, "stream": False}
-        asr_opts = {"enable_itn": bool(self.enable_itn)}
-        if self.language:
-            asr_opts["language"] = self.language
-        body["asr_options"] = asr_opts
+        if with_asr_opts:
+            asr_opts = {"enable_itn": bool(self.enable_itn)}
+            if self.language:
+                asr_opts["language"] = self.language
+            body["asr_options"] = asr_opts
         return body
 
     def transcribe(self, wav_bytes, context_words=None):
-        body = self._build_body(wav_bytes, context_words)
-        req = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Authorization": "Bearer " + self.api_key,
-                     "Content-Type": "application/json"},
-            method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                out = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            # 把服务端错误正文带进日志（Key/模型未开通/地域/音频无效各自报错不同）
-            detail = e.read().decode("utf-8", "replace")[:600]
-            logger.error(f"ASR HTTP {e.code}: {detail}")
-            raise
+        # 自动降级重试：qwen3-asr-flash 的 OpenAI 兼容实现"仅允许设置一组消息"，
+        # 带 system 词表消息时可能报 400（does not support this input）。
+        # 第一次失败→去掉 system 重试；再失败→去掉 asr_options 重试。
+        for attempt in (1, 2, 3):
+            body = self._build_body(
+                wav_bytes,
+                context_words if attempt == 1 else None,
+                with_asr_opts=(attempt <= 2))
+            req = urllib.request.Request(
+                self.base_url + "/chat/completions",
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Authorization": "Bearer " + self.api_key,
+                         "Content-Type": "application/json"},
+                method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    out = json.loads(resp.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                # 把服务端错误正文带进日志（Key/模型未开通/地域/音频无效各自报错不同）
+                detail = e.read().decode("utf-8", "replace")[:600]
+                logger.error(f"ASR HTTP {e.code}: {detail}")
+                if (e.code == 400 and attempt < 3
+                        and ("does not support this input" in detail
+                             or "InvalidParameter" in detail)):
+                    if attempt == 1:
+                        logger.warning("ASR 400：尝试去掉 system 词表消息重试"
+                                       "（OpenAI 兼容可能仅支持单组 user 消息）")
+                    else:
+                        logger.warning("ASR 400：尝试去掉 asr_options 重试")
+                    continue
+                raise
+        else:
+            raise RuntimeError("ASR 请求连续失败")
         content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
         # 官方响应 content 标注为 array（示例为字符串），两种都兼容
         if isinstance(content, list):
@@ -760,16 +780,19 @@ class NetControlSession:
             if self.link is not None and self.link._sess is not None:
                 own = self.link._sess.session
             if msg_type == 1:
-                voice = direct_announce.parse_udp_voice(payload, own_session=own)
-                if voice is None:
+                # 服务器下行按批转发（实测约 600ms 批 5 包×120ms），
+                # 必须解析载荷内全部语音包，否则音频会被压缩成倍速
+                voices = direct_announce.parse_udp_voice_multi(payload, own_session=own)
+                if not voices:
                     return
-                if self._talking_gate and voice["session"] not in self._talking_sessions:
-                    return                        # 无"开始讲话"信令的包（底噪等），丢弃
-                if self._decoder is None:
-                    self._decoder = direct_announce.OpusDecoder()
-                pcm = self._decoder.decode(voice["opus"])
-                if pcm:
-                    self._capture.feed(pcm)
+                for voice in voices:
+                    if self._talking_gate and voice["session"] not in self._talking_sessions:
+                        continue              # 无"开始讲话"信令的包（底噪等），丢弃
+                    if self._decoder is None:
+                        self._decoder = direct_announce.OpusDecoder()
+                    pcm = self._decoder.decode(voice["opus"])
+                    if pcm:
+                        self._capture.feed(pcm)
             elif msg_type == 15:
                 # UserTalking: f1=session, f2=talking(0/1)
                 d = direct_announce.pb_dict(payload)
