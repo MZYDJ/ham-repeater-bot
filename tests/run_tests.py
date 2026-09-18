@@ -6,6 +6,7 @@
 覆盖：字母解释法解码/呼号校验/信号提取/去重、Mumble varint 编解码、
 UDP 语音包解析（含回声过滤）、Opus 编解码往返、VAD 切段、WAV 落盘、配置回退。
 """
+import http.client
 import os
 import struct
 import sys
@@ -188,6 +189,48 @@ def test_asr_body():
     check("itn 默认开", body["asr_options"]["enable_itn"] is True)
     sysmsg = body["messages"][0]["content"]
     check("词表进 System", "BH3XX" in sysmsg and "BRAVO" in sysmsg)
+    # system 词表格式变体（--asr-probe 探测用）
+    b_list = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="list")
+    check("list 变体 content 为数组",
+          isinstance(b_list["messages"][0]["content"], list)
+          and b_list["messages"][0]["content"][0]["type"] == "text")
+    b_bare = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="bare")
+    check("bare 变体纯词表", b_bare["messages"][0]["content"] == "BRAVO")
+    b_none = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="none")
+    check("none 变体无 system", all(m["role"] != "system" for m in b_none["messages"]))
+    b_noopts = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"],
+                             with_asr_opts=False, sys_style="str")
+    check("no-opts 变体无 asr_options", "asr_options" not in b_noopts)
+
+
+def test_conn_reuse():
+    print("[ASR 长连接复用（keep-alive）]")
+    from unittest import mock
+    client = AsrClient(api_key="sk-test")
+    calls = []
+    fake_resp = mock.Mock()
+    fake_resp.status = 200
+    fake_resp.read.return_value = b'{"choices":[{"message":{"content":"OK"}}]}'
+    fake_conn = mock.Mock()
+    fake_conn.getresponse.return_value = fake_resp
+    fake_conn.request.side_effect = lambda m, p, body, headers: calls.append(p)
+    client._conn = fake_conn
+    client._conn_host, client._conn_port = "dashscope.aliyuncs.com", 443
+    s1, d1 = client._request({"a": 1})
+    s2, d2 = client._request({"a": 2})
+    check("同一连接对象复用", client._conn is fake_conn and len(calls) == 2,
+          f"calls={len(calls)}")
+    check("请求路径正确", all(p.endswith("/chat/completions") for p in calls), str(calls))
+    check("响应读回", s2 == 200 and b"OK" in d2, f"s2={s2}")
+    # 长连接失效（RemoteDisconnected）→ 重建（mock 新连接）后重试成功
+    fake_conn2 = mock.Mock()
+    fake_conn2.getresponse.side_effect = [
+        http.client.RemoteDisconnected("server closed")]
+    client._conn = fake_conn2
+    client._conn_host, client._conn_port = "dashscope.aliyuncs.com", 443
+    with mock.patch("net_control.http.client.HTTPSConnection", return_value=fake_conn):
+        s3, d3 = client._request({})
+    check("连接失效重建重试", s3 == 200 and b"OK" in d3, f"s3={s3}")
 
 
 def test_config_defaults():
@@ -307,7 +350,7 @@ def main():
     print("== 点名主播离线单元测试 ==")
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
-               test_asr_body, test_config_defaults, test_retry_reset,
+               test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
                test_info_followup, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

@@ -30,6 +30,7 @@ import array
 import base64
 import contextlib
 import datetime
+import http.client
 import json
 import logging
 import queue
@@ -355,7 +356,17 @@ class VoiceCapture:
 # ====================== ASR 客户端（qwen3-asr-flash，OpenAI 兼容） ======================
 class AsrClient:
     """非流式转写：OpenAI 兼容 /chat/completions，System Message 传实体词表
-    （点名名单、解释法词表、已抄收呼号）提升呼号识别。纯 urllib，无新增依赖。"""
+    （点名名单、解释法词表、已抄收呼号）提升呼号识别。纯标准库，无新增依赖。
+
+    连接复用：持有一个 http.client.HTTPSConnection 长连接（keep-alive），
+    点名期间多次 ASR 共用同一条 TCP+TLS，省去每次请求的握手开销
+    （此前每次 transcribe 都新建连接——用户实测"每次 ASR 都要重新发送一次 TCP"）。
+
+    官方文档（2026-09-17 更新）确认 system 消息受支持且必须放 messages 第一位，
+    仅千问3-ASR-Flash 支持，用于提供上下文/实体词表。但实测带 system 返回 400
+    （InternalError.Algo.InvalidParameter: ... does not support this input）。
+    自动降级链：带 system → 去 system → 再去 asr_options，保证点名不中断；
+    --asr-probe 可逐变体探测 system 的正确格式（content 字符串/数组/纯词表）。"""
 
     def __init__(self, api_key="", model="qwen3-asr-flash",
                  base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -366,14 +377,33 @@ class AsrClient:
         self.enable_itn = enable_itn
         self.language = language
         self.timeout = timeout
+        self._conn = None                       # 复用的 HTTPS 长连接（懒创建）
+        self._conn_host = None
+        self._conn_port = None
 
-    def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True):
+    # ---------- 请求体构造（sys_style 供 system 词表格式探测） ----------
+    def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True,
+                    sys_style="str"):
+        """构造请求体。sys_style：
+        - "str"  ：system.content 为纯字符串（带指令性引导语，生产默认）
+        - "bare" ：system.content 仅为词表本身（文档称 system 用于上下文/实体词表，
+                   "不支持设置模型角色等传统系统提示词"，指令语可能是 400 诱因）
+        - "list" ：system.content 为 [{"type":"text","text":...}]（对齐多模态结构）
+        - "none" ：不带 system（降级路径）"""
         uri = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
         messages = []
-        if context_words:
-            ctx = ("业余无线电点名应答转写。以下为背景实体词表，请优先正确识别："
-                   + "、".join(context_words))
-            messages.append({"role": "system", "content": ctx})
+        if context_words and sys_style != "none":
+            vocab = "、".join(context_words)
+            if sys_style == "list":
+                sys_content = [{"type": "text", "text":
+                                "业余无线电点名应答转写。以下为背景实体词表，"
+                                "请优先正确识别：" + vocab}]
+            elif sys_style == "bare":
+                sys_content = vocab
+            else:
+                sys_content = ("业余无线电点名应答转写。以下为背景实体词表，"
+                               "请优先正确识别：" + vocab)
+            messages.append({"role": "system", "content": sys_content})
         messages.append({"role": "user",
                          "content": [{"type": "input_audio",
                                       "input_audio": {"data": uri}}]})
@@ -385,39 +415,68 @@ class AsrClient:
             body["asr_options"] = asr_opts
         return body
 
-    def transcribe(self, wav_bytes, context_words=None):
-        # 自动降级重试：qwen3-asr-flash 的 OpenAI 兼容实现"仅允许设置一组消息"，
-        # 带 system 词表消息时可能报 400（does not support this input）。
-        # 第一次失败→去掉 system 重试；再失败→去掉 asr_options 重试。
+    # ---------- 长连接请求 ----------
+    def _request(self, body, retry_conn=True):
+        """POST JSON 到 /chat/completions，复用长连接。返回 (status, body_bytes)。
+        响应体必须读完（http.client 才能继续复用连接）；连接被服务端关闭
+        （空闲超时/断链）时重建一次重试。"""
+        from urllib.parse import urlparse
+        u = urlparse(self.base_url)
+        path = u.path.rstrip("/") + "/chat/completions"
+        if self._conn is None or (u.hostname, u.port or 443) != (self._conn_host, self._conn_port):
+            self._conn = http.client.HTTPSConnection(
+                u.hostname, u.port or 443, timeout=self.timeout)
+            self._conn_host, self._conn_port = u.hostname, u.port or 443
+        conn = self._conn
+        req_body = json.dumps(body).encode("utf-8")
+        headers = {"Authorization": "Bearer " + self.api_key,
+                   "Content-Type": "application/json",
+                   "Connection": "keep-alive"}
+        try:
+            conn.request("POST", path, body=req_body, headers=headers)
+            resp = conn.getresponse()
+            data = resp.read()                  # 读完 body 才能复用连接
+            return resp.status, data
+        except (http.client.HTTPException, OSError) as e:
+            if retry_conn:
+                # 长连接被服务端关闭（空闲超时等）→ 重建后重试一次（幂等 POST，安全）
+                logger.info(f"ASR 长连接失效，重建重试（{type(e).__name__}）")
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+                return self._request(body, retry_conn=False)
+            raise
+
+    def transcribe(self, wav_bytes, context_words=None, sys_style=None):
+        # 自动降级重试：qwen3-asr-flash 的 OpenAI 兼容实现带 system 词表消息时
+        # 实测报 400（does not support this input）。链：带 system → 去 system →
+        # 再去 asr_options。sys_style 显式传入时（--asr-probe）不降级、按指定格式试。
         for attempt in (1, 2, 3):
+            style = sys_style if sys_style is not None else (
+                "str" if attempt == 1 else "none")
             body = self._build_body(
                 wav_bytes,
-                context_words if attempt == 1 else None,
-                with_asr_opts=(attempt <= 2))
-            req = urllib.request.Request(
-                self.base_url + "/chat/completions",
-                data=json.dumps(body).encode("utf-8"),
-                headers={"Authorization": "Bearer " + self.api_key,
-                         "Content-Type": "application/json"},
-                method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    out = json.loads(resp.read().decode("utf-8"))
+                context_words if style != "none" else None,
+                with_asr_opts=(attempt <= 2),
+                sys_style=style)
+            status, data = self._request(body)
+            detail = data.decode("utf-8", "replace")
+            if status == 200:
+                out = json.loads(detail)
                 break
-            except urllib.error.HTTPError as e:
-                # 把服务端错误正文带进日志（Key/模型未开通/地域/音频无效各自报错不同）
-                detail = e.read().decode("utf-8", "replace")[:600]
-                logger.error(f"ASR HTTP {e.code}: {detail}")
-                if (e.code == 400 and attempt < 3
-                        and ("does not support this input" in detail
-                             or "InvalidParameter" in detail)):
-                    if attempt == 1:
-                        logger.warning("ASR 400：尝试去掉 system 词表消息重试"
-                                       "（OpenAI 兼容可能仅支持单组 user 消息）")
-                    else:
-                        logger.warning("ASR 400：尝试去掉 asr_options 重试")
-                    continue
-                raise
+            logger.error(f"ASR HTTP {status}: {detail[:600]}")
+            if (status == 400 and attempt < 3 and sys_style is None
+                    and ("does not support this input" in detail
+                         or "InvalidParameter" in detail)):
+                if attempt == 1:
+                    logger.warning("ASR 400：尝试去掉 system 词表消息重试"
+                                   "（OpenAI 兼容可能仅支持单组 user 消息）")
+                else:
+                    logger.warning("ASR 400：尝试去掉 asr_options 重试")
+                continue
+            raise RuntimeError(f"ASR HTTP {status}: {detail[:200]}")
         else:
             raise RuntimeError("ASR 请求连续失败")
         content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
@@ -976,6 +1035,11 @@ def main():
     ap.add_argument("--asr-test", nargs="?", const="", metavar="WAV",
                     help="ASR 接口自测：传 WAV 文件路径，或留空用 2 秒合成音测试"
                          "（打印完整识别结果/服务端错误正文，用于排查 Key/模型/地域/音频问题）")
+    ap.add_argument("--asr-probe", nargs="?", const="", metavar="WAV",
+                    help="system 词表格式探测：依次用 5 种请求变体调用 ASR，"
+                         "打印各自 HTTP 状态码与错误正文/识别结果，定位带 system 词表"
+                         "报 400 的正确姿势（str=字符串+引导语 / list=content数组 / "
+                         "bare=纯词表 / none=无system基线 / no-opts=无asr_options）")
     args = ap.parse_args()
     if args.decode:
         res = decode_callsign(args.decode)
@@ -1024,6 +1088,51 @@ def main():
             print("若为 HTTP 400/404：检查 api_key、模型名、地域支持（美国地域不支持"
                   "OpenAI 兼容模式）；若是音频类报错请换用真实录音文件重试，"
                   "例如：python3 net_control.py --asr-test /app/net_records/seg_xxx.wav")
+        return
+    if args.asr_probe is not None:
+        if args.asr_probe:
+            wav_bytes = Path(args.asr_probe).read_bytes()
+        else:
+            import math
+            pcm16 = bytearray()
+            for i in range(16000 * 2):              # 2 秒 1kHz 正弦 16bit @16k
+                v = int(12000 * math.sin(2 * math.pi * 1000 * i / 16000))
+                pcm16 += struct.pack("<h", v)
+            wav_bytes = pcm_to_wav_bytes(bytes(pcm16))
+        client = AsrClient(
+            api_key=nc_cfg("asr", "api_key", default=""),
+            model=nc_cfg("asr", "model", default="qwen3-asr-flash"),
+            base_url=nc_cfg("asr", "base_url",
+                            default="https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            enable_itn=nc_cfg("asr", "enable_itn", default=True),
+            language=nc_cfg("asr", "language", default=""))
+        print(f"system 词表格式探测: model={client.model} 音频={len(wav_bytes)}B")
+        print(f"base_url={client.base_url}  api_key={'已配置' if client.api_key else '空'}\n")
+        variants = [
+            ("V1 str+opts    ", "str", True),
+            ("V2 list+opts   ", "list", True),
+            ("V3 bare+opts   ", "bare", True),
+            ("V4 none+opts   ", "none", True),
+            ("V5 str+no-opts ", "str", False),
+        ]
+        vocab = ["BRAVO", "HOTEL", "BH3XX", "BG9ABC", "泉盛", "咸阳市"]
+        for label, style, with_opts in variants:
+            body = client._build_body(wav_bytes, context_words=vocab,
+                                      with_asr_opts=with_opts, sys_style=style)
+            status, data = client._request(body)
+            detail = data.decode("utf-8", "replace")
+            if status == 200:
+                try:
+                    out = json.loads(detail)
+                    content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    print(f"{label} → HTTP 200  识别: {content!r}")
+                except Exception as e:
+                    print(f"{label} → HTTP 200  解析失败: {e}")
+            else:
+                print(f"{label} → HTTP {status}  {detail[:240]}")
+        print("\n结论：V1 若 400 而 V4 成功 → system 是触发点；"
+              "再对比 V2/V3/V5 可定位正确格式。找到后把 net_control 的 ASR 词表"
+              "请求改用该格式（改 _build_body 默认 sys_style）。")
         return
     ap.print_help()
 
