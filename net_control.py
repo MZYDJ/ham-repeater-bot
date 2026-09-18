@@ -227,6 +227,29 @@ def callsign_phonetic(call):
     return " ".join(out)
 
 
+def clean_report_text(text):
+    """补充信息段轻量清洗（TTS 复诵友好）：
+    - 去首尾标点/空白、压缩连续空白
+    - ASR 常把 QTH 展开成 "Q T" / "Q T H" → 归一为 QTH
+    - 功率 "5W" → "5 瓦"（TTS 读 W 不稳定）；"5瓦" → "5 瓦"
+    - 过滤纯标点/语气词的噪音文本（如 "。"、"嗯"、0.5s 环境声段）"""
+    t = re.sub(r"^[\s。，,.！!？?；;：:、~～…]+|[\s。，,.！!？?；;：:、~～…]+$", "", text or "")
+    t = re.sub(r"\s+", " ", t)
+    # 中文场景不能用 \b（\b 依赖 \w 边界，中文相邻时失效；\w 也匹配中文，
+    # 故用"排除后跟 H"防 QTH 二次替换）
+    t = re.sub(r"Q\s*T\s*H", "QTH", t, flags=re.I)
+    t = re.sub(r"Q\s*T(?![Hh])", "QTH", t, flags=re.I)
+    t = re.sub(r"(\d+)\s*W", r"\1 瓦", t, flags=re.I)
+    t = re.sub(r"(\d+)瓦", r"\1 瓦", t)
+    t = t.strip()
+    if not t:
+        return ""
+    # 纯语气词/无实义噪音（全为语气词且长度≤4）→ 视为空
+    if len(t) <= 4 and re.fullmatch(r"[嗯啊哦呃哈哼唉]+", t):
+        return ""
+    return t
+
+
 # ====================== WAV 落盘 ======================
 def write_wav(path, pcm16, rate=16000):
     with open(path, "wb") as f:
@@ -260,11 +283,16 @@ class VoiceCapture:
     FRAME_S = 960 * 2                                # 20ms @48k int16 字节数
 
     def __init__(self, threshold=None, silence_end_ms=None, min_segment_ms=None,
-                 max_segment_ms=None, out_rate=16000, save_dir=None, on_segment=None):
+                 max_segment_ms=None, out_rate=16000, save_dir=None, on_segment=None,
+                 ptt_release_delay_ms=None):
         self.threshold = threshold if threshold is not None else nc_cfg("vad_threshold", default=800)
-        self.silence_end_ms = silence_end_ms if silence_end_ms is not None else nc_cfg("silence_end_ms", default=600)
+        self.silence_end_ms = silence_end_ms if silence_end_ms is not None else nc_cfg("silence_end_ms", default=1000)
         self.min_segment_ms = min_segment_ms if min_segment_ms is not None else nc_cfg("min_segment_ms", default=400)
         self.max_segment_ms = max_segment_ms if max_segment_ms is not None else nc_cfg("max_segment_ms", default=15000)
+        # PTT 抬起后延迟收尾（毫秒）：对方松 PTT 后不立即切段，再等这段窗口内的
+        # 断续语音（中继台转发偶发停顿），避免"一句话没说完就断成两段"
+        self.ptt_release_delay_ms = (ptt_release_delay_ms if ptt_release_delay_ms is not None
+                                     else nc_cfg("ptt_release_delay_ms", default=1000))
         self.out_rate = out_rate
         self.save_dir = Path(save_dir) if save_dir else None
         self.on_segment = on_segment
@@ -274,6 +302,7 @@ class VoiceCapture:
         self._noise = 0.0
         self._seq = 0
         self._seg_session = None        # 当前段来源 session（讲话人标识，点名上下文关联用）
+        self._defer_frames = 0          # PTT 抬起后的延迟收尾剩余帧数（20ms/帧）
 
     def _rms(self, frame):
         s = array.array('h')
@@ -312,6 +341,9 @@ class VoiceCapture:
                 self._buf48 += frame
                 if active:
                     self._silence_s = 0.0
+                    self._defer_frames = 0          # 又有声音：取消 PTT 延迟收尾
+                elif self._defer_frames > 0:
+                    self._defer_frames -= 1         # 延迟窗口内：不计入静音（防断续）
                 else:
                     self._silence_s += 0.02
                 dur = len(self._buf48) / (48000 * 2)
@@ -326,6 +358,7 @@ class VoiceCapture:
         self._buf48 = bytearray()
         self._silence_s = 0.0
         self._seg_session = None
+        self._defer_frames = 0
         dur = len(pcm48) / (48000 * 2)
         if dur < self.min_segment_ms / 1000:
             return
@@ -346,11 +379,17 @@ class VoiceCapture:
             except Exception as e:
                 logger.warning(f"应答段回调异常: {e}")
 
-    def force_finalize(self):
-        """外部（如 UserTalking 结束信令）要求立即结束当前语音段。
-        优于纯 VAD 静音等待：对方话音一停（松 PTT）即切段，不吞尾字。"""
-        if self._speaking:
-            self._finalize()
+    def force_finalize(self, defer_ms=0):
+        """外部（如 UserTalking 结束信令）要求结束当前语音段。
+        - defer_ms=0（默认）：立即切段（讲话人切换用，不吞尾字）
+        - defer_ms>0（PTT 抬起）：延迟 defer_ms 毫秒再切，期间若又检测到声音
+          （断续/中继台转发停顿）则取消收尾；避免"一句话没说完就断"。"""
+        if not self._speaking:
+            return
+        if defer_ms > 0:
+            self._defer_frames = max(self._defer_frames, defer_ms // 20)
+            return
+        self._finalize()
 
 
 # ====================== ASR 客户端（qwen3-asr-flash，OpenAI 兼容） ======================
@@ -792,16 +831,43 @@ class NetControlSession:
         if (self._current_call is not None
                 and (session is None or self._current_session is None
                      or session == self._current_session)):
-            info = raw or ""
+            info = clean_report_text(raw)
+            if not info:
+                # 空段/纯语气词（0.5s 环境声、放麦尾音）→ 静默忽略：
+                # 不归入不播报，避免"您的信息已记录"空刷屏（实测 19:14 连续两次）
+                logger.info(f"{self._current_call} 空补充段忽略（{raw!r}）")
+                return
+            kw = info.lower()
+            correct_kw = ("不对", "错了", "不是", "纠正", "说错", "重报", "听错")
+            confirm_kw = ("正确", "确认", "对的", "没问题", "收到了", "是的",
+                          "对对对", "收到收到")
+            if any(k in kw for k in correct_kw):
+                # 友台纠正（呼号/信息听错）→ 请其重报，不归入信息
+                logger.info(f"{self._current_call} 纠正请求: {info}")
+                self._speak(self._fmt(nc_cfg("correct_text", default=
+                    "抱歉，刚才抄收可能有误，请您再重复一遍，Over"),
+                    call=self._current_call,
+                    call_phonetic=callsign_phonetic(self._current_call)))
+                return
+            if len(info) <= 6 and any(k in kw for k in confirm_kw):
+                # 短确认语（"正确""收到"）→ 确认收尾，请下一位（不归入不重复复诵）
+                logger.info(f"{self._current_call} 确认收到: {info}")
+                self._speak(self._fmt(nc_cfg("confirm_text", default=
+                    "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
+                    call=self._current_call,
+                    call_phonetic=callsign_phonetic(self._current_call)))
+                return
             prev_info = self._current_entry[4] or ""
             self._current_entry[4] = (prev_info + " " + info).strip()
             if signal and not self._current_entry[1]:
                 self._current_entry[1] = signal
             logger.info(f"{self._current_call} 补充信息：{info}")
+            # 把抄收到的信息完整复诵，让友台确认是否正确（用户点名习惯）
             self._speak(self._fmt(nc_cfg("info_ack_text", default=
-                "抄收，{call_phonetic}，您的信息已记录，请下一位友台。Over"),
+                "抄收，{call_phonetic}，您说的是：{info}。是否正确？Over"),
                 call=self._current_call,
-                call_phonetic=callsign_phonetic(self._current_call)))
+                call_phonetic=callsign_phonetic(self._current_call),
+                info=info))
             return
         # 低置信度：请求重复（限次）
         if self._retry_pending or self._retry_left <= 0:
@@ -915,7 +981,10 @@ class NetControlSession:
                 if talking == 0:
                     if sess is not None:
                         self._talking_sessions.discard(sess)
-                    self._capture.force_finalize()
+                    # PTT 抬起：延迟 ptt_release_delay_ms 再收尾（防断续断句），
+                    # 延迟窗口内有声音会自动取消
+                    self._capture.force_finalize(
+                        defer_ms=nc_cfg("ptt_release_delay_ms", default=1000))
                 elif talking == 1:
                     self._ever_talk = True
                     if sess is not None:

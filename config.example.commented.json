@@ -131,7 +131,9 @@
                                       // 点名无限延长，宽限耗尽强制收尾（默认 300=5 分钟）
     "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
     "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
-    "info_ack_text": "抄收，{call_phonetic}，您的信息已记录，请下一位友台。Over",  // 当前友台补充完信息（无呼号段归入后）的确认话术
+    "info_ack_text": "抄收，{call_phonetic}，您说的是：{info}。是否正确？Over",  // 当前友台补充完信息（无呼号段归入后）：复诵其内容让友台确认（空段自动忽略不播报）
+    "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",  // 友台短确认语（"正确/收到/确认"）后的收尾话术
+    "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over",  // 友台纠正（"不对/错了"）后请其重报
     "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",
     "dup_text": "{call_phonetic} 已经抄收过，请下一位友台。",
     "no_reply_text": "无人应答，继续下一位。",
@@ -139,7 +141,8 @@
     "closing_text": "CQ CQ CQ，现在是北京时间{time}，{net_name}到此结束，我是本次主控{ctrl_call}，本次参与台网点名的共有{n}位友台，非常感谢各位友台积极参与，接下来各位友台可以自由通联，73！",
     // ---- 话音检测（VAD）----
     "vad_threshold": 800,       // 活动音能量阈值（16bit 样本 RMS；链路底噪大时调高）
-    "silence_end_ms": 600,      // 静音多少毫秒判定"对方说完了"（UserTalking 结束信令优先于它）
+    "silence_end_ms": 1000,     // 静音多少毫秒判定"对方说完了"（UserTalking 结束信令+延迟收尾优先于它）。中继台讲话停顿多，600ms 易断句，建议 1000~1500
+    "ptt_release_delay_ms": 1000,  // PTT 抬起（talking=false）后延迟多少毫秒再收尾：中继台断续转发时避免"一句话没说完就断成两段"，窗口内有声音自动取消
     "min_segment_ms": 400,      // 短于此的语音段忽略（防误触发）
     "max_segment_ms": 15000,    // 单段最长（超过强制截断，防失控）
     "use_talking_gate": true,   // 说话信令门控：仅采集服务器广播了"开始讲话"的远端语音，
