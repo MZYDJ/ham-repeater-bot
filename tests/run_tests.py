@@ -274,11 +274,12 @@ def test_retry_reset():
     check("抄收后额度恢复", sess._retry_left == 1 and not sess._retry_pending,
           f"retry_left={sess._retry_left}")
 
-    # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 归入当前友台并复诵，不消耗额度
+    # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 结构化提取并复诵确认
     sess._asr_text = lambda pcm: "我的设备是泉盛K6，天线原机天线，五瓦"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
-    check("同台补充信息归入", len(spoken) == 3 and "您说的是" in spoken[2]
-          and "泉盛K6" in spoken[2]
+    check("同台补充信息归入", len(spoken) == 3 and "信息已记录" in spoken[2]
+          and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
+          and "功率 5 瓦" in spoken[2]
           and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
           f"spoken={spoken} entry={sess._current_entry}")
     check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
@@ -312,8 +313,9 @@ def test_info_followup():
     check("补充段归入友台1", sess._current_call == "BH3XX"
           and "QTH" in (sess._current_entry[4] or ""),
           f"call={sess._current_call} entry={sess._current_entry}")
-    check("补充段复诵信息", len(spoken) == 2 and "您说的是" in spoken[1]
-          and "咸阳市" in spoken[1] and "泉盛K6" in spoken[1],
+    check("补充段复诵信息", len(spoken) == 2 and "信息已记录" in spoken[1]
+          and "QTH 咸阳市渭城区" in spoken[1] and "设备 泉盛K6" in spoken[1]
+          and "功率 5 瓦" in spoken[1],
           f"spoken={spoken}")
     # 空段（0.5s 环境声）→ 静默忽略，不播报不归入
     n = len(spoken)
@@ -338,6 +340,23 @@ def test_info_followup():
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     check("纠正语请重报", len(spoken) == n + 2 and "重" in spoken[-1],
           f"spoken={spoken}")
+    # "不正确"纠正语（实测 19:48 漏判场景）→ 走纠正分支，不复诵
+    sess._asr_text = lambda pcm: "不正确，不正确，请重复抄收"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("不正确走纠正分支", len(spoken) == n + 3 and "重" in spoken[-1],
+          f"spoken={spoken}")
+    # 无结构化字段的询问语（实测 19:47 被复诵成废话）→ 引导补报信息
+    sess._asr_text = lambda pcm: "主控是否抄收？"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("询问抄收状态引导补报", len(spoken) == n + 4 and "呼号已记录" in spoken[-1],
+          f"spoken={spoken}")
+    # 无实义噪音（"那主播"）→ 静默忽略，不播报不归入
+    sess._asr_text = lambda pcm: "那主播"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("无实义噪音静默", len(spoken) == n + 4,
+          f"spoken={spoken}")
+    check("噪音不归入", sess._current_entry[4] == "我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦",
+          f"entry={sess._current_entry}")
     # 友台2 报呼号（session=2）→ 抄收并替换当前友台
     sess._asr_text = lambda pcm: "这里是BG9ABC，信号59"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
@@ -363,6 +382,66 @@ def test_report_clean():
     check("纯标点过滤", c("。") == "" and c("…") == "")
     check("语气词过滤", c("嗯") == "" and c("嗯嗯") == "")
     check("保留实质", c("对，我的QTH在咸阳") == "对，我的QTH在咸阳")
+
+
+def test_report_fields():
+    print("[结构化字段提取 extract_report_fields]")
+    f = net_control.extract_report_fields
+    r = f("我的QTH在咸阳市渭城区，设备泉盛K6，原机天线，五瓦功率发射")
+    d = dict(r)
+    check("QTH/设备/天线/功率全提取", d.get("QTH") == "咸阳市渭城区"
+          and d.get("设备") == "泉盛K6" and d.get("天线") == "原机天线"
+          and d.get("功率") == "5 瓦", f"{r}")
+    r = f("Q T H 咸阳，设备是即时通，天线原机天线，5W")
+    d = dict(r)
+    check("Q T 展开/阿拉伯功率", d.get("QTH") == "咸阳" and d.get("设备") == "即时通"
+          and d.get("功率") == "5 瓦", f"{r}")
+    r = f("信号五九")
+    check("信号报告提取", dict(r).get("信号") == "59", f"{r}")
+    r = f("主控是否抄收")
+    check("询问语无字段", r == [], f"{r}")
+    r = f("那主播")
+    check("噪音无字段", r == [], f"{r}")
+
+
+def test_wait_channel_idle():
+    print("[先听后说：抢麦前等待信道空闲]")
+    sess = net_control.NetControlSession(link=None)
+    sess._teardown_dir = None
+    sess._capture = None
+    # 无活跃讲话 → 立即可发射
+    sess._talking_sessions = set()
+    check("空闲立即放行", sess._wait_channel_idle() is True)
+    # 信令层有人在讲 → 等待（模拟 0.3s 后对方讲完）
+    sess._talking_sessions = {999}
+    t0 = time.time()
+    def _release_after(t):
+        pass
+    # 起线程模拟对方 0.3s 后讲完
+    import threading as _th
+    def _clear():
+        _th.Event().wait(0.3)
+        sess._talking_sessions.discard(999)
+    th = _th.Thread(target=_clear)
+    th.start()
+    ok = sess._wait_channel_idle()
+    th.join()
+    check("占用中等待放行", ok is True and 0.2 <= time.time() - t0 <= 3.0,
+          f"ok={ok} dt={time.time() - t0:.2f}")
+    # 等待超时（tx_wait_timeout=1s）仍发射，不卡死
+    sess._talking_sessions = {888}
+    import direct_announce
+    old = direct_announce.CFG.get("net_control", {}).get("tx_wait_timeout")
+    direct_announce.CFG.setdefault("net_control", {})["tx_wait_timeout"] = 1
+    t0 = time.time()
+    ok = sess._wait_channel_idle()
+    dt = time.time() - t0
+    if old is None:
+        direct_announce.CFG["net_control"].pop("tx_wait_timeout", None)
+    else:
+        direct_announce.CFG["net_control"]["tx_wait_timeout"] = old
+    check("超时兜底发射", ok is True and dt < 3.0,
+          f"ok={ok} dt={dt:.2f}")
 
 
 def test_templates():
@@ -398,7 +477,8 @@ def main():
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
-               test_info_followup, test_report_clean, test_templates]:
+               test_info_followup, test_report_clean, test_report_fields,
+               test_wait_channel_idle, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)

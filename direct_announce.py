@@ -596,10 +596,12 @@ class DirectAnnouncer:
             raise RuntimeError("抢麦失败: %s" % (d or "6秒无响应"))
         c.send(15, build_user_talking(self.session, True))
         print("抢麦成功，已上报 UserTalking(talking=true)")
-    def play(self, packets, verbose=True):
+    def play(self, packets, verbose=True, abort_check=None):
         """UserTalking 之后先等 LEAD_DELAY（官方时序 0.5s，中继台靠该间隔建链），
         再匀速发包(120ms/包)→尾巴冲刷→上报停止说话→放麦→收回执。成功返回 True。
-        必须在 take_mic() 之后调用。"""
+        必须在 take_mic() 之后调用。
+        abort_check：每批发包前调用的回调（返回 True 表示信道被他人占用/抢台，
+        立即停止发包并放麦让位，返回 False）。用于点名播报时检测他人讲话。"""
         c = self.c
         if verbose:
             print("延迟 %.0fms 后开始发包" % (LEAD_DELAY * 1000))
@@ -607,6 +609,13 @@ class DirectAnnouncer:
         start = time.time()
         n_sent = 0
         for i, pkt in enumerate(packets):     # 匀速 120ms/包（官方实时编码节奏，v6）
+            if abort_check is not None and abort_check():
+                # 他人抢台/讲话 → 立即放麦让位（不发送剩余包，避免与对方抢信道）
+                c.send(15, build_user_talking(self.session, False))
+                c.send(14, build_apply_mic(False))
+                if verbose:
+                    print("播报被抢占，已放麦让位（已发 %d/%d 包）" % (n_sent, len(packets)))
+                return False
             c.send(1, pkt)
             n_sent += 1
             if verbose and n_sent % 50 == 0:
@@ -690,7 +699,21 @@ class PersistentAnnouncer:
     def _keeper(self):
         while not self._stop.is_set():
             time.sleep(0.5)
-            if self._busy.is_set():                # 播报独占期间让路
+            if self._busy.is_set():
+                # 播报独占期间仍泵下行（只读不写：socket 全双工，与播报线程 send 并发安全），
+                # 供点名接收侧做"他人抢台检测"——若 busy 时完全停泵，
+                # 播报期间友台说话会完全听不到（实测 19:46 抢台被无视的根因）
+                s = self._sess
+                if s is not None and s.c is not None:
+                    try:
+                        for t, p in s.c.drain():
+                            if self._on_downlink is not None:
+                                try:
+                                    self._on_downlink(t, p)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                 continue
             removed = False
             with self._lock:
