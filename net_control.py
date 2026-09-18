@@ -24,7 +24,6 @@ Message 传实体词表提升呼号识别）；LLM 可选走 GLM-4.5-Flash（智
 用法：
     python3 net_control.py --decode "Bravo Hotel Three X-ray X-ray 信号五九"   # 离线解码自测
     python3 net_control.py --opus-roundtrip                                     # 编解码往返自测
-    python3 net_control.py --asr-test                                           # ASR 接口自测（需已配 api_key）
 """
 import argparse
 import array
@@ -234,6 +233,21 @@ def write_wav(path, pcm16, rate=16000):
                             b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16))
         f.write(struct.pack("<4sI", b"data", len(pcm16)))
         f.write(pcm16)
+
+
+def pcm_to_wav_bytes(pcm16, rate=16000):
+    """16k 16bit 单声道裸 PCM → 标准 WAV 文件字节（供 ASR Data URL 使用）。
+
+    注意：ASR 服务端按 Data URL 声明的 mediatype（audio/wav）解析音频，
+    若直接发送无 WAV 头的裸 PCM 会报 400
+    （InternalError.Algo.InvalidParameter: ... does not support this input）。"""
+    import io
+    buf = io.BytesIO()
+    buf.write(struct.pack("<4sI4s4sIHHIIHH", b"RIFF", 36 + len(pcm16), b"WAVE",
+                          b"fmt ", 16, 1, 1, rate, rate * 2, 2, 16))
+    buf.write(struct.pack("<4sI", b"data", len(pcm16)))
+    buf.write(pcm16)
+    return buf.getvalue()
 
 
 # ====================== 话音检测（VAD）与切段 ======================
@@ -788,8 +802,10 @@ class NetControlSession:
         need = int(16000 * 2 * min_secs)
         if len(pcm16) < need:
             pcm16 = pcm16 + b"\x00" * (need - len(pcm16))
+        # 裸 PCM → 标准 WAV 字节（服务端按 Data URL mediatype 解析，缺 WAV 头会 400）
+        wav_bytes = pcm_to_wav_bytes(pcm16)
         try:
-            return self._asr.transcribe(pcm16, context_words=self._context_words())
+            return self._asr.transcribe(wav_bytes, context_words=self._context_words())
         except Exception as e:
             logger.error(f"ASR 调用失败: {e}")
             return ""
@@ -903,14 +919,15 @@ def main():
         return
     if args.asr_test is not None:
         if args.asr_test:
-            pcm16 = Path(args.asr_test).read_bytes()
+            wav_bytes = Path(args.asr_test).read_bytes()      # 已是完整音频文件（WAV）
         else:
             import math
             pcm16 = bytearray()
             for i in range(16000 * 2):              # 2 秒 1kHz 正弦 16bit @16k
                 v = int(12000 * math.sin(2 * math.pi * 1000 * i / 16000))
                 pcm16 += struct.pack("<h", v)
-            pcm16 = bytes(pcm16)
+            # 合成的是裸 PCM，需包 WAV 头（否则服务端按 audio/wav 解析失败报 400）
+            wav_bytes = pcm_to_wav_bytes(bytes(pcm16))
         client = AsrClient(
             api_key=nc_cfg("asr", "api_key", default=""),
             model=nc_cfg("asr", "model", default="qwen3-asr-flash"),
@@ -918,17 +935,18 @@ def main():
                             default="https://dashscope.aliyuncs.com/compatible-mode/v1"),
             enable_itn=nc_cfg("asr", "enable_itn", default=True),
             language=nc_cfg("asr", "language", default=""))
-        print(f"ASR 自测: model={client.model} 音频={len(pcm16)}B"
-              f"（{len(pcm16) / 32000:.1f}s @16k mono）")
+        print(f"ASR 自测: model={client.model} 音频={len(wav_bytes)}B"
+              f"（约 {len(wav_bytes) / 32000:.1f}s @16k mono）")
         print(f"base_url={client.base_url}")
         print(f"api_key={'已配置' if client.api_key else '空（配置 net_control.asr.api_key）'}")
         try:
-            text = client.transcribe(pcm16, context_words=["BRAVO", "BH3XX"])
+            text = client.transcribe(wav_bytes, context_words=["BRAVO", "BH3XX"])
             print(f"识别结果: {text!r}")
         except Exception as e:
             print(f"ASR 自测失败: {type(e).__name__}: {e}")
             print("若为 HTTP 400/404：检查 api_key、模型名、地域支持（美国地域不支持"
-                  "OpenAI 兼容模式）；若是音频类报错请换用真实录音文件重试。")
+                  "OpenAI 兼容模式）；若是音频类报错请换用真实录音文件重试，"
+                  "例如：python3 net_control.py --asr-test /app/net_records/seg_xxx.wav")
         return
     ap.print_help()
 
