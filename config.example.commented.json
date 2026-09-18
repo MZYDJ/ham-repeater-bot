@@ -184,7 +184,7 @@
       "api_key": "",            // 智谱 API Key
       "model": "glm-4.5-flash", // 免费模型
       "base_url": "https://open.bigmodel.cn/api/paas/v4",
-      "timeout": 8,             // 单次调用限时（秒）；放线程限时，超时放弃不拖点名
+      "timeout": 5,             // 单次调用限时（秒）；放线程限时，超时放弃不拖点名
       "max_calls": 3            // 每轮点名最多调用次数（防慢接口拖死流程）
     }
   }

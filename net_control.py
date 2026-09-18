@@ -734,6 +734,8 @@ class NetControlSession:
         self._asr = None
         self._llm = None
         self._llm_calls = 0                 # 每轮点名 LLM 兜底调用计数（防超时拖死）
+        self._llm_fails = 0                 # 连续失败计数（熔断：≥2 本轮停用）
+        self._play_lock = threading.Lock()  # 发射串行化：嵌套播报排队，不并发抢麦
         self._decoder = None
         self._capture = None
         self._net_ctx = {}          # 话术模板上下文（_run 启动时填充）
@@ -1144,6 +1146,12 @@ class NetControlSession:
         max_calls = int(nc_cfg("llm", "max_calls", default=3))
         if self._llm_calls >= max_calls:
             return None
+        if self._llm_fails >= 2:
+            # 熔断：接口连续超时/异常（实测 GLM 持续 8s 超时），本轮不再调用
+            if not getattr(self, "_llm_tripped", False):
+                self._llm_tripped = True
+                logger.warning("LLM 连续 2 次失败，本轮点名停用 LLM 兜底（防拖慢点名）")
+            return None
         try:
             logger.info("LLM 兜底提取（低置信度）…")
             box = {}
@@ -1151,15 +1159,19 @@ class NetControlSession:
                 target=lambda: box.__setitem__("d", self._llm.extract(raw)),
                 daemon=True)
             tt.start()
-            tt.join(timeout=8)
+            tt.join(timeout=5)
             if tt.is_alive():
-                logger.warning("LLM 兜底超时（8s），放弃本次修复")
+                logger.warning("LLM 兜底超时（5s），放弃本次修复")
+                self._llm_fails += 1
                 return None
             d = box.get("d", {})
             self._llm_calls += 1
         except Exception as e:
             logger.warning(f"LLM 调用失败: {e}")
+            self._llm_fails += 1
             return None
+        if self._llm_fails > 0:
+            self._llm_fails = 0             # 一次成功即清零熔断计数
         call2 = (d.get("callsign") or "").strip().upper().replace(" ", "").replace("-", "")
         if not call2 or not re.fullmatch(r"B[A-Z]\d[A-Z]{1,3}", call2):
             logger.info(f"LLM 未给出合法呼号（{d!r}），维持原流程")
@@ -1349,7 +1361,7 @@ class NetControlSession:
                 return True
         return False
 
-    def _wait_channel_idle(self):
+    def _wait_channel_idle(self, drain=True):
         """先听后说：抢麦前等待信道空闲。当前无人讲话 → 立即返回；
         有人在讲 → 等待对方讲完（最多 tx_wait_timeout 秒，超时仍发射，
         避免点名流程被无限拖住）。返回 True 表示可发射。
@@ -1368,8 +1380,9 @@ class NetControlSession:
             if not self._someone_speaking():
                 logger.info("信道已空闲，开始播报")
                 return True
-            # 等待期间继续识别：消费队列中积压的语音段（多人接连说话不丢）
-            consumed = self._drain_queue()
+            # 等待期间继续识别：消费队列中积压的语音段（多人接连说话不丢）。
+            # 发射线程内调用时 drain=False（避免在锁内触发嵌套播报→死锁）
+            consumed = self._drain_queue() if drain else 0
             if consumed:
                 logger.info(f"等待期间已识别 {consumed} 段（友台轮流点名）")
                 if not self._someone_speaking():
@@ -1426,50 +1439,74 @@ class NetControlSession:
         except Exception as e:
             logger.error(f"点名音频构建失败: {e}")
             return
-        s = None
-        if self.link is not None:
-            for _ in range(10):                     # 等广播让出 busy（互斥等待，最多10s）
-                s = self.link.ensure_session()
-                if s is not None or self._stop.is_set():
-                    break
-                time.sleep(1.0)
-        if s is None and self.link is not None:
-            logger.warning("链路忙或不可用，跳过本句点名播报")
-            return
-        # 先听后说：抢麦前等待信道空闲（当前无人讲话才按下 PTT）。
-        # 实测 19:46 友台在 TTS 合成期间抢台说话，主控 TTS 完成后直接抢麦，
-        # 恰好压住对方——必须在 take_mic 前检查并等待。
-        if s is not None:
-            self._wait_channel_idle()
-        if self._stop.is_set():
-            return
-        try:
-            if s is None:                           # 无常驻链路（独立运行场景）：临时短链
-                s2 = direct_announce.DirectAnnouncer(
-                    username=direct_announce.cfg_get("talk", "username", default=""),
-                    password=direct_announce.cfg_get("talk", "password", default=""))
-                try:
-                    with contextlib.redirect_stdout(_StdoutToLogger(logger)):
-                        s2.connect()
-                        s2.take_mic()
-                        s2.play(packets)
-                finally:
-                    s2.close()
-                return
-            # 发射中兜底：若抢麦瞬间对方仍在讲话（等待窗口竞态），检测到他人
-            # 语音立即放麦让位，不压对方（abort_check 由下行泵回调置位）
-            self._preempted.clear()
-            with contextlib.redirect_stdout(_StdoutToLogger(logger)):
-                s.take_mic()
-                ok = s.play(packets, abort_check=lambda: self._preempted.is_set())
-            if not ok:
-                logger.warning("点名播报被他人讲话抢占，已放麦让位（不重播，避免抢台循环）")
-        except Exception as e:
-            logger.error(f"点名播报失败: {e}")
-        finally:
-            if s is not None and self.link is not None:
-                self.link.release()
-            self._last_tx_end = time.time()    # 发射结束时刻（回波过滤窗口起点）
+        # ---- 发射放后台线程（play 阻塞 3~15s）----
+        # 发射期间主线程继续 _drain_queue：实测"友台说完话日志延迟 6~12s 才
+        # 刷出、完全无反应"的根因——旧代码发射（play）串行阻塞主线程，期间
+        # 不消费 _seg_queue，友台段切出后要等主控发射完才被处理。
+        # 嵌套播报（发射期间识别到的段触发的 _speak）经 _play_lock 排队，
+        # 等当前发射完成后再播，不丢句、不死锁（_wait_channel_idle 在发射
+        # 线程内 drain=False，避免锁内再触发嵌套播报）。
+        play_box = {}
+
+        def _do_play():
+            try:
+                with self._play_lock:
+                    if self._stop.is_set():
+                        return
+                    s = None
+                    if self.link is not None:
+                        for _ in range(30):    # 等广播让出 busy（含嵌套排队场景，最多30s）
+                            s = self.link.ensure_session()
+                            if s is not None or self._stop.is_set():
+                                break
+                            time.sleep(1.0)
+                    if s is None and self.link is not None:
+                        logger.warning("链路忙或不可用，跳过本句点名播报")
+                        play_box["skipped"] = True
+                        return
+                    # 先听后说：抢麦前等待信道空闲（当前无人讲话才按下 PTT）
+                    if s is not None:
+                        self._wait_channel_idle(drain=False)
+                    if self._stop.is_set():
+                        return
+                    try:
+                        if s is None:          # 无常驻链路（独立运行场景）：临时短链
+                            s2 = direct_announce.DirectAnnouncer(
+                                username=direct_announce.cfg_get(
+                                    "talk", "username", default=""),
+                                password=direct_announce.cfg_get(
+                                    "talk", "password", default=""))
+                            try:
+                                with contextlib.redirect_stdout(_StdoutToLogger(logger)):
+                                    s2.connect()
+                                    s2.take_mic()
+                                    s2.play(packets)
+                            finally:
+                                s2.close()
+                            return
+                        # 发射中兜底：检测到他人语音立即放麦让位，不压对方
+                        self._preempted.clear()
+                        with contextlib.redirect_stdout(_StdoutToLogger(logger)):
+                            s.take_mic()
+                            ok = s.play(packets,
+                                        abort_check=lambda: self._preempted.is_set())
+                        play_box["ok"] = ok
+                        if not ok:
+                            logger.warning("点名播报被他人讲话抢占，"
+                                           "已放麦让位（不重播，避免抢台循环）")
+                    except Exception as e:
+                        logger.error(f"点名播报失败: {e}")
+                    finally:
+                        if s is not None and self.link is not None:
+                            self.link.release()
+                        self._last_tx_end = time.time()   # 发射结束（回波过滤窗口起点）
+            finally:
+                play_box["done"] = True
+
+        pt = threading.Thread(target=_do_play, daemon=True)
+        pt.start()
+        self._drain_queue(depth=1)   # 发射期间继续识别（嵌套播报经 _play_lock 排队）
+        pt.join(timeout=60)
 
     # ---------- 点名记录 CSV 实时落盘 ----------
     # 点名一开始就创建文件（写表头），此后每次抄收/补充信息立即全量重写。
