@@ -383,13 +383,13 @@ class AsrClient:
 
     # ---------- 请求体构造（sys_style 供 system 词表格式探测） ----------
     def _build_body(self, wav_bytes, context_words=None, with_asr_opts=True,
-                    sys_style="str"):
+                    sys_style="list"):
         """构造请求体。sys_style：
-        - "str"  ：system.content 为纯字符串（带指令性引导语，生产默认）
-        - "bare" ：system.content 仅为词表本身（文档称 system 用于上下文/实体词表，
-                   "不支持设置模型角色等传统系统提示词"，指令语可能是 400 诱因）
-        - "list" ：system.content 为 [{"type":"text","text":...}]（对齐多模态结构）
-        - "none" ：不带 system（降级路径）"""
+        - "list" ：system.content 为 [{"type":"text","text":...}]（生产默认；
+                   实测 2026-09-18 只有此格式被服务端接受，其余均 400）
+        - "str"  ：system.content 为纯字符串（带指令性引导语）→ 实测 400
+        - "bare" ：system.content 仅为词表本身字符串 → 实测 400
+        - "none" ：不带 system（降级兜底）"""
         uri = "data:audio/wav;base64," + base64.b64encode(wav_bytes).decode("ascii")
         messages = []
         if context_words and sys_style != "none":
@@ -450,12 +450,12 @@ class AsrClient:
             raise
 
     def transcribe(self, wav_bytes, context_words=None, sys_style=None):
-        # 自动降级重试：qwen3-asr-flash 的 OpenAI 兼容实现带 system 词表消息时
-        # 实测报 400（does not support this input）。链：带 system → 去 system →
-        # 再去 asr_options。sys_style 显式传入时（--asr-probe）不降级、按指定格式试。
+        # 自动降级重试：system 词表实测须用数组格式（list），字符串格式报 400
+        # （does not support this input）。链：list → 去 system → 再去 asr_options。
+        # sys_style 显式传入时（--asr-probe）不降级、按指定格式试。
         for attempt in (1, 2, 3):
             style = sys_style if sys_style is not None else (
-                "str" if attempt == 1 else "none")
+                "list" if attempt == 1 else "none")
             body = self._build_body(
                 wav_bytes,
                 context_words if style != "none" else None,
@@ -1037,9 +1037,11 @@ def main():
                          "（打印完整识别结果/服务端错误正文，用于排查 Key/模型/地域/音频问题）")
     ap.add_argument("--asr-probe", nargs="?", const="", metavar="WAV",
                     help="system 词表格式探测：依次用 5 种请求变体调用 ASR，"
-                         "打印各自 HTTP 状态码与错误正文/识别结果，定位带 system 词表"
-                         "报 400 的正确姿势（str=字符串+引导语 / list=content数组 / "
-                         "bare=纯词表 / none=无system基线 / no-opts=无asr_options）")
+                         "打印各自 HTTP 状态码与错误正文/识别结果。已实测定位："
+                         "system.content 必须用数组 [{\"type\":\"text\",\"text\":...}]"
+                         "（list）才被接受，字符串（str/bare）一律 400，"
+                         "无 system（none）可作基线。建议传真实录音 WAV 以同时"
+                         "验证词表对呼号识别的增益")
     args = ap.parse_args()
     if args.decode:
         res = decode_callsign(args.decode)
@@ -1108,9 +1110,10 @@ def main():
             language=nc_cfg("asr", "language", default=""))
         print(f"system 词表格式探测: model={client.model} 音频={len(wav_bytes)}B")
         print(f"base_url={client.base_url}  api_key={'已配置' if client.api_key else '空'}\n")
+        print("已实测结论（2026-09-18）：list 数组格式成功，str/bare 字符串格式 400。\n")
         variants = [
-            ("V1 str+opts    ", "str", True),
-            ("V2 list+opts   ", "list", True),
+            ("V1 list+opts   ", "list", True),
+            ("V2 str+opts    ", "str", True),
             ("V3 bare+opts   ", "bare", True),
             ("V4 none+opts   ", "none", True),
             ("V5 str+no-opts ", "str", False),
@@ -1130,9 +1133,9 @@ def main():
                     print(f"{label} → HTTP 200  解析失败: {e}")
             else:
                 print(f"{label} → HTTP {status}  {detail[:240]}")
-        print("\n结论：V1 若 400 而 V4 成功 → system 是触发点；"
-              "再对比 V2/V3/V5 可定位正确格式。找到后把 net_control 的 ASR 词表"
-              "请求改用该格式（改 _build_body 默认 sys_style）。")
+        print("\n预期：V1/V4 成功（list=生产默认；none=降级兜底），V2/V3/V5 400。"
+              "若 V1 对真实录音识别出呼号即证明词表生效（建议："
+              "python3 net_control.py --asr-probe /app/net_records/seg_xxx.wav）。")
         return
     ap.print_help()
 
