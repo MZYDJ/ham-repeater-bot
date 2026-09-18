@@ -909,30 +909,7 @@ class NetControlSession:
                                   call=call, call_phonetic=callsign_phonetic(call)))
             return
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
-            entry = [call, signal or "", wav or "", raw or "", ""]
-            self._checked_in.append(entry)
-            self._checked_calls.add(call.upper())
-            # 呼号段若已含结构化信息（"我的QTH在…"）一并记录
-            fd = dict(extract_report_fields(raw))
-            if fd or signal:
-                fd.setdefault("signal", signal or "")
-                self._fields.setdefault(call.upper(), {}).update(fd)
-            self._checkin_times[call.upper()] = datetime.datetime.now().isoformat(timespec="seconds")
-            self._retry_pending = False
-            self._retry_left = int(nc_cfg("max_retry", default=1))  # 关键：成功抄收后恢复额度，
-            # 否则下一个新友台首次未抄收也会被静默（实测 17:26:53 起机器人哑巴的根因）
-            # 保存"当前友台"上下文：后续不带呼号的补充段按 session 归入该友台
-            self._current_call = call.upper()
-            self._current_session = session
-            self._current_entry = entry
-            ack = self._fmt(nc_cfg("ack_text", default=
-                "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
-                "请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over"),
-                call=call, call_phonetic=callsign_phonetic(call), report=signal or "")
-            logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
-            self._speak(ack)
-            self._flush_csv()          # 实时落盘：新友台抄收即写入
-            return
+            return self._do_checkin(call, signal, wav, raw, session, score)
         # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
         # 点名流程中友台报完呼号后，补充 QTH/设备/天线/功率时通常不再重复呼号
         # （17:26:51 实测段"我的QTH在咸阳市…设备即时通…五瓦功率发射"即此场景）。
@@ -1025,6 +1002,24 @@ class NetControlSession:
             # 无实义（"那主播""哦，这里是"等）→ 静默忽略，不归入不播报
             logger.info(f"{self._current_call} 无结构化信息且无关键词，忽略: {info}")
             return
+        # LLM 兜底（可选，llm.enabled=true）：确定性解码低置信度/未解出呼号且
+        # 文本非空时，先让 LLM 尝试修复呼号与信号——命中直接按抄收处理，
+        # 避免"请重复"空耗一轮；失败/未启用则原样走低置信度流程
+        thr = int(nc_cfg("confidence_threshold", default=60))
+        if (call is None or score < thr) and clean_report_text(raw):
+            fix = self._llm_fix(raw, res)
+            if fix:
+                call2, sig2, score2 = fix["callsign"], fix["signal"], fix["score"]
+                if is_duplicate(call2, self._checked_calls):
+                    logger.info(f"重复抄收 {call2}（LLM 修复），跳过")
+                    self._dups += 1
+                    self._retry_pending = False
+                    self._retry_left = int(nc_cfg("max_retry", default=1))
+                    self._speak(self._fmt(nc_cfg("dup_text", default=
+                        "{call_phonetic} 已经抄收过，请下一位友台。"),
+                        call=call2, call_phonetic=callsign_phonetic(call2)))
+                    return
+                return self._do_checkin(call2, sig2, wav, raw, session, score2)
         # 低置信度：请求重复（限次）
         if self._retry_pending or self._retry_left <= 0:
             logger.warning(f"未抄收（{'/'.join(res['reasons'])}）文本: {raw}")
@@ -1048,6 +1043,65 @@ class NetControlSession:
             self._speak(self._fmt(nc_cfg("repeat_text", default=
                 "{call_phonetic}，请重复一遍您的呼号。"), call=target,
                 call_phonetic=callsign_phonetic(target) or "上一位友台"))
+
+    def _do_checkin(self, call, signal, wav, raw, session, score):
+        """抄收一位友台：入册 + 恢复额度 + 建立当前友台上下文 + 播确认 + 实时落盘。"""
+        entry = [call, signal or "", wav or "", raw or "", ""]
+        self._checked_in.append(entry)
+        self._checked_calls.add(call.upper())
+        # 呼号段若已含结构化信息（"我的QTH在…"）一并记录
+        fd = dict(extract_report_fields(raw))
+        if fd or signal:
+            fd.setdefault("signal", signal or "")
+            self._fields.setdefault(call.upper(), {}).update(fd)
+        self._checkin_times[call.upper()] = datetime.datetime.now().isoformat(timespec="seconds")
+        self._retry_pending = False
+        self._retry_left = int(nc_cfg("max_retry", default=1))  # 关键：成功抄收后恢复额度，
+        # 否则下一个新友台首次未抄收也会被静默（实测 17:26:53 起机器人哑巴的根因）
+        # 保存"当前友台"上下文：后续不带呼号的补充段按 session 归入该友台
+        self._current_call = call.upper()
+        self._current_session = session
+        self._current_entry = entry
+        ack = self._fmt(nc_cfg("ack_text", default=
+            "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
+            "请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over"),
+            call=call, call_phonetic=callsign_phonetic(call), report=signal or "")
+        logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
+        self._speak(ack)
+        self._flush_csv()          # 实时落盘：新友台抄收即写入
+
+    def _llm_fix(self, raw, res):
+        """低置信度时用 LLM 兜底修复呼号/信号（net_control.llm.enabled=true 时）。
+        返回 {"callsign","signal","score"} 或 None（未启用/无合法呼号/调用失败）。
+        LLM 失败绝不影响点名：任何异常只记日志，返回 None 走原流程。"""
+        if self._llm is None:
+            if not nc_cfg("llm", "enabled", default=False) \
+                    or not nc_cfg("llm", "api_key", default=""):
+                self._llm = False
+                return None
+            self._llm = LlmClient(
+                api_key=nc_cfg("llm", "api_key", default=""),
+                model=nc_cfg("llm", "model", default="glm-4.5-flash"),
+                base_url=nc_cfg("llm", "base_url",
+                                default="https://open.bigmodel.cn/api/paas/v4"),
+                timeout=float(nc_cfg("llm", "timeout", default=15)))
+        if self._llm is False:
+            return None
+        try:
+            logger.info("LLM 兜底提取（低置信度）…")
+            d = self._llm.extract(raw)
+        except Exception as e:
+            logger.warning(f"LLM 调用失败: {e}")
+            return None
+        call2 = (d.get("callsign") or "").strip().upper().replace(" ", "").replace("-", "")
+        if not call2 or not re.fullmatch(r"B[A-Z]\d[A-Z]{1,3}", call2):
+            logger.info(f"LLM 未给出合法呼号（{d!r}），维持原流程")
+            return None
+        sig2 = d.get("signal") or res.get("signal")
+        logger.info(f"LLM 修复呼号: {res['callsign'] or '无'} → {call2}"
+                    f"{'，信号 ' + str(sig2) if sig2 else ''}")
+        return {"callsign": call2, "signal": sig2,
+                "score": 95, "reasons": ["LLM 修复"]}
 
     def _speak_summary(self):
         n = len(self._checked_in)

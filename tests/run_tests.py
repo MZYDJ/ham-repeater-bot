@@ -587,6 +587,37 @@ def test_echo_other_speaker():
           f"checked={sess._checked_in}")
 
 
+def test_llm_fallback():
+    print("[LLM 兜底修复（llm.enabled=true）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    sess._speak = lambda t: None
+
+    class FakeLLM:
+        calls = 0
+        def extract(self, text):
+            type(self).calls += 1
+            return {"callsign": "BG9BFZ", "signal": "59", "copied": True, "note": ""}
+
+    sess._llm = FakeLLM()          # 注入可用 LLM（跳过 enabled/api_key 检查）
+    # decode 解不出的文本（B9BFZ 缺 G，格式不合法）→ 低置信度 → LLM 兜底
+    sess._asr_text = lambda p: "主控主控，这里是B九B F Z"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=9)
+    check("LLM 被调用", FakeLLM.calls == 1, f"calls={FakeLLM.calls}")
+    check("LLM 修复后抄收", [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"checked={sess._checked_in}")
+    check("信号由 LLM 补提", sess._checked_in[0][1] == "59",
+          f"sig={sess._checked_in[0][1]}")
+    # 未启用 LLM（默认）→ 不调用、不阻塞原流程
+    sess2 = net_control.NetControlSession(link=None)
+    sess2._net_ctx = {"ctrl_call": "BI9BZW"}
+    sess2._speak = lambda t: None
+    sess2._asr_text = lambda p: "主控主控，这里是B九B F Z"
+    sess2._process_segment(b"\x00" * 32000, 1.0, None, session=9)
+    check("未启用时不调用不抄收", sess2._checked_in == [] and sess2._llm is False,
+          f"checked={sess2._checked_in}")
+
+
 def test_templates():
     print("[话术模板（TTS 占位符）]")
     check("解释法回读", callsign_phonetic("BH3XX") == "Bravo Hotel Three X-ray X-ray")
@@ -624,7 +655,7 @@ def main():
                test_wait_channel_idle, test_export_csv, test_echo_filter,
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,
                test_ctrl_call_filter, test_same_session_new_call,
-               test_echo_other_speaker, test_templates]:
+               test_echo_other_speaker, test_llm_fallback, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
