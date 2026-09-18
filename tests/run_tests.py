@@ -482,6 +482,49 @@ def test_wait_channel_idle():
           f"ok={ok} dt={dt:.2f}")
 
 
+def test_echo_filter():
+    print("[中继台回波过滤 _is_echo]")
+    sess = net_control.NetControlSession(link=None)
+    sess._speak = lambda t: None
+    check("未发射过非回波", not sess._is_echo("", 0.6))
+    sess._last_tx_end = time.time()
+    sess._last_spoken_text = "这里是BI9BZW，抄收你的信号，请报告QTH"
+    check("窗口内短空段→回波", sess._is_echo("", 0.5), f"last={sess._last_tx_end}")
+    check("文本重合→回波", sess._is_echo("抄收你的信号", 0.8))
+    check("文本不重合→非回波", not sess._is_echo("这里是BH3XX信号59", 0.8))
+    check("段太长→非回波", not sess._is_echo("", 3.0))
+    sess._last_tx_end = time.time() - 10
+    check("超时窗外→非回波", not sess._is_echo("", 0.5))
+    # 端到端：放麦后紧接的空段不触发"请重复呼号"、不耗额度
+    sess._last_tx_end = time.time()
+    sess._asr_text = lambda p: ""
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._process_segment(b"\x00" * 32000, 0.6, None, session=1)
+    check("回波段静默不播报", spoken == [], f"spoken={spoken}")
+    check("额度未消耗", sess._retry_left == 1, f"left={sess._retry_left}")
+
+
+def test_wait_idle_consumes_queue():
+    print("[等待发射期间继续识别]")
+    sess = net_control.NetControlSession(link=None)
+    sess._asr_text = lambda p: "这里是BG9ABC，信号59"
+    sess._seg_queue.put((b"\x00" * 32000, 1.0, None, 3))
+    sess._speak = lambda t: None
+    calls = {"n": 0}
+
+    def fake_speaking():
+        calls["n"] += 1
+        return calls["n"] < 3          # 前两次有人讲，第三次空闲
+
+    sess._someone_speaking = fake_speaking
+    sess._wait_channel_idle()
+    check("等待期间消费队列并抄收",
+          [c for c, *_ in sess._checked_in] == ["BG9ABC"],
+          f"checked={sess._checked_in}")
+    check("当前友台已切换", sess._current_call == "BG9ABC", f"call={sess._current_call}")
+
+
 def test_templates():
     print("[话术模板（TTS 占位符）]")
     check("解释法回读", callsign_phonetic("BH3XX") == "Bravo Hotel Three X-ray X-ray")
@@ -516,7 +559,8 @@ def main():
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_conn_reuse, test_config_defaults, test_retry_reset,
                test_info_followup, test_report_clean, test_report_fields,
-               test_wait_channel_idle, test_export_csv, test_templates]:
+               test_wait_channel_idle, test_export_csv, test_echo_filter,
+               test_wait_idle_consumes_queue, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
