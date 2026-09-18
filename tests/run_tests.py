@@ -187,19 +187,21 @@ def test_asr_body():
     check("OpenAI 兼容结构", body["model"] == "qwen3-asr-flash"
           and body["messages"][0]["role"] == "system" and not body["stream"])
     check("itn 默认开", body["asr_options"]["enable_itn"] is True)
+    # 生产默认：system.content 数组格式（实测 2026-09-18 唯一被服务端接受的格式）
     sysmsg = body["messages"][0]["content"]
-    check("词表进 System", "BH3XX" in sysmsg and "BRAVO" in sysmsg)
+    check("默认 system 为数组",
+          isinstance(sysmsg, list) and sysmsg[0]["type"] == "text")
+    sys_text = sysmsg[0]["text"]
+    check("词表进 System", "BH3XX" in sys_text and "BRAVO" in sys_text)
     # system 词表格式变体（--asr-probe 探测用）
-    b_list = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="list")
-    check("list 变体 content 为数组",
-          isinstance(b_list["messages"][0]["content"], list)
-          and b_list["messages"][0]["content"][0]["type"] == "text")
+    b_str = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="str")
+    check("str 变体为字符串", isinstance(b_str["messages"][0]["content"], str))
     b_bare = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="bare")
     check("bare 变体纯词表", b_bare["messages"][0]["content"] == "BRAVO")
     b_none = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"], sys_style="none")
     check("none 变体无 system", all(m["role"] != "system" for m in b_none["messages"]))
     b_noopts = c._build_body(b"\x00\x00\x00\x00", context_words=["BRAVO"],
-                             with_asr_opts=False, sys_style="str")
+                             with_asr_opts=False, sys_style="list")
     check("no-opts 变体无 asr_options", "asr_options" not in b_noopts)
 
 
