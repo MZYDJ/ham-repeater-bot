@@ -248,6 +248,46 @@ def callsign_phonetic(call):
     return " ".join(out)
 
 
+def extract_report_fields(text):
+    """从补充信息段提取结构化字段（点名确认/记录用）：
+    返回有序 [(字段标签, 值)]，仅含实际提取到的字段。
+    - QTH/设备/天线/功率/信号报告 五类核心信息
+    - 提取不到任何字段 → 空列表（调用方不重复复诵，改走确认/纠正/静默分支）"""
+    fields = []
+    # QTH：ASR 常展开为 "Q T H"，覆盖 QTH/Q T H/位置/地址/所在地
+    m = re.search(r"(?:QTH|Q\s*T\s*H|位置|地址|所在地)(?:[是在位于]|的|是)?"
+                  r"\s*([^，。；,;.!！?？\s]{2,24})", text, re.I)
+    if m and not re.search(r"[A-Za-z]\d[A-Za-z]{1,3}", m.group(1)):
+        fields.append(("QTH", m.group(1).strip()))
+    # 设备
+    m = re.search(r"(?:设备|机器|电台|手台|车台)(?:是|为|的|的是|用的)?"
+                  r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
+    if m:
+        fields.append(("设备", m.group(1).strip()))
+    # 天线：两种常见语序——"天线原机天线"（天线在前）与"原机天线/八木天线"（天线在后）。
+    # 优先"天线在前"（避免把"天线原机天线"误切为 xxx天线），再试"天线在后"。
+    m = re.search(r"天线(?:是|为|的|用的)?\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,12})",
+                  text, re.I)
+    if m:
+        fields.append(("天线", m.group(1).strip()))
+    else:
+        m = re.search(r"([\u4e00-\u9fffA-Za-z0-9\-]{2,6})天线", text)
+        if m:
+            fields.append(("天线", m.group(1) + "天线"))
+    # 功率：阿拉伯数字 + 中文数字（"5瓦/五瓦"），不带单位读法（瓦）
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:瓦|W)", text, re.I) or \
+        re.search(r"([零一二两三四五六七八九洞幺])\s*瓦", text)
+    if m:
+        p = m.group(1)
+        p = CN_DIGITS.get(p, p)          # 中文数字转阿拉伯
+        fields.append(("功率", f"{p} 瓦"))
+    # 信号报告（"信号五九"→59）
+    sig = extract_signal(text)
+    if sig:
+        fields.append(("信号", sig))
+    return fields
+
+
 def clean_report_text(text):
     """补充信息段轻量清洗（TTS 复诵友好）：
     - 去首尾标点/空白、压缩连续空白
@@ -670,6 +710,7 @@ class NetControlSession:
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
         self._ever_talk = False                 # 本会话是否收到过任何开始讲话信令
         self._gate_started = time.time()
+        self._preempted = threading.Event()     # 播报发射中检测到他人讲话（抢占让位）
         self._asr = None
         self._llm = None
         self._decoder = None
@@ -859,11 +900,16 @@ class NetControlSession:
                 logger.info(f"{self._current_call} 空补充段忽略（{raw!r}）")
                 return
             kw = info.lower()
-            correct_kw = ("不对", "错了", "不是", "纠正", "说错", "重报", "听错")
+            correct_kw = ("不对", "不正确", "错了", "不是", "纠正", "说错",
+                          "重报", "听错", "抄错", "读错")
             confirm_kw = ("正确", "确认", "对的", "没问题", "收到了", "是的",
                           "对对对", "收到收到")
+            ask_kw = ("是否抄收", "抄收到了吗", "抄收了吗", "是否收到",
+                      "听得到吗", "听清了吗", "主控在吗", "在吗")
             if any(k in kw for k in correct_kw):
                 # 友台纠正（呼号/信息听错）→ 请其重报，不归入信息
+                # （"不正确"必须命中：实测 19:48 友台说"不正确，请重复抄收"
+                #   旧逻辑因 confirm 检查长度限制漏判，被当补充信息复诵）
                 logger.info(f"{self._current_call} 纠正请求: {info}")
                 self._speak(self._fmt(nc_cfg("correct_text", default=
                     "抱歉，刚才抄收可能有误，请您再重复一遍，Over"),
@@ -878,17 +924,48 @@ class NetControlSession:
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
                 return
-            prev_info = self._current_entry[4] or ""
-            self._current_entry[4] = (prev_info + " " + info).strip()
-            if signal and not self._current_entry[1]:
-                self._current_entry[1] = signal
-            logger.info(f"{self._current_call} 补充信息：{info}")
-            # 把抄收到的信息完整复诵，让友台确认是否正确（用户点名习惯）
-            self._speak(self._fmt(nc_cfg("info_ack_text", default=
-                "抄收，{call_phonetic}，您说的是：{info}。是否正确？Over"),
-                call=self._current_call,
-                call_phonetic=callsign_phonetic(self._current_call),
-                info=info))
+            # 结构化字段提取：确认的是结构化内容（QTH/设备/天线/功率/信号），
+            # 不再把整句话原样复诵（实测 19:47 "主控是否抄收"被复诵成废话）
+            fields = extract_report_fields(info)
+            if fields:
+                prev_info = self._current_entry[4] or ""
+                self._current_entry[4] = (prev_info + " " + info).strip()
+                if signal and not self._current_entry[1]:
+                    self._current_entry[1] = signal
+                field_str = "、".join(f"{label} {v}" for label, v in fields)
+                logger.info(f"{self._current_call} 补充信息（结构化 {len(fields)} 项）："
+                            f"{field_str}")
+                tmpl = nc_cfg("info_ack_text", default=
+                    "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over")
+                if "{fields}" in tmpl:
+                    self._speak(self._fmt(tmpl, call=self._current_call,
+                        call_phonetic=callsign_phonetic(self._current_call),
+                        fields=field_str))
+                else:                      # 用户自定义旧模板（无 {fields}）→ 兼容整句复诵
+                    self._speak(self._fmt(tmpl, call=self._current_call,
+                        call_phonetic=callsign_phonetic(self._current_call),
+                        info=info))
+                return
+            # 无结构化字段的文本分类：
+            if any(k in kw for k in ask_kw):
+                # 友台询问是否抄收/主控在吗 → 确认抄收并引导补报信息
+                logger.info(f"{self._current_call} 询问抄收状态: {info}")
+                self._speak(self._fmt(nc_cfg("ask_ack_text", default=
+                    "抄收，{call_phonetic}，您的呼号已记录，"
+                    "请报告您的QTH、使用设备、天线、功率，Over"),
+                    call=self._current_call,
+                    call_phonetic=callsign_phonetic(self._current_call)))
+                return
+            if "呼号" in kw:
+                # 友台在补报呼号（"我的呼号是BG9"之类未拼完整）→ 请其报完整呼号
+                logger.info(f"{self._current_call} 补报呼号: {info}")
+                self._speak(self._fmt(nc_cfg("repeat_text", default=
+                    "{call_phonetic}，请再报一次您的完整呼号，Over"),
+                    call=self._current_call,
+                    call_phonetic=callsign_phonetic(self._current_call)))
+                return
+            # 无实义（"那主播""哦，这里是"等）→ 静默忽略，不归入不播报
+            logger.info(f"{self._current_call} 无结构化信息且无关键词，忽略: {info}")
             return
         # 低置信度：请求重复（限次）
         if self._retry_pending or self._retry_left <= 0:
@@ -959,8 +1036,9 @@ class NetControlSession:
 
     def _on_downlink(self, msg_type, payload):
         """keeper 线程回调：处理语音包（msg_type=1）与讲话信令（msg_type=15）。
-        - 自己发射中（busy 锁被占）不接收：防把自家播报/点名回声当应答
-          （下行包是否带 session 由服务器决定，此守卫不依赖 session 字段，双保险）
+        - 自己在播报中（busy 锁被占）：不采集应答（防把自家播报回声当应答），
+          但仍做"抢占检测"——检测到非自己 session 的讲话信令/语音包即置位
+          _preempted，播报线程据此立即放麦让位（先听后说原则的发射中兜底）
         - 信令门控（use_talking_gate=true，默认）：仅采集服务器广播过
           UserTalking 开始讲话（talking=true）的远端语音——过滤链路底噪/杂音
           误触发的假"应答段"；若 60s 内从未收到任何说话信令（平台不下发），
@@ -968,22 +1046,27 @@ class NetControlSession:
         - UserTalking 结束信令（talking=false）→ 立即切段，不等 VAD 静音超时
         - 自己 session 的信令（放麦回显）直接忽略"""
         try:
-            if self.link is not None and self.link._busy.is_set():
-                return
-            # 自动降级：60s 内从未收到任何开始讲话信令 → 纯 VAD（不丢应答）
-            if (self._talking_gate and not self._ever_talk
-                    and time.time() - self._gate_started > 60):
-                self._talking_gate = False
-                logger.warning("60s 内未收到任何说话信令（平台可能不下发），"
-                               "降级为纯 VAD 采集")
             own = None
             if self.link is not None and self.link._sess is not None:
                 own = self.link._sess.session
+            busy = self.link is not None and self.link._busy.is_set()
+            if not busy:
+                # 自动降级：60s 内从未收到任何开始讲话信令 → 纯 VAD（不丢应答）
+                if (self._talking_gate and not self._ever_talk
+                        and time.time() - self._gate_started > 60):
+                    self._talking_gate = False
+                    logger.warning("60s 内未收到任何说话信令（平台可能不下发），"
+                                   "降级为纯 VAD 采集")
             if msg_type == 1:
                 # 服务器下行按批转发（实测约 600ms 批 5 包×120ms），
                 # 必须解析载荷内全部语音包，否则音频会被压缩成倍速
                 voices = direct_announce.parse_udp_voice_multi(payload, own_session=own)
                 if not voices:
+                    return
+                if busy:
+                    # 自己在发射：任何非自己 session 的语音包 = 他人在讲话 → 抢占
+                    if any(v["session"] != own for v in voices):
+                        self._preempted.set()
                     return
                 for voice in voices:
                     if self._talking_gate and voice["session"] not in self._talking_sessions:
@@ -999,6 +1082,10 @@ class NetControlSession:
                 sess, talking = d.get(1), d.get(2)
                 if sess is not None and sess == own:
                     return                        # 自己（放麦回显）的信令，忽略
+                if busy:
+                    if talking == 1:
+                        self._preempted.set()    # 发射中他人按下 PTT → 抢占让位
+                    return
                 if talking == 0:
                     if sess is not None:
                         self._talking_sessions.discard(sess)
@@ -1043,6 +1130,33 @@ class NetControlSession:
         words += [str(x) for x in (nc_cfg("extra_vocab", default=[]) or [])]
         return words
 
+    def _someone_speaking(self):
+        """信道占用判据（任一命中即视为有人在讲话）：
+        ① 信令层：服务器广播过"开始讲话"且尚未收到"结束"的远端 session 集合；
+        ② VAD 层：正在采集中的语音段（含静音收尾窗口，确保对方真正讲完）。"""
+        if self._talking_sessions:
+            return True
+        if self._capture is not None and self._capture._speaking:
+            return True
+        return False
+
+    def _wait_channel_idle(self):
+        """先听后说：抢麦前等待信道空闲。当前无人讲话 → 立即返回；
+        有人在讲 → 等待对方讲完（最多 tx_wait_timeout 秒，超时仍发射，
+        避免点名流程被无限拖住）。返回 True 表示可发射。"""
+        timeout = float(nc_cfg("tx_wait_timeout", default=30))
+        if not self._someone_speaking():
+            return True
+        logger.info(f"信道占用中，等待对方讲完再播报（最多 {timeout:.0f}s）…")
+        deadline = time.time() + timeout
+        while time.time() < deadline and not self._stop.is_set():
+            if not self._someone_speaking():
+                logger.info("信道已空闲，开始播报")
+                return True
+            time.sleep(0.2)
+        logger.warning(f"等待信道空闲超时（{timeout:.0f}s），仍尝试播报")
+        return True
+
     def _speak(self, text):
         if not text or self._stop.is_set():
             return
@@ -1071,6 +1185,13 @@ class NetControlSession:
         if s is None and self.link is not None:
             logger.warning("链路忙或不可用，跳过本句点名播报")
             return
+        # 先听后说：抢麦前等待信道空闲（当前无人讲话才按下 PTT）。
+        # 实测 19:46 友台在 TTS 合成期间抢台说话，主控 TTS 完成后直接抢麦，
+        # 恰好压住对方——必须在 take_mic 前检查并等待。
+        if s is not None:
+            self._wait_channel_idle()
+        if self._stop.is_set():
+            return
         try:
             if s is None:                           # 无常驻链路（独立运行场景）：临时短链
                 s2 = direct_announce.DirectAnnouncer(
@@ -1084,9 +1205,14 @@ class NetControlSession:
                 finally:
                     s2.close()
                 return
+            # 发射中兜底：若抢麦瞬间对方仍在讲话（等待窗口竞态），检测到他人
+            # 语音立即放麦让位，不压对方（abort_check 由下行泵回调置位）
+            self._preempted.clear()
             with contextlib.redirect_stdout(_StdoutToLogger(logger)):
                 s.take_mic()
-                s.play(packets)
+                ok = s.play(packets, abort_check=lambda: self._preempted.is_set())
+            if not ok:
+                logger.warning("点名播报被他人讲话抢占，已放麦让位（不重播，避免抢台循环）")
         except Exception as e:
             logger.error(f"点名播报失败: {e}")
         finally:
