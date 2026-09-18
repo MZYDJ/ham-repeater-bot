@@ -371,6 +371,7 @@ class VoiceCapture:
         self._seq = 0
         self._seg_session = None        # 当前段来源 session（讲话人标识，点名上下文关联用）
         self._defer_frames = 0          # PTT 抬起后的延迟收尾剩余帧数（20ms/帧）
+        self.last_feed_at = None        # 最近一次收到音频帧的时刻（采集卡死检测用）
 
     def _rms(self, frame):
         s = array.array('h')
@@ -385,9 +386,12 @@ class VoiceCapture:
     def feed(self, pcm48, session=None):
         """喂入 48kHz 单声道 PCM。session 为该批语音的远端来源标识：
         讲话人切换（session 变化）时先收尾当前段再开新段，保证每个切出的
-        语音段归属单一 session（点名状态机据此把"补充信息段"归入当前友台）。"""
+        语音段归属单一 session（点名状态机据此把"补充信息段"归入当前友台）。
+        每批都刷新 last_feed_at——对方讲完、链路静默后不再有帧喂入，
+        上层据此判定"已讲完"，避免 _speaking 无限卡 True。"""
         if not pcm48:
             return
+        self.last_feed_at = time.time()
         if (self._speaking and session is not None
                 and self._seg_session is not None and session != self._seg_session):
             self._finalize()                       # 换人：先收尾上一位的段
@@ -729,6 +733,7 @@ class NetControlSession:
         self._preempted = threading.Event()     # 播报发射中检测到他人讲话（抢占让位）
         self._asr = None
         self._llm = None
+        self._llm_calls = 0                 # 每轮点名 LLM 兜底调用计数（防超时拖死）
         self._decoder = None
         self._capture = None
         self._net_ctx = {}          # 话术模板上下文（_run 启动时填充）
@@ -933,7 +938,8 @@ class NetControlSession:
                           "对对对", "收到收到")
             ask_kw = ("是否抄收", "抄收到了吗", "抄收了吗", "是否收到",
                       "听得到吗", "听清了吗", "主控在吗", "在吗",
-                      "能否抄收", "能否超收", "是否超收", "能不能抄收")
+                      "能否抄收", "能否超收", "是否超收", "能不能抄收",
+                      "是否超时", "超时了吗", "超收了吗", "可以了吗", "好了吗")
             if any(k in kw for k in correct_kw):
                 # 友台纠正（呼号/信息听错）→ 请其重报，不归入信息
                 # （"不正确"必须命中：实测 19:48 友台说"不正确，请重复抄收"
@@ -1073,7 +1079,9 @@ class NetControlSession:
     def _llm_fix(self, raw, res):
         """低置信度时用 LLM 兜底修复呼号/信号（net_control.llm.enabled=true 时）。
         返回 {"callsign","signal","score"} 或 None（未启用/无合法呼号/调用失败）。
-        LLM 失败绝不影响点名：任何异常只记日志，返回 None 走原流程。"""
+        LLM 失败绝不影响点名：任何异常只记日志，返回 None 走原流程。
+        调用放线程并限时 8s（实测 GLM 慢时一次阻塞 19s 拖死点名节奏），
+        且每轮点名最多 llm_max_calls（默认 3）次。"""
         if self._llm is None:
             if not nc_cfg("llm", "enabled", default=False) \
                     or not nc_cfg("llm", "api_key", default=""):
@@ -1084,12 +1092,25 @@ class NetControlSession:
                 model=nc_cfg("llm", "model", default="glm-4.5-flash"),
                 base_url=nc_cfg("llm", "base_url",
                                 default="https://open.bigmodel.cn/api/paas/v4"),
-                timeout=float(nc_cfg("llm", "timeout", default=15)))
+                timeout=float(nc_cfg("llm", "timeout", default=8)))
         if self._llm is False:
+            return None
+        max_calls = int(nc_cfg("llm", "max_calls", default=3))
+        if self._llm_calls >= max_calls:
             return None
         try:
             logger.info("LLM 兜底提取（低置信度）…")
-            d = self._llm.extract(raw)
+            box = {}
+            tt = threading.Thread(
+                target=lambda: box.__setitem__("d", self._llm.extract(raw)),
+                daemon=True)
+            tt.start()
+            tt.join(timeout=8)
+            if tt.is_alive():
+                logger.warning("LLM 兜底超时（8s），放弃本次修复")
+                return None
+            d = box.get("d", {})
+            self._llm_calls += 1
         except Exception as e:
             logger.warning(f"LLM 调用失败: {e}")
             return None
@@ -1254,7 +1275,9 @@ class NetControlSession:
            陈旧超时：超过 talking_stale_seconds（默认 8s）无该 session 新语音
            包即视为已讲完并清出，防"信道永久占用"自锁。
         ② VAD 层：正在采集中的语音段（含静音收尾窗口，确保对方真正讲完）。
-           采集本身受静音超时与 max_segment_ms（15s 强制截断）兜底，不会永锁。"""
+           静音累计只在有新音频帧喂入时推进——对方讲完、链路静默后不再有帧，
+           _speaking 会无限卡 True（实测"没人说话却等 30s"的根因之一）。
+           故加 feed 活性检测：最近 vad_idle_seconds（默认 2s）无新帧即复位。"""
         stale = float(nc_cfg("talking_stale_seconds", default=8))
         for s in list(self._talking_sessions):
             last = self._talking_active.get(s, 0)
@@ -1265,8 +1288,19 @@ class NetControlSession:
                             f"释放 session {s} 的信道占用")
         if self._talking_sessions:
             return True
-        if self._capture is not None and self._capture._speaking:
-            return True
+        if self._capture is not None:
+            if self._capture._speaking:
+                idle = float(nc_cfg("vad_idle_seconds", default=2))
+                last = self._capture.last_feed_at
+                if last is None or time.time() - last > idle:
+                    # 正在采集但已 idle 超时：无新帧（对方讲完/链路静默），
+                    # 强制复位采集，避免"信道永久占用"
+                    if last is not None:
+                        logger.info(f"VAD 采集空闲超时（{idle:.0f}s 无新帧），"
+                                    f"复位说话状态")
+                    self._capture._speaking = False
+                    return False
+                return True
         return False
 
     def _wait_channel_idle(self):
@@ -1289,14 +1323,7 @@ class NetControlSession:
                 logger.info("信道已空闲，开始播报")
                 return True
             # 等待期间继续识别：消费队列中积压的语音段（多人接连说话不丢）
-            consumed = 0
-            try:
-                while True:
-                    pcm16, dur, wav, session = self._seg_queue.get_nowait()
-                    self._process_segment(pcm16, dur, wav, session)
-                    consumed += 1
-            except queue.Empty:
-                pass
+            consumed = self._drain_queue()
             if consumed:
                 logger.info(f"等待期间已识别 {consumed} 段（友台轮流点名）")
                 if not self._someone_speaking():
@@ -1306,6 +1333,21 @@ class NetControlSession:
         logger.warning(f"等待信道空闲超时（{timeout:.0f}s），仍尝试播报")
         return True
 
+    def _drain_queue(self, depth=0):
+        """消费 _seg_queue 中积压的语音段（等待信道/合成期间继续识别）。
+        depth 防递归失控：识别段触发的新播报若再次进入 drain，最多嵌套 2 层。"""
+        if depth >= 2:
+            return 0
+        consumed = 0
+        try:
+            while True:
+                pcm16, dur, wav, session = self._seg_queue.get_nowait()
+                self._process_segment(pcm16, dur, wav, session)
+                consumed += 1
+        except queue.Empty:
+            pass
+        return consumed
+
     def _speak(self, text):
         if not text or self._stop.is_set():
             return
@@ -1314,7 +1356,20 @@ class NetControlSession:
         self._last_spoken_text = text      # 回波过滤：与紧随其后收到的短段比对
         mp3 = ""
         try:
-            mp3 = self.tts_func(text) if self.tts_func else synth_text(text)
+            if self.tts_func:
+                mp3 = self.tts_func(text)
+            else:
+                # TTS 合成放后台线程：合成需要 3~20s（edge-tts 网络），期间
+                # 主线程继续识别队列中的语音段，不阻塞点名节奏（实测 10s 合成
+                # 期间友台说话被拖住是"识别中断"的根因之一）
+                box = {}
+                tt = threading.Thread(
+                    target=lambda: box.__setitem__("mp3", synth_text(text)),
+                    daemon=True)
+                tt.start()
+                self._drain_queue(depth=1)   # 合成期间继续识别
+                tt.join(timeout=45)
+                mp3 = box.get("mp3", "")
         except Exception as e:
             logger.error(f"点名 TTS 异常: {e}")
         if not mp3:

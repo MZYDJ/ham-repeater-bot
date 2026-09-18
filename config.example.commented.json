@@ -148,6 +148,7 @@
     "echo_holdoff_seconds": 1.5,  // 中继台回波过滤：自己发射结束后该秒数内的短语音段视为疑似回波
     "echo_segment_max_seconds": 1.5,  // 回波过滤：超过该时长的段不视为回波（真实友台抢答通常更长；且文本与刚播报/上一段内容连续重合≥70% 才判回波，避免误杀）
     "talking_stale_seconds": 8,  // 说话信令防自锁：UserTalking 结束信令偶发丢失会导致"信道永久占用"（每次播报前白等 30s），该 session 超过此秒数无新语音包即视为讲完并释放信道
+    "vad_idle_seconds": 2,  // VAD 采集防卡死：正在采集但超过该秒数无新音频帧喂入（对方讲完、链路静默）→ 强制复位说话状态，根治"没人说话却信道占用中"
     "min_segment_ms": 400,      // 短于此的语音段忽略（防误触发）
     "max_segment_ms": 15000,    // 单段最长（超过强制截断，防失控）
     "use_talking_gate": true,   // 说话信令门控：仅采集服务器广播了"开始讲话"的远端语音，
@@ -179,10 +180,12 @@
     },
     // ---- LLM 信息提取（可选，默认关闭；主路径为词表确定性解码）----
     "llm": {
-      "enabled": false,         // true=低置信度时调 LLM 修复/提取备注
+      "enabled": false,         // true=低置信度时调 LLM 修复呼号/提取信号（api_key 必填，否则自动禁用）
       "api_key": "",            // 智谱 API Key
       "model": "glm-4.5-flash", // 免费模型
-      "base_url": "https://open.bigmodel.cn/api/paas/v4"
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "timeout": 8,             // 单次调用限时（秒）；放线程限时，超时放弃不拖点名
+      "max_calls": 3            // 每轮点名最多调用次数（防慢接口拖死流程）
     }
   }
 }
