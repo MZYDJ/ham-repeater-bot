@@ -24,6 +24,7 @@ Message 传实体词表提升呼号识别）；LLM 可选走 GLM-4.5-Flash（智
 用法：
     python3 net_control.py --decode "Bravo Hotel Three X-ray X-ray 信号五九"   # 离线解码自测
     python3 net_control.py --opus-roundtrip                                     # 编解码往返自测
+    python3 net_control.py --asr-test                                           # ASR 接口自测（需已配 api_key）
 """
 import argparse
 import array
@@ -366,9 +367,21 @@ class AsrClient:
             headers={"Authorization": "Bearer " + self.api_key,
                      "Content-Type": "application/json"},
             method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            out = json.loads(resp.read().decode("utf-8"))
-        return (out.get("choices") or [{}])[0].get("message", {}).get("content", "").strip()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                out = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 把服务端错误正文带进日志（Key/模型未开通/地域/音频无效各自报错不同）
+            detail = e.read().decode("utf-8", "replace")[:600]
+            logger.error(f"ASR HTTP {e.code}: {detail}")
+            raise
+        content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        # 官方响应 content 标注为 array（示例为字符串），两种都兼容
+        if isinstance(content, list):
+            content = "".join(
+                str(x.get("text", "")) if isinstance(x, dict) else str(x)
+                for x in content)
+        return content.strip()
 
 
 # ====================== LLM 客户端（可选，GLM-4.5-Flash） ======================
@@ -483,6 +496,11 @@ class NetControlSession:
         self._failed = 0
         self._retry_pending = False
         self._retry_left = int(nc_cfg("max_retry", default=1))
+        self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
+        self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
+        self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
+        self._ever_talk = False                 # 本会话是否收到过任何开始讲话信令
+        self._gate_started = time.time()
         self._asr = None
         self._llm = None
         self._decoder = None
@@ -546,13 +564,13 @@ class NetControlSession:
         logger.info("点名主播会话开始")
         try:
             self._ensure_capture()
-            self._speak(nc_cfg("opening_text", default=
+            self._speak(self._fmt(nc_cfg("opening_text", default=
                 "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是每周{weekday}晚"
                 "{net_name}，我是今晚主控{ctrl_call}，今天是{date}，现在是北京时间{time}，"
                 "我的QTH位于{main_qth}，所用设备{main_device}，{main_antenna}，"
                 "{main_power}功率发射，现在开始台网点名，请抄收到信号的友台依次上台报告"
                 "你的呼号、QTH、使用设备、天线、功率以及抄收到主控台的信号报告，"
-                "这里是{ctrl_phonetic} {ctrl_call}，Over"))
+                "这里是{ctrl_phonetic} {ctrl_call}，Over")))
             if nc_cfg("roster_mode", default=False):
                 self._run_roster()
             else:
@@ -564,26 +582,51 @@ class NetControlSession:
             self._teardown()
 
     def _run_open(self):
-        window = float(nc_cfg("listen_after_open_seconds", default=60))
+        """开放点名窗口：
+        - 最短收听 listen_after_open_seconds（默认 60s）
+        - 总时长 max_net_seconds（默认 1800s=30 分钟）：到点后不再强制立即结束，
+          若仍有人在点名（正上麦应答），等其说完——连续 quiet_end_seconds（默认 10s）
+          无任何应答活动才触发收尾
+        - grace_seconds（默认 300s）为到点后的硬性宽限，防长时间持续讲话无限延长
+        - 应答处理是同步的（ASR+TTS 播报期间不检查结束条件），天然"等人说完" """
+        start = time.time()
+        self._last_activity = start
+        min_window = float(nc_cfg("listen_after_open_seconds", default=60))
+        max_net = float(nc_cfg("max_net_seconds", default=1800))
+        quiet_end = float(nc_cfg("quiet_end_seconds", default=10))
+        grace = float(nc_cfg("grace_seconds", default=300))
         max_count = int(nc_cfg("max_checked_in", default=200))
-        deadline = time.time() + window
-        logger.info(f"点名开放收听窗口 {window:.0f} 秒")
-        while (time.time() < deadline and len(self._checked_in) < max_count
-               and not self._stop.is_set()):
-            remain = deadline - time.time()
-            if remain <= 0:
+        deadline = start + max(max_net, min_window)
+        hard = deadline + grace
+        logger.info(f"点名开放收听：最短 {min_window:.0f}s，总时长 {max_net:.0f}s，"
+                    f"到点后连续 {quiet_end:.0f}s 无应答即收尾"
+                    f"（硬上限 {hard - start:.0f}s）")
+        while not self._stop.is_set():
+            now = time.time()
+            if len(self._checked_in) >= max_count:
+                break
+            if now >= hard:
+                logger.warning(f"到达硬上限（宽限 {grace:.0f}s 已耗尽），强制收尾")
+                break
+            if now >= deadline and now - self._last_activity >= quiet_end:
+                logger.info(f"已到点名总时长，且连续 {quiet_end:.0f}s 无应答，收尾")
                 break
             try:
-                pcm16, dur, wav = self._seg_queue.get(timeout=min(remain, 1.0))
+                pcm16, dur, wav = self._seg_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
             self._process_segment(pcm16, dur, wav)
 
     def _run_roster(self):
         roster = [str(x).upper() for x in (nc_cfg("roster", default=[]) or [])]
-        logger.info(f"固定名单点名，共 {len(roster)} 位")
+        max_secs = float(nc_cfg("roster_max_seconds", default=1800))
+        started = time.time()
+        logger.info(f"固定名单点名，共 {len(roster)} 位（总时长上限 {max_secs:.0f}s）")
         for call in roster:
             if self._stop.is_set():
+                break
+            if time.time() - started >= max_secs:
+                logger.warning(f"固定名单到达总时长上限 {max_secs:.0f}s，跳过剩余名单")
                 break
             self._speak(self._fmt(nc_cfg("roster_call_text", default="请{call_phonetic}回答。Over"),
                                   call=call, call_phonetic=callsign_phonetic(call)))
@@ -599,6 +642,7 @@ class NetControlSession:
 
     # ---------- 应答处理 ----------
     def _process_segment(self, pcm16, dur, wav):
+        self._last_activity = time.time()
         logger.info(f"收到应答段 {dur:.1f}s（{Path(wav).name if wav else '未落盘'}）")
         raw = self._asr_text(pcm16)
         logger.info(f"ASR: {raw}")
@@ -661,36 +705,72 @@ class NetControlSession:
     def _ensure_capture(self):
         if self._capture is not None:
             return
-        save_dir = nc_cfg("audio_dir", default="/app/net_records") if nc_cfg("save_audio", default=True) else None
+        save_dir = None
+        if nc_cfg("save_audio", default=True):
+            save_dir = nc_cfg("audio_dir", default="/app/net_records")
+            try:
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"应答录音目录不可写（{e}），本次不落盘录音"
+                               f"（容器需 chown 见 start.sh）")
+                save_dir = None
         self._capture = VoiceCapture(
             save_dir=save_dir,
             on_segment=lambda pcm16, dur, wav: self._seg_queue.put((pcm16, dur, wav)))
         if self.link is not None:
             self.link._on_downlink = self._on_downlink      # 注册下行分发（点名期间）
         logger.info(f"接收侧就绪（VAD 阈值 {self._capture.threshold}，"
-                    f"静音收尾 {self._capture.silence_end_ms}ms）")
+                    f"静音收尾 {self._capture.silence_end_ms}ms，"
+                    f"信令门控 {'开' if self._talking_gate else '关'}）")
 
     def _on_downlink(self, msg_type, payload):
         """keeper 线程回调：处理语音包（msg_type=1）与讲话信令（msg_type=15）。
         - 自己发射中（busy 锁被占）不接收：防把自家播报/点名回声当应答
           （下行包是否带 session 由服务器决定，此守卫不依赖 session 字段，双保险）
-        - UserTalking 结束信令（talking=false）→ 立即切段，不等 VAD 静音超时"""
+        - 信令门控（use_talking_gate=true，默认）：仅采集服务器广播过
+          UserTalking 开始讲话（talking=true）的远端语音——过滤链路底噪/杂音
+          误触发的假"应答段"；若 60s 内从未收到任何说话信令（平台不下发），
+          自动降级为纯 VAD 采集
+        - UserTalking 结束信令（talking=false）→ 立即切段，不等 VAD 静音超时
+        - 自己 session 的信令（放麦回显）直接忽略"""
         try:
             if self.link is not None and self.link._busy.is_set():
                 return
+            # 自动降级：60s 内从未收到任何开始讲话信令 → 纯 VAD（不丢应答）
+            if (self._talking_gate and not self._ever_talk
+                    and time.time() - self._gate_started > 60):
+                self._talking_gate = False
+                logger.warning("60s 内未收到任何说话信令（平台可能不下发），"
+                               "降级为纯 VAD 采集")
+            own = None
+            if self.link is not None and self.link._sess is not None:
+                own = self.link._sess.session
             if msg_type == 1:
-                voice = direct_announce.parse_udp_voice(payload, own_session=None)
+                voice = direct_announce.parse_udp_voice(payload, own_session=own)
                 if voice is None:
                     return
+                if self._talking_gate and voice["session"] not in self._talking_sessions:
+                    return                        # 无"开始讲话"信令的包（底噪等），丢弃
                 if self._decoder is None:
                     self._decoder = direct_announce.OpusDecoder()
                 pcm = self._decoder.decode(voice["opus"])
                 if pcm:
                     self._capture.feed(pcm)
             elif msg_type == 15:
-                # UserTalking: f1=session, f2=talking(0/1)。talking=0 即对方松 PTT
-                if direct_announce.pb_dict(payload).get(2) == 0:
+                # UserTalking: f1=session, f2=talking(0/1)
+                d = direct_announce.pb_dict(payload)
+                sess, talking = d.get(1), d.get(2)
+                if sess is not None and sess == own:
+                    return                        # 自己（放麦回显）的信令，忽略
+                if talking == 0:
+                    if sess is not None:
+                        self._talking_sessions.discard(sess)
                     self._capture.force_finalize()
+                elif talking == 1:
+                    self._ever_talk = True
+                    if sess is not None:
+                        self._talking_sessions.add(sess)
+                    self._capture.force_finalize()   # 上一位的段在此收尾（讲话人切换）
         except Exception:
             pass
 
@@ -703,6 +783,11 @@ class NetControlSession:
                                 default="https://dashscope.aliyuncs.com/compatible-mode/v1"),
                 enable_itn=nc_cfg("asr", "enable_itn", default=True),
                 language=nc_cfg("asr", "language", default=""))
+        # 过短音频补静音到 asr_min_seconds（规避接口对极短/空音频的拒绝）
+        min_secs = float(nc_cfg("asr_min_seconds", default=1.0))
+        need = int(16000 * 2 * min_secs)
+        if len(pcm16) < need:
+            pcm16 = pcm16 + b"\x00" * (need - len(pcm16))
         try:
             return self._asr.transcribe(pcm16, context_words=self._context_words())
         except Exception as e:
@@ -795,6 +880,9 @@ def main():
     ap = argparse.ArgumentParser(description="点名主播离线自测")
     ap.add_argument("--decode", help="离线解码：输入 ASR 转录文本，输出呼号/信号/置信度")
     ap.add_argument("--opus-roundtrip", action="store_true", help="Opus 编解码往返自测")
+    ap.add_argument("--asr-test", nargs="?", const="", metavar="WAV",
+                    help="ASR 接口自测：传 WAV 文件路径，或留空用 2 秒合成音测试"
+                         "（打印完整识别结果/服务端错误正文，用于排查 Key/模型/地域/音频问题）")
     args = ap.parse_args()
     if args.decode:
         res = decode_callsign(args.decode)
@@ -812,6 +900,35 @@ def main():
         out = dec.decode(opus)
         print(f"编码 {len(pcm)}B → Opus {len(opus)}B → 解码 {len(out)}B")
         print("往返长度一致:", len(out) == len(pcm))
+        return
+    if args.asr_test is not None:
+        if args.asr_test:
+            pcm16 = Path(args.asr_test).read_bytes()
+        else:
+            import math
+            pcm16 = bytearray()
+            for i in range(16000 * 2):              # 2 秒 1kHz 正弦 16bit @16k
+                v = int(12000 * math.sin(2 * math.pi * 1000 * i / 16000))
+                pcm16 += struct.pack("<h", v)
+            pcm16 = bytes(pcm16)
+        client = AsrClient(
+            api_key=nc_cfg("asr", "api_key", default=""),
+            model=nc_cfg("asr", "model", default="qwen3-asr-flash"),
+            base_url=nc_cfg("asr", "base_url",
+                            default="https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            enable_itn=nc_cfg("asr", "enable_itn", default=True),
+            language=nc_cfg("asr", "language", default=""))
+        print(f"ASR 自测: model={client.model} 音频={len(pcm16)}B"
+              f"（{len(pcm16) / 32000:.1f}s @16k mono）")
+        print(f"base_url={client.base_url}")
+        print(f"api_key={'已配置' if client.api_key else '空（配置 net_control.asr.api_key）'}")
+        try:
+            text = client.transcribe(pcm16, context_words=["BRAVO", "BH3XX"])
+            print(f"识别结果: {text!r}")
+        except Exception as e:
+            print(f"ASR 自测失败: {type(e).__name__}: {e}")
+            print("若为 HTTP 400/404：检查 api_key、模型名、地域支持（美国地域不支持"
+                  "OpenAI 兼容模式）；若是音频类报错请换用真实录音文件重试。")
         return
     ap.print_help()
 
