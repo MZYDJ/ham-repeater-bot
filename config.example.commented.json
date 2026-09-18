@@ -147,7 +147,7 @@
     "tx_wait_timeout": 30,   // 先听后说：主控按下 PTT 前等待信道空闲的最长秒数（当前有人在讲话就等对方讲完；超时仍发射，避免点名被无限拖住）。等待期间会继续识别队列中友台的话
     "echo_holdoff_seconds": 1.5,  // 中继台回波过滤：自己发射结束后该秒数内的短语音段视为疑似回波
     "echo_segment_max_seconds": 1.5,  // 回波过滤：超过该时长的段不视为回波（真实友台抢答通常更长；且文本与刚播报/上一段内容连续重合≥70% 才判回波，避免误杀）
-    "talking_stale_seconds": 8,  // 说话信令防自锁：UserTalking 结束信令偶发丢失会导致"信道永久占用"（每次播报前白等 30s），该 session 超过此秒数无新语音包即视为讲完并释放信道
+    "talking_stale_seconds": 4,  // 说话信令防自锁：UserTalking 结束信令偶发丢失会导致"信道永久占用"（每次播报前白等 30s），该 session 超过此秒数无新语音包即视为讲完并释放信道
     "vad_idle_seconds": 2,  // VAD 采集防卡死：正在采集但超过该秒数无新音频帧喂入（对方讲完、链路静默）→ 强制复位说话状态，根治"没人说话却信道占用中"
     "min_segment_ms": 400,      // 短于此的语音段忽略（防误触发）
     "max_segment_ms": 15000,    // 单段最长（超过强制截断，防失控）
@@ -176,7 +176,10 @@
       "model": "qwen3-asr-flash",
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "enable_itn": true,       // 数字归一化："五九"→"59"（信号报告需要）
-      "language": ""            // 留空=自动识别；确定中文可填 zh
+      "language": "",           // 留空=自动识别；确定中文可填 zh
+      "sys_style": "none"       // system 词表：none=关闭（默认，最稳）；list=开启
+                                // （实测 list 偶发被服务端"词表回显"当输入转写，
+                                //  返回词表全文导致识别全错——代码有回显校验自动降级）
     },
     // ---- LLM 信息提取（可选，默认关闭；主路径为词表确定性解码）----
     "llm": {
