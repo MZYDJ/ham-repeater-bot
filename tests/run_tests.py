@@ -454,6 +454,23 @@ def test_info_followup():
           and sess._fields.get("BH3XX", {}).get("power") == "5 瓦"
           and sess._fields.get("BG9ABC", {}).get("qth") == "咸阳市",
           f"fields={sess._fields}")
+    # 设备新句式："用的是手机/使用的是手机"（实测 22:40 丢失"手机"导致反复追问）
+    sess._asr_text = lambda pcm: "天线是没有天线，用的是手机"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("用的是手机提取设备", sess._fields.get("BG9ABC", {}).get("device") == "手机"
+          and "手机" in (sess._current_entry[4] or ""),
+          f"fields={sess._fields} entry={sess._current_entry}")
+    # 重复补充同值字段（"没有天线"已记录过）→ 静默，不重复复诵
+    n3 = len(spoken)
+    sess._asr_text = lambda pcm: "天线是没有天线"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("重复补充静默不播报", len(spoken) == n3, f"spoken={spoken}")
+    # "不是已经说过了吗"反问 → 不判纠正（实测 22:43 误播"抄收有误"）
+    n4 = len(spoken)
+    sess._asr_text = lambda pcm: "我的设备，我的车贴是刚才不是已经说过了吗？你没有记住吗"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("反问不是不判纠正", len(spoken) == n4 and "抄收有误" not in "".join(spoken),
+          f"spoken={spoken}")
 
 
 def test_export_csv():
