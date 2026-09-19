@@ -800,10 +800,18 @@ class PersistentAnnouncer:
         """播报结束，连接归还守护线程继续保活"""
         self._busy.clear()
     def suspend(self):
-        """临时直连播报期间暂停守护保活/重连（防与临时连接同账号互踢）。
-        现有连接保留但不 Ping；resume 后恢复正常保活与重连。"""
+        """临时直连播报期间暂停守护保活/重连，并**主动断开现有连接**让出登录名额
+        （防同账号互踢：残留登录状态的常驻连接会被临时连接顶掉，resume 后重连又
+        顶回临时连接——实测 20:51 短链抢麦被重连常驻顶掉而失败）。resume 后重连。"""
         with self._lock:
             self._suspended = True
+            if self._sess is not None:
+                try:
+                    self._sess.close()
+                except Exception:
+                    pass
+                self._sess = None
+                self._last_ok = 0.0
     def resume(self):
         """恢复常驻链路保活/重连（临时直连播报已结束，可安全回到单连接）。"""
         with self._lock:

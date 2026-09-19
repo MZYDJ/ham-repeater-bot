@@ -271,13 +271,20 @@ def extract_report_fields(text):
     # 设备：覆盖"设备是手机/电台为K6/用的是手机/使用手机/用手机"等句式。
     # 先匹配"设备/机器/电台/手台/车台"关键词（"我使用的设备是手机"→手机），
     # 再兜底"用/使用"句式（"用的是手机"→手机）；排除疑问词防误取。
-    m = re.search(r"(?:设备|机器|电台|手台|车台)(?:是|为|的|的是|用的)?"
-                  r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
+    # ASR 常插入填充词（"设备情况森海科斯G T幺二"→"情况"是噪声，型号含中文
+    # 数字+空格，"G T幺二"应并回设备名）→ 分隔符含"情况/的话"等，匹配集含
+    # 空格，事后压缩空格并把型号中文数字转阿拉伯（幺二→12）。
+    m = re.search(r"(?:设备|机器|电台|手台|车台)(?:是|为|的|的是|用的|情况|的话)?"
+                  r"\s*([\u4e00-\u9fffA-Za-z0-9 \-]{2,20})", text, re.I)
     if not m:
         m = re.search(r"(?:用的是|使用的是|用|使用)(?:的)?(?:是)?"
                       r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
     if m and not re.search(r"什么|哪个|怎样|怎么|多少|干嘛|干吗", m.group(1)):
-        fields.append(("device", m.group(1).strip()))
+        dev = m.group(1).strip()
+        dev = re.sub(r"\s+", "", dev)      # "G T幺二" → "GT幺二"
+        dev = re.sub(r"[零幺一二三四五六七八九洞两]",
+                     lambda c: CN_DIGITS.get(c.group(0), c.group(0)), dev)
+        fields.append(("device", dev))
     # 天线：两种常见语序——"天线原机天线"（天线在前）与"原机天线/八木天线"（天线在后）。
     # 优先"天线在前"（避免把"天线原机天线"误切为 xxx天线），再试"天线在后"。
     m = re.search(r"天线(?:是|为|的|用的)?\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,12})",
@@ -288,13 +295,18 @@ def extract_report_fields(text):
         m = re.search(r"([\u4e00-\u9fffA-Za-z0-9\-]{2,6})天线", text)
         if m:
             fields.append(("antenna", m.group(1) + "天线"))
-    # 功率：阿拉伯数字 + 中文数字（"5瓦/五瓦"），不带单位读法（瓦）
+    # 功率：阿拉伯数字 + 中文数字（"5瓦/五瓦"），不带单位读法（瓦）；
+    # 或档位词（"高功率/中功率/低功率/大功率"——实测 20:49 "高功率发射"）。
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:瓦|W)", text, re.I) or \
         re.search(r"([零一二两三四五六七八九洞幺])\s*瓦", text)
     if m:
         p = m.group(1)
         p = CN_DIGITS.get(p, p)          # 中文数字转阿拉伯
         fields.append(("power", f"{p} 瓦"))
+    else:
+        m = re.search(r"(高|中|低|大|小)功率", text)
+        if m:
+            fields.append(("power", m.group(1) + "功率"))
     # 信号报告（"信号五九"→59）
     sig = extract_signal(text)
     if sig:
@@ -1131,6 +1143,11 @@ class NetControlSession:
             logger.info(f"主控自身呼号 {call}，忽略（回波/自我识别）")
             return
         if call and is_duplicate(call, self._checked_calls):
+            # 重复抄收：先看本段是否在补报缺失字段（实测 20:51:26 友台重复报
+            # "抄你的信号五九"→ 信号59 应补录，而不是直接"已经抄收过"吞掉）
+            if self._current_call == call and self._apply_report_fields(call, raw, signal):
+                logger.info(f"{call} 重复抄收但补报字段已记录: {raw}")
+                return
             logger.info(f"重复抄收 {call}，跳过")
             self._dups += 1
             self._retry_pending = False
@@ -1266,32 +1283,7 @@ class NetControlSession:
             # 不再把整句话原样复诵（实测 19:47 "主控是否抄收"被复诵成废话）
             fields = extract_report_fields(info)
             if fields:
-                prev_info = self._current_entry[4] or ""
-                self._current_entry[4] = (prev_info + " " + info).strip()
-                if signal and not self._current_entry[1]:
-                    self._current_entry[1] = signal
-                field_str = "、".join(
-                    f"{FIELD_LABEL.get(k, k)} {v}" for k, v in fields)
-                logger.info(f"{self._current_call} 补充信息（结构化 {len(fields)} 项）："
-                            f"{field_str}")
-                # 重复值抑制：提取的字段值全部与已记录相同（如再次报"没有天线"）
-                # → 静默忽略，不重复复诵刷屏（实测 22:41:06 重复播"天线 没有天线"）
-                old = self._fields.get(self._current_call, {}) or {}
-                is_dup = all(str(old.get(k, "")) == v for k, v in fields)
-                if is_dup:
-                    logger.info(f"{self._current_call} 重复补充信息忽略（已记录）: {field_str}")
-                    return
-                # 结构化字段永久化（CSV 导出用；信号报告并入字段表）
-                fd = dict(fields)
-                if self._current_entry[1]:
-                    fd.setdefault("signal", self._current_entry[1])
-                self._fields.setdefault(self._current_call, {}).update(fd)
-                self._flush_csv()          # 实时落盘：结构化字段更新即写入
-                # 合并确认：友台一句话被 VAD 切成多段（实测 20:06:55-20:07:02 六段
-                # 报完设备/功率/天线/QTH/信号），每段立即播"是否正确"会连播六次打断
-                # 对方且互相顶替。改为只累积字段、停稳 report_merge_gap_seconds
-                # （默认 4s）后由 _flush_pending_report 统一确认一次。
-                self._pending_at = time.time()
+                self._apply_report_fields(self._current_call, info, signal)
                 return
             # 无结构化字段的文本分类：
             if any(k in kw for k in ask_kw):
@@ -1374,6 +1366,38 @@ class NetControlSession:
         fd = self._fields.get(call, {}) or {}
         return [k for k in REQUIRED_FIELDS
                 if not str(fd.get(k) or "").strip()]
+
+    def _apply_report_fields(self, call, info_text, signal=None):
+        """结构化字段落地：记录 entry[4]/信号 → 永久化 _fields → 实时落盘 CSV →
+        置 _pending_at 等合并确认（同一句话被 VAD 切碎时只播一次）。
+        补充信息分支与"重复抄收但补报缺失字段"（20:51:26 实测"抄你的信号五九"）
+        共用。"""
+        call = (call or "").upper()
+        entry = self._current_entry
+        fields = extract_report_fields(info_text)
+        if not fields:
+            return False
+        prev_info = entry[4] or "" if entry else ""
+        if entry is not None:
+            entry[4] = (prev_info + " " + info_text).strip()
+            if signal and not entry[1]:
+                entry[1] = signal
+        field_str = "、".join(
+            f"{FIELD_LABEL.get(k, k)} {v}" for k, v in fields)
+        logger.info(f"{call} 补充信息（结构化 {len(fields)} 项）：{field_str}")
+        old = self._fields.get(call, {}) or {}
+        is_dup = all(str(old.get(k, "")) == v for k, v in fields)
+        if is_dup:
+            logger.info(f"{call} 重复补充信息忽略（已记录）: {field_str}")
+            return False
+        fd = dict(fields)
+        if entry is not None and entry[1]:
+            fd.setdefault("signal", entry[1])
+        self._fields.setdefault(call, {}).update(fd)
+        self._flush_csv()          # 实时落盘：结构化字段更新即写入
+        # 合并确认：只累积字段、停稳 report_merge_gap_seconds 后统一确认一次
+        self._pending_at = time.time()
+        return True
 
     def _flush_pending_report(self, force=False):
         """合并确认：友台连续多段补充信息（同一句话被 VAD 切碎）→ 只播一次完整确认。
@@ -1926,20 +1950,31 @@ class NetControlSession:
                         if s is None:          # 无常驻链路（独立运行场景）：临时短链
                             if self.link is not None and hasattr(self.link, "suspend"):
                                 self.link.suspend()   # 挂起常驻，防同账号互踢
-                            s2 = direct_announce.DirectAnnouncer(
-                                username=direct_announce.cfg_get(
-                                    "talk", "username", default=""),
-                                password=direct_announce.cfg_get(
-                                    "talk", "password", default=""))
-                            try:
-                                with contextlib.redirect_stdout(_StdoutToLogger(logger)):
-                                    s2.connect()
-                                    s2.take_mic()
-                                    s2.play(packets)
-                            finally:
-                                s2.close()
-                                if self.link is not None and hasattr(self.link, "resume"):
-                                    self.link.resume()   # 临时链已断开，恢复常驻保活
+                            # 短链抢麦可能因连接抖动失败（实测 20:51:36 "已经抄收过"
+                            # 播报被吞）→ 换新连接重试一次，避免整句丢失
+                            last_err = None
+                            for _try in range(2):
+                                s2 = direct_announce.DirectAnnouncer(
+                                    username=direct_announce.cfg_get(
+                                        "talk", "username", default=""),
+                                    password=direct_announce.cfg_get(
+                                        "talk", "password", default=""))
+                                try:
+                                    with contextlib.redirect_stdout(_StdoutToLogger(logger)):
+                                        s2.connect()
+                                        s2.take_mic()
+                                        s2.play(packets)
+                                    break
+                                except Exception as e:
+                                    last_err = e
+                                    try:
+                                        s2.close()
+                                    except Exception:
+                                        pass
+                            else:
+                                logger.error(f"点名播报短链重试仍失败: {last_err}")
+                            if self.link is not None and hasattr(self.link, "resume"):
+                                self.link.resume()   # 临时链已断开，恢复常驻保活
                             return
                         # 发射中兜底：检测到他人语音立即放麦让位，不压对方
                         self._preempted.clear()

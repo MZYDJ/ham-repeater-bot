@@ -937,7 +937,7 @@ def test_report_merged_confirm():
     time.sleep(0.8)
     sess._flush_pending_report()
     check("合并确认只播一次且含全部字段",
-          len(spoken) == n0 + 2 and "设备 全胜U二" in spoken[n0]
+          len(spoken) == n0 + 2 and "设备 全胜U2" in spoken[n0]
           and "功率 5 瓦" in spoken[n0] and "QTH 团结路" in spoken[n0],
           f"spoken={spoken}")
     # 再次 flush（无新内容）→ 不重复播
@@ -1039,6 +1039,50 @@ def test_suspend_resume():
           not link._suspended and link._backoff == 30.0)
 
 
+def test_power_highpower_and_device_gt12():
+    print("[20:49 实测长句：功率档位词+设备型号中文数字（森海科斯G T幺二）]")
+    text = ("我QTH是兴平南关西路，设备情况森海科斯G T幺二，原机天线，"
+            "高功率，24楼高度发射，主控是否超收？Over")
+    fields = dict(net_control.extract_report_fields(text))
+    check("QTH 提取", fields.get("qth") == "兴平南关西路", f"fields={fields}")
+    check("设备去噪声+型号数字化",
+          fields.get("device") == "森海科斯GT12",
+          f"fields={fields}")
+    check("天线原机天线", fields.get("antenna") == "原机天线", f"fields={fields}")
+    check("高功率提取", fields.get("power") == "高功率", f"fields={fields}")
+
+
+def test_duplicate_report_fields():
+    print("[重复抄收但补报缺失字段：20:51:26 '抄你的信号五九' → 应补录而非跳过]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BI9BZY"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("首次抄收", sess._current_call == "BI9BZY"
+          and "抄收" in spoken[0] and "Zulu Yankee" in spoken[0],
+          f"cur={sess._current_call} spoken={spoken}")
+    # 已记 QTH/设备/天线，缺信号 → 友台重复报呼号+信号59
+    sess._asr_text = lambda p: "我的QTH是咸阳，设备手机，天线原装天线"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    n0 = len(spoken)
+    sess._asr_text = lambda p: "主控主控，这里是B I九B Z Y，抄你的信号五九，是否抄收？Over"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("重复呼号但补报信号59已记录",
+          sess._fields.get("BI9BZY", {}).get("signal") == "59"
+          and not any("已经抄收过" in s for s in spoken[n0:]),
+          f"fields={sess._fields} spoken={spoken[n0:]}")
+    # 纯重复（无新字段）→ 走"已经抄收过"
+    n1 = len(spoken)
+    sess._asr_text = lambda p: "这里是BI9BZY"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("纯重复仍回已经抄收过",
+          any("已经抄收过" in s for s in spoken[n1:]),
+          f"spoken={spoken[n1:]}")
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -1124,6 +1168,7 @@ def main():
                test_join_intent_guide, test_checkedin_repeat_feedback,
                test_replace_guard,
                test_suspend_resume,
+               test_power_highpower_and_device_gt12, test_duplicate_report_fields,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
