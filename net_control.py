@@ -693,13 +693,37 @@ class LlmClient:
 
 
 # ====================== TTS（独立于 announce.py，避免循环依赖） ======================
+def _cosyvoice_audio_format(fmt, sample_rate):
+    """dashscope tts_v2 的 AudioFormat 枚举：采样率已合并在 format 里（如 MP3_24000HZ_MONO_256KBPS）。
+    按 config 的 cosyvoice_format + cosyvoice_sample_rate 映射；未知组合回退默认。"""
+    from dashscope.audio.tts_v2.speech_synthesizer import AudioFormat
+    fmt = (fmt or "mp3").lower()
+    sr = int(sample_rate or 24000)
+    if fmt == "mp3":
+        return getattr(AudioFormat, f"MP3_{sr}HZ_MONO_256KBPS",
+                       AudioFormat.MP3_24000HZ_MONO_256KBPS)
+    if fmt == "wav":
+        return getattr(AudioFormat, f"WAV_{sr}HZ_MONO_16BIT",
+                       AudioFormat.WAV_24000HZ_MONO_16BIT)
+    if fmt == "pcm":
+        return getattr(AudioFormat, f"PCM_{sr}HZ_MONO_16BIT",
+                       AudioFormat.PCM_24000HZ_MONO_16BIT)
+    if fmt == "opus":
+        return getattr(AudioFormat, f"OGG_OPUS_{int(sr/1000)}KHZ_MONO_32KBPS",
+                       AudioFormat.OGG_OPUS_24KHZ_MONO_32KBPS)
+    return AudioFormat.MP3_24000HZ_MONO_256KBPS
+
+
 def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
     """阿里云百炼 CosyVoice 官方 SDK 合成（dashscope.audio.tts_v2.SpeechSynthesizer，
     WebSocket 流式，与官方示例一致；首包延迟低，支持 cosyvoice-v3.5-plus/flash 复刻音色）。
-    写入 mp3 文件。复用 asr.api_key；模型/音色见 tts.cosyvoice_*。"""
+    写入 mp3 文件。复用 asr.api_key；模型/音色见 tts.cosyvoice_*。
+    SDK 版本签名差异（1.18 老签名 sample_rate/rate/pitch ↔ 1.2x+ 新签名
+    format 枚举含采样率 + speech_rate/pitch_rate）用 TypeError 探测自动适配。"""
     import dashscope
     from dashscope.audio.tts_v2 import SpeechSynthesizer
-    api_key = (direct_announce.cfg_get("net_control", "asr", "api_key", default="") or direct_announce.cfg_get("asr", "api_key", default=""))
+    api_key = (direct_announce.cfg_get("net_control", "asr", "api_key", default="")
+               or direct_announce.cfg_get("asr", "api_key", default=""))
     model = direct_announce.cfg_get("tts", "cosyvoice_model",
                                     default="cosyvoice-v3.5-flash")
     voice = direct_announce.cfg_get("tts", "cosyvoice_voice", default="")
@@ -709,28 +733,25 @@ def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
         raise RuntimeError("CosyVoice 未配置：" + "、".join(missing)
                            + "（config.json 中该字段为空或缺失）")
     dashscope.api_key = api_key
+    fmt = direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3")
+    sr = int(direct_announce.cfg_get("tts", "cosyvoice_sample_rate", default=24000))
+    vol = int(direct_announce.cfg_get("tts", "cosyvoice_volume", default=50))
+    rate = float(direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0))
+    pitch = float(direct_announce.cfg_get("tts", "cosyvoice_pitch", default=1.0))
+    try:                                  # 新签名（1.2x+）：AudioFormat 枚举 + speech_rate/pitch_rate
+        synthesizer = SpeechSynthesizer(
+            model=model, voice=voice,
+            format=_cosyvoice_audio_format(fmt, sr),
+            volume=vol, speech_rate=rate, pitch_rate=pitch)
+    except TypeError:                     # 旧签名（1.18）：sample_rate/rate/pitch
+        synthesizer = SpeechSynthesizer(
+            model=model, voice=voice,
+            format=fmt, sample_rate=sr, volume=vol,
+            rate=rate, pitch=pitch, timeout=timeout)
     try:
-        synthesizer = SpeechSynthesizer(
-            model=model, voice=voice,
-            format=direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3"),
-            sample_rate=int(direct_announce.cfg_get(
-                "tts", "cosyvoice_sample_rate", default=24000)),
-            volume=int(direct_announce.cfg_get("tts", "cosyvoice_volume", default=50)),
-            rate=float(direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0)),
-            pitch=float(direct_announce.cfg_get("tts", "cosyvoice_pitch", default=1.0)),
-            timeout=timeout,
-        )
-    except TypeError:                    # 旧版 dashscope 无 timeout 构造参数
-        synthesizer = SpeechSynthesizer(
-            model=model, voice=voice,
-            format=direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3"),
-            sample_rate=int(direct_announce.cfg_get(
-                "tts", "cosyvoice_sample_rate", default=24000)),
-            volume=int(direct_announce.cfg_get("tts", "cosyvoice_volume", default=50)),
-            rate=float(direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0)),
-            pitch=float(direct_announce.cfg_get("tts", "cosyvoice_pitch", default=1.0)),
-        )
-    audio = synthesizer.call(text)
+        audio = synthesizer.call(text, timeout_millis=timeout * 1000)
+    except TypeError:                     # 旧版 call 无 timeout_millis
+        audio = synthesizer.call(text)
     if not audio:
         raise RuntimeError("CosyVoice SDK 返回空音频")
     cache_path.write_bytes(audio)
