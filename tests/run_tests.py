@@ -700,17 +700,16 @@ def test_same_session_new_call():
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     sess._asr_text = lambda p: "我的QTH在咸阳市"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    # 同 session 新友台补报完整呼号 → 不被补充信息吞；但当前友台已记录
-    # 结构化信息（识别修正仅限"刚抄收未报信息"的早期窗口，实测 20:15:15
-    # 已点过者重复说话不应覆盖已确认记录）→ 不替换，回"呼号已记录"反馈
+    # 同 session 新友台补报完整呼号 → 不被补充信息吞；但呼号完全不相似
+    # （BJ9EFU vs BH3XX，编辑距离大）→ 判定为另一友台插队排队，不顶当前友台
     sess._asr_text = lambda p: "这里是BJ九EFU，能否超收"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    check("已记录信息不替换旧呼号",
-          [c for c, *_ in sess._checked_in] == ["BH3XX"],
-          f"checked={sess._checked_in}")
-    check("当前友台不变且给反馈", sess._current_call == "BH3XX"
-          and any("呼号已记录" in s for s in spoken),
-          f"call={sess._current_call} spoken={spoken}")
+    check("不相似呼号排队不替换",
+          [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"]
+          and sess._current_call == "BH3XX"
+          and any(w["call"] == "BJ9EFU" for w in sess._waiting),
+          f"checked={sess._checked_in} cur={sess._current_call} "
+          f"waiting={sess._waiting}")
 
 
 def test_echo_other_speaker():
@@ -1083,6 +1082,53 @@ def test_duplicate_report_fields():
           f"spoken={spoken[n1:]}")
 
 
+def test_relay_same_session_interloper():
+    print("[中继转发同 session：A 刚抄收 B 报不相似呼号 → 排队不顶 A（实测干扰场景）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9AA"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 被抄收", sess._current_call == "BG9AA", f"cur={sess._current_call}")
+    # 同一 session（中继转发）B 报完全不相似的呼号 → 排队，不替换 A
+    sess._asr_text = lambda p: "这里是BG9BB"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("同session不相似→排队不顶A",
+          sess._current_call == "BG9AA"
+          and [c for c, *_ in sess._checked_in] == ["BG9AA", "BG9BB"]
+          and any(w["call"] == "BG9BB" for w in sess._waiting),
+          f"cur={sess._current_call} checked={sess._checked_in} "
+          f"waiting={sess._waiting}")
+    # 当前友台收尾 → 自动轮到 B
+    sess._end_current()
+    check("收尾后轮到 B", sess._current_call == "BG9BB",
+          f"cur={sess._current_call}")
+
+
+def test_similar_callsign_cross_session_replace():
+    print("[跨 session 相似呼号（BLZ↔BFZ 编辑距离1）→ 识别修正替换]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9BLZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("BLZ 先被抄收", sess._current_call == "BG9BLZ", f"cur={sess._current_call}")
+    # 另一设备（session=8）报相似呼号 → 识别修正，替换为 BFZ
+    sess._asr_text = lambda p: "这里是BG九BFZ，Bravo Foxtrot Zulu"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("相似呼号跨session替换",
+          [c for c, *_ in sess._checked_in] == ["BG9BFZ"]
+          and sess._current_call == "BG9BFZ"
+          and "BG9BLZ" not in sess._checked_calls
+          and not sess._waiting,
+          f"checked={sess._checked_in} cur={sess._current_call} "
+          f"waiting={sess._waiting}")
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -1169,6 +1215,7 @@ def main():
                test_replace_guard,
                test_suspend_resume,
                test_power_highpower_and_device_gt12, test_duplicate_report_fields,
+               test_relay_same_session_interloper, test_similar_callsign_cross_session_replace,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

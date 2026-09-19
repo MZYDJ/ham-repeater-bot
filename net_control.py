@@ -253,6 +253,35 @@ def callsign_phonetic(call):
 
 FIELD_LABEL = {"qth": "QTH", "device": "设备", "antenna": "天线",
                "power": "功率", "signal": "信号"}
+
+
+def callsign_edit_distance(a, b):
+    """两呼号 Levenshtein 编辑距离（大小写不敏感）。"""
+    a, b = (a or "").upper(), (b or "").upper()
+    la, lb = len(a), len(b)
+    if abs(la - lb) > 4:
+        return abs(la - lb)
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[lb]
+
+
+def callsign_similar(a, b, max_dist=1):
+    """呼号相似度：编辑距离 ≤ max_dist 视为"同一友台识别修正"候选。
+    取 max_dist=1（ASR 把呼号听错几乎都是单个字符，如 BG9BLZ↔BG9BFZ）；
+    距离 ≥2（如 BG9AA vs BG9BB、BI9BZY vs BG9BFZ）→ 判定为另一友台。
+    保守倾向"排队而非替换"：把修正误判成插队只会多等一轮（不丢人），
+    把插队误判成修正会顶掉当前友台（丢人）——中继转发场景所有友台
+    同 session 无法靠 session 区分，此判据是最后防线。"""
+    a, b = (a or "").upper(), (b or "").upper()
+    if not a or not b:
+        return False
+    return callsign_edit_distance(a, b) <= max_dist
 # 点名应答应记录的核心结构化字段（抄收后若缺失则主动追问，每字段最多问一次）
 REQUIRED_FIELDS = ("signal", "qth", "device", "antenna", "power")
 
@@ -1119,8 +1148,15 @@ class NetControlSession:
         prev_end = self._seg_end_at.get(session) if session is not None else None
         raw = self._asr_text(pcm16)
         logger.info(f"ASR: {raw}")
-        # 中继台回波过滤：自己发射后/对方讲完后紧接的短段，先于一切处理丢弃
-        if self._is_echo(raw, dur, session, prev_end):
+        res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
+        call, signal, score = res["callsign"], res["signal"], res["score"]
+        # 中继台回波过滤：自己发射后/对方讲完后紧接的短段，先于一切处理丢弃。
+        # 仅对"无新呼号/已抄收呼号"的段生效——解析出**新呼号**的段不可能是回波
+        # （回波是同一人的尾音/自身播报，不会报出新呼号）。实测中继转发场景
+        # 友台 A 讲完（"这里是BG9AA"）B 立即报名（"这里是BG9BB"），模板化开场
+        # 文本重合≥70% + 同 session → 若按旧逻辑 B 的报名被当 A 的回波静默吞掉。
+        if (call is None or call.upper() in self._checked_calls) \
+                and self._is_echo(raw, dur, session, prev_end):
             logger.info(f"疑似中继台回波，忽略（{raw!r} dur={dur:.1f}s"
                         f"{' session=' + str(session) if session is not None else ''}）")
             return
@@ -1128,8 +1164,6 @@ class NetControlSession:
         if session is not None:
             self._seg_end_at[session] = time.time()
             self._seg_text[session] = raw
-        res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
-        call, signal, score = res["callsign"], res["signal"], res["score"]
         thr = int(nc_cfg("confidence_threshold", default=60))
         # 空/纯语气词段（放麦尾音、环境声、回波残余）→ 静默：
         # 不播"请重复呼号"、不消耗重复请求额度（实测 20:15 放麦后 0.6s 空段
@@ -1159,24 +1193,33 @@ class NetControlSession:
             return
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
             if self._current_active:
-                # 同 session 重报不同呼号 = 同一友台纠正/识别修正（如 ASR 把 BFZ
-                # 听成 BLZ，友台随后重报正确呼号）→ 替换旧记录，不打断不排队。
-                # 仅限"刚抄收、尚未报信息"的早期窗口：已记录结构化信息后再
-                # 重报不同呼号（20:15:15 实测"BFZ 在等确认时又说话"）视为重复
-                # 确认，不覆盖已确认记录，回"呼号已记录"反馈。
-                if session is not None and session == self._current_session \
-                        and (self._current_call or "").upper() != call.upper():
-                    if self._current_entry and self._current_entry[4]:
-                        logger.info(f"{self._current_call} 已记录信息，同 session 重报 "
-                                    f"{call} 不替换（识别修正仅限早期窗口）: {raw}")
-                        self._speak(self._fmt(nc_cfg("ask_ack_text", default=
-                            "抄收，{call_phonetic}，您的呼号已记录，"
-                            "请报告您的QTH、使用设备、天线、功率，Over"),
-                            call=self._current_call,
-                            call_phonetic=callsign_phonetic(self._current_call)))
-                        return
-                    return self._replace_checkin(call, signal, wav, raw, session, score)
-                # 不同 session（另一个人）→ 插队：静默记录+排队，不打断
+                # 当前友台进行中收到新呼号，两种语义：
+                # ① 识别修正（同一友台纠正/ASR 听错）：新呼号与当前友台高度相似
+                #    （编辑距离≤1，如 ASR 把 BFZ 听成 BLZ）→ 替换旧记录，不打断。
+                #    仅限"刚抄收、尚未报信息"的早期窗口：已记录结构化信息后再
+                #    重报（20:15:15 实测"BFZ 在等确认时又说话"）不覆盖已确认记录，
+                #    回"呼号已记录"反馈。
+                # ② 另一友台插队：呼号不相似（BG9AA vs BG9BB）→ 静默排队等候，
+                #    不顶掉当前友台。
+                # 判定依据是**呼号相似度而非 session**：中继转发场景所有友台
+                # 同 session（用户实测确认），同 session 不代表同一人；反过来
+                # 跨设备（不同 session）也可能是一人纠正。保守倾向排队——
+                # 修正被误判为插队只多等一轮（不丢人），插队被误判为修正会
+                # 顶掉当前友台（丢人）。
+                if (self._current_call or "").upper() != call.upper():
+                    similar = callsign_similar(self._current_call, call)
+                    if similar:
+                        if self._current_entry and self._current_entry[4]:
+                            logger.info(f"{self._current_call} 已记录信息，重报 "
+                                        f"{call} 不替换（识别修正仅限早期窗口）: {raw}")
+                            self._speak(self._fmt(nc_cfg("ask_ack_text", default=
+                                "抄收，{call_phonetic}，您的呼号已记录，"
+                                "请报告您的QTH、使用设备、天线、功率，Over"),
+                                call=self._current_call,
+                                call_phonetic=callsign_phonetic(self._current_call)))
+                            return
+                        return self._replace_checkin(call, signal, wav, raw, session, score)
+                # 呼号不相似（另一个人，无论 session）→ 插队：静默记录+排队，不打断
                 return self._queue_interloper(call, signal, raw, session)
             return self._do_checkin(call, signal, wav, raw, session, score)
         # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
