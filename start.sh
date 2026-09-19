@@ -39,8 +39,11 @@ engine = (cfg.get("tts") or {}).get("engine", "cosyvoice")
 if not has("talk", "username") or not has("talk", "password"):
     print("[WARN] talk.username / talk.password 未配置！直连链路将无法登录。")
 if engine == "cosyvoice":
-    if not has("asr", "api_key"):
-        print("[WARN] tts.engine=cosyvoice 但 asr.api_key 为空/缺失！点名与播报 TTS 将失败。")
+    # ASR/CosyVoice 共用一把百炼 key：实际读取路径 net_control.asr.api_key（优先）/ 顶层 asr.api_key（兼容）
+    asr_key = (cfg.get("net_control", {}).get("asr", {}).get("api_key")
+               or (cfg.get("asr") or {}).get("api_key"))
+    if not asr_key:
+        print("[WARN] tts.engine=cosyvoice 但 asr.api_key 为空/缺失（检查 net_control.asr.api_key 或顶层 asr.api_key）！点名 TTS 将失败。")
     if not has("tts", "cosyvoice_voice"):
         print("[WARN] tts.engine=cosyvoice 但 tts.cosyvoice_voice 为空/缺失！v3.5 系列需先在百炼控制台创建音色。")
     if not has("tts", "cosyvoice_model"):

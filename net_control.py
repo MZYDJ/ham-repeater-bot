@@ -699,7 +699,7 @@ def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
     写入 mp3 文件。复用 asr.api_key；模型/音色见 tts.cosyvoice_*。"""
     import dashscope
     from dashscope.audio.tts_v2 import SpeechSynthesizer
-    api_key = direct_announce.cfg_get("asr", "api_key", default="")
+    api_key = (direct_announce.cfg_get("net_control", "asr", "api_key", default="") or direct_announce.cfg_get("asr", "api_key", default=""))
     model = direct_announce.cfg_get("tts", "cosyvoice_model",
                                     default="cosyvoice-v3.5-flash")
     voice = direct_announce.cfg_get("tts", "cosyvoice_voice", default="")
@@ -745,7 +745,7 @@ def _cosyvoice_synth(text, cache_path, timeout=28):
     import base64
     import json
     import urllib.request
-    api_key = direct_announce.cfg_get("asr", "api_key", default="")
+    api_key = (direct_announce.cfg_get("net_control", "asr", "api_key", default="") or direct_announce.cfg_get("asr", "api_key", default=""))
     model = direct_announce.cfg_get("tts", "cosyvoice_model",
                                     default="cosyvoice-v3.5-flash")
     voice = direct_announce.cfg_get("tts", "cosyvoice_voice", default="")
