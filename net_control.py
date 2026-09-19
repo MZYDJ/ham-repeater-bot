@@ -1131,7 +1131,12 @@ class NetControlSession:
             return
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
             if self._current_active:
-                # 当前友台正在抄收/追问/确认中：新呼号=插队，静默记录+排队，不打断
+                # 同 session 重报不同呼号 = 同一友台纠正/识别修正（如 ASR 把 BFZ
+                # 听成 BLZ，友台随后重报正确呼号）→ 替换旧记录，不打断不排队
+                if session is not None and session == self._current_session \
+                        and (self._current_call or "").upper() != call.upper():
+                    return self._replace_checkin(call, signal, wav, raw, session, score)
+                # 不同 session（另一个人）→ 插队：静默记录+排队，不打断
                 return self._queue_interloper(call, signal, raw, session)
             return self._do_checkin(call, signal, wav, raw, session, score)
         # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
@@ -1395,6 +1400,24 @@ class NetControlSession:
         logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
         self._speak(ack)
         self._flush_csv()          # 实时落盘：新友台抄收即写入
+
+    def _replace_checkin(self, call, signal, wav, raw, session, score):
+        """同 session 重报不同呼号（同一友台，前一次为 ASR 识别错误/口头重报）：
+        用新呼号替换当前友台旧记录，重新抄收。CSV 里只留正确呼号，不排队不打断。"""
+        cur = (self._current_call or "").upper()
+        logger.info(f"同台友台重报呼号（识别修正）: {cur} → {call.upper()}")
+        for i, e in enumerate(self._checked_in):
+            if e[0].upper() == cur:
+                self._checked_in.pop(i)
+                break
+        self._checked_calls.discard(cur.upper())
+        self._fields.pop(cur.upper(), None)
+        self._asked_fields.pop(cur.upper(), None)   # 追问计数随旧记录清除
+        self._checkin_times.pop(cur.upper(), None)
+        self._current_call = None     # 由 _do_checkin 重建上下文
+        self._current_session = None
+        self._current_entry = None
+        self._do_checkin(call, signal, wav, raw, session, score)
 
     def _queue_interloper(self, call, signal, raw, session):
         """当前友台进行中收到新呼号（插队）：静默记录到点名 CSV，不播报回应、

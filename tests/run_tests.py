@@ -693,15 +693,16 @@ def test_same_session_new_call():
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     sess._asr_text = lambda p: "我的QTH在咸阳市"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    # 同 session 新友台补报完整呼号 → 不被补充信息吞；BH3XX 流程未收尾
-    # → 新行为：静默入册+排队（插队），不打断当前友台
+    # 同 session 新友台补报完整呼号 → 不被补充信息吞；同 session 重报不同呼号
+    # = 同一友台识别修正 → 替换旧记录（CSV 只留正确呼号）
     sess._asr_text = lambda p: "这里是BJ九EFU，能否超收"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    check("新呼号被入册", [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"],
+    check("同session重报替换旧呼号",
+          [c for c, *_ in sess._checked_in] == ["BJ9EFU"],
           f"checked={sess._checked_in}")
-    check("插队排队不切换", sess._current_call == "BH3XX"
-          and [w["call"] for w in sess._waiting] == ["BJ9EFU"],
-          f"call={sess._current_call} waiting={sess._waiting}")
+    check("替换后当前为正确呼号", sess._current_call == "BJ9EFU"
+          and "BH3XX" not in sess._checked_calls,
+          f"call={sess._current_call} checked_calls={sess._checked_calls}")
 
 
 def test_echo_other_speaker():
@@ -878,6 +879,29 @@ def test_interloper_queued():
           f"spoken={spoken}")
 
 
+def test_same_session_replace():
+    print("[同 session 重报不同呼号 = 识别修正替换（如 ASR 把 BFZ 听成 BLZ 后重报）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    # 第一次识别错误：BLZ（session=7）
+    sess._asr_text = lambda p: "主控主控，这里是BG九BLZ请求参加测试点名"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("错误呼号先被抄收", sess._current_call == "BG9BLZ", f"cur={sess._current_call}")
+    # 同 session 重报正确呼号 BFZ → 替换，CSV 只留 BFZ
+    sess._asr_text = lambda p: "主控，我的呼号是B G九B F Z，Bravo Golf Nine Bravo Foxtrot Zulu"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("同session重报替换",
+          [c for c, *_ in sess._checked_in] == ["BG9BFZ"]
+          and sess._current_call == "BG9BFZ"
+          and "BG9BLZ" not in sess._checked_calls,
+          f"checked={sess._checked_in} cur={sess._current_call}")
+    # 不播报请重复/不排队（走正常抄收确认）
+    check("替换后正常抄收确认", any("Foxtrot Zulu" in s and "抄收" in s for s in spoken),
+          f"spoken={spoken}")
+
+
 def test_idle_recall():
     print("[空闲重新呼叫：点名中长时间无应答 → 重播开场呼叫]")
     sess = net_control.NetControlSession(link=None)
@@ -981,6 +1005,7 @@ def main():
                test_llm_call_cap, test_tts_synth_drains_queue,
                test_speech_supersede_waits,
                test_interloper_queued, test_idle_recall,
+               test_same_session_replace,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
