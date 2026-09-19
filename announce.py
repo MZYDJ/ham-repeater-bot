@@ -146,11 +146,21 @@ def tts_cache_path(text: str) -> Path:
     """TTS 缓存文件路径（以播报文本 md5 为键）"""
     return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
 def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) -> str:
-    """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试"""
+    """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试。
+    引擎由 tts.engine 统一决定（点名/定时播报/蓄水池同一引擎）：
+    - cosyvoice（默认）→ 阿里云百炼 CosyVoice（net_control.synth_text，复用 asr.api_key，
+      快且稳；edge-tts 网络不可达时不再空转重试）
+    - edge → Edge-TTS 兜底"""
     if max_retries is None:
         max_retries = TTS_MAX_RETRIES
     if retry_delay is None:
         retry_delay = TTS_RETRY_DELAY
+    if direct_announce.cfg_get("tts", "engine", default="cosyvoice") == "cosyvoice":
+        # 延迟 import 避免模块级循环依赖（net_control 亦 import direct_announce）
+        import net_control
+        return net_control.synth_text(
+            text, max_retries=max_retries, retry_delay=retry_delay,
+            timeout_inner=TTS_TIMEOUT_INNER, timeout_join=TTS_TIMEOUT_JOIN)
     cache_path = tts_cache_path(text)
     # 缓存命中时用 libmpg123 完整解码 dry-run 校验（识别头部损坏+尾部截断不完整），
     # 空/损坏文件视为无效，删除后重新合成
