@@ -1500,9 +1500,10 @@ class NetControlSession:
             self._speak(self._fmt(tmpl, call=self._current_call,
                 call_phonetic=callsign_phonetic(self._current_call),
                 info=info))
-        # 结构化信息仍未记全 → 追问缺失项（每字段最多问一次），齐了才请下一位
-        if self._ask_missing(self._current_call):
-            return
+        # 注意：这里不再立即追问缺失字段（旧逻辑播完"是否正确？Over"后马上
+        # 追一句"请补充信号、QTH、功率"，实测 22:06:16→22:06:34 主控连播两句、
+        # 友台还没回答"是否正确"就被抢话）——友台先回答"是否正确/继续补充"，
+        # 确认后（_process_segment 确认分支）再按缺失字段追问，节奏才正常。
 
     def _ask_missing(self, call):
         """结构化信息未记全 → 主动追问缺失项（每字段每友台最多问一次，防无限循环）。

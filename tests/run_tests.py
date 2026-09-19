@@ -355,12 +355,20 @@ def test_retry_reset():
           and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
           f"spoken={spoken} entry={sess._current_entry}")
     sess._flush_pending_report(force=True)
-    check("合并确认含全部字段", len(spoken) == 4 and "信息已记录" in spoken[2]
+    check("合并确认含全部字段", len(spoken) == 3 and "信息已记录" in spoken[2]
           and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
           and "功率 5 瓦" in spoken[2],
           f"spoken={spoken}")
     check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
-    check("缺 QTH 主动追问", "请再补充您的QTH" in spoken[3],
+    # 合并确认后不再立即追问缺失字段（22:06:16→22:06:34 主控连播两句抢话）；
+    # 缺失项等友台确认（"正确"）后再追问
+    check("合并确认后不立即追问", len(spoken) == 3,
+          f"spoken={spoken}")
+
+    # 段3b：友台确认"正确" → 缺失字段（QTH）此时追问
+    sess._asr_text = lambda pcm: "正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("确认后追问缺失字段", len(spoken) == 4 and "请再补充您的QTH" in spoken[3],
           f"spoken={spoken}")
 
     # 段4：新 session 无呼号（新友台没报呼号）→ 引导报呼号
@@ -933,16 +941,17 @@ def test_report_merged_confirm():
     sess._asr_text = lambda p: "QTH团结路"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
     check("第三段仍不播报", len(spoken) == n0, f"spoken={spoken}")
-    # 停稳超过合并窗口 → 播一次合并确认（含全部字段）+ 缺失字段追问
+    # 停稳超过合并窗口 → 播一次合并确认（含全部字段）；缺失字段不再立即追问
+    # （等友台确认后追问，实测 22:06:16→22:06:34 连播两句抢话的根因）
     time.sleep(0.8)
     sess._flush_pending_report()
     check("合并确认只播一次且含全部字段",
-          len(spoken) == n0 + 2 and "设备 全胜U2" in spoken[n0]
+          len(spoken) == n0 + 1 and "设备 全胜U2" in spoken[n0]
           and "功率 5 瓦" in spoken[n0] and "QTH 团结路" in spoken[n0],
           f"spoken={spoken}")
     # 再次 flush（无新内容）→ 不重复播
     sess._flush_pending_report(force=True)
-    check("无新内容不重复确认", len(spoken) == n0 + 2, f"spoken={spoken}")
+    check("无新内容不重复确认", len(spoken) == n0 + 1, f"spoken={spoken}")
 
 
 def test_join_intent_guide():
