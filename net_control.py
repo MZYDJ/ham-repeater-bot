@@ -2136,40 +2136,32 @@ class NetControlSession:
                         return
                     try:
                         if s is None:          # 无常驻链路（独立运行场景）：临时短链
-                            if self.link is not None and hasattr(self.link, "suspend"):
-                                self.link.suspend()   # 挂起常驻，防同账号互踢
-                            # 短链抢麦可能因连接抖动失败（实测 20:51:36 "已经抄收过"
-                            # 播报被吞）→ 换新连接重试一次，避免整句丢失
-                            last_err = None
-                            for _try in range(2):
-                                s2 = direct_announce.DirectAnnouncer(
-                                    username=direct_announce.cfg_get(
-                                        "talk", "username", default=""),
-                                    password=direct_announce.cfg_get(
-                                        "talk", "password", default=""))
-                                try:
-                                    with contextlib.redirect_stdout(_StdoutToLogger(logger)):
-                                        s2.connect()
-                                        s2.take_mic()
-                                        s2.play(packets)
-                                    break
-                                except Exception as e:
-                                    last_err = e
-                                    try:
-                                        s2.close()
-                                    except Exception:
-                                        pass
-                            else:
-                                logger.error(f"点名播报短链重试仍失败: {last_err}")
-                            if self.link is not None and hasattr(self.link, "resume"):
-                                self.link.resume()   # 临时链已断开，恢复常驻保活
+                            self._play_shortlink(packets)
                             return
                         # 发射中兜底：检测到他人语音立即放麦让位，不压对方
                         self._preempted.clear()
-                        with contextlib.redirect_stdout(_StdoutToLogger(logger)):
-                            s.take_mic()
-                            ok = s.play(packets,
-                                        abort_check=lambda: self._preempted.is_set())
+                        try:
+                            with contextlib.redirect_stdout(_StdoutToLogger(logger)):
+                                s.take_mic()
+                                ok = s.play(packets,
+                                            abort_check=lambda: self._preempted.is_set())
+                        except Exception as e:
+                            # 常驻抢麦失败（6s 无回执）：信道被真实占用但信令/VAD
+                            # 未检出（中继转发下行收不到对方语音）、或服务器瞬时
+                            # 不给麦（实测 20:30 准点播报失败后现场流程可成功；
+                            # 20:07/20:51/22:22 点名播报失败后整句丢失）→ 延迟
+                            # 3s 让服务器/信道让位，短链兜底重试，不丢关键播报。
+                            if self._speech_seq > my_seq:
+                                logger.info("常驻抢麦失败，期间已有更新播报，放弃本句")
+                                return
+                            logger.warning(f"常驻抢麦失败，3s 后短链兜底重试: {e}")
+                            self.link.release()
+                            time.sleep(3.0)
+                            if self._speech_seq > my_seq:
+                                logger.info("常驻抢麦失败，期间已有更新播报，放弃本句")
+                                return
+                            self._play_shortlink(packets)
+                            return
                         play_box["ok"] = ok
                         if not ok:
                             logger.warning("点名播报被他人讲话抢占，"
@@ -2187,6 +2179,38 @@ class NetControlSession:
         pt.start()
         self._drain_queue(depth=1)   # 发射期间继续识别（嵌套播报经 _play_lock 排队）
         self._pump_until(pt, 60)     # 发射期间持续收尾/识别
+
+    def _play_shortlink(self, packets):
+        """临时短链播报（常驻不可用/抢麦失败兜底）：
+        suspend 挂起常驻（防同账号互踢）→ 换新连接重试 ≤2 次 → resume。
+        短链抢麦可能因连接抖动失败（实测 20:51:36 播报被吞）→ 换新连接重试，
+        避免整句丢失。返回 True=成功。"""
+        if self.link is not None and hasattr(self.link, "suspend"):
+            self.link.suspend()
+        last_err = None
+        for _try in range(2):
+            s2 = direct_announce.DirectAnnouncer(
+                username=direct_announce.cfg_get("talk", "username", default=""),
+                password=direct_announce.cfg_get("talk", "password", default=""))
+            try:
+                with contextlib.redirect_stdout(_StdoutToLogger(logger)):
+                    s2.connect()
+                    s2.take_mic()
+                    s2.play(packets)
+                if self.link is not None and hasattr(self.link, "resume"):
+                    self.link.resume()   # 临时链已断开，恢复常驻保活
+                return True
+            except Exception as e:
+                last_err = e
+                try:
+                    s2.close()
+                except Exception:
+                    pass
+        if last_err is not None:
+            logger.error(f"点名播报短链重试仍失败: {last_err}")
+        if self.link is not None and hasattr(self.link, "resume"):
+            self.link.resume()   # 临时链已断开，恢复常驻保活
+        return False
 
     # ---------- 点名记录 CSV 实时落盘 ----------
     # 点名一开始就创建文件（写表头），此后每次抄收/补充信息立即全量重写。
