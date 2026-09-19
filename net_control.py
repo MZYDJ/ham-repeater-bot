@@ -704,7 +704,10 @@ def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
                                     default="cosyvoice-v3.5-flash")
     voice = direct_announce.cfg_get("tts", "cosyvoice_voice", default="")
     if not api_key or not voice:
-        raise RuntimeError("CosyVoice 未配置：asr.api_key 或 tts.cosyvoice_voice")
+        missing = [f for f, v in (("asr.api_key", api_key),
+                                  ("tts.cosyvoice_voice", voice)) if not v]
+        raise RuntimeError("CosyVoice 未配置：" + "、".join(missing)
+                           + "（config.json 中该字段为空或缺失）")
     dashscope.api_key = api_key
     try:
         synthesizer = SpeechSynthesizer(
@@ -750,7 +753,10 @@ def _cosyvoice_synth(text, cache_path, timeout=28):
         "https://dashscope.aliyuncs.com/api/v1/services/"
         "aigc/multimodal-generation/generation"))
     if not api_key or not voice:
-        raise RuntimeError("CosyVoice 未配置：asr.api_key 或 tts.cosyvoice_voice")
+        missing = [f for f, v in (("asr.api_key", api_key),
+                                  ("tts.cosyvoice_voice", voice)) if not v]
+        raise RuntimeError("CosyVoice 未配置：" + "、".join(missing)
+                           + "（config.json 中该字段为空或缺失）")
     payload = {
         "model": model,
         "input": {"text": text, "voice": voice},
