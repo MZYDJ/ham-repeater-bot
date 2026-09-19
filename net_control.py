@@ -904,6 +904,9 @@ class NetControlSession:
         self._current_call = None           # 当前台上友台呼号（大写）
         self._current_session = None        # 抄收该呼号的语音段来源 session
         self._current_entry = None          # 指向 _checked_in 中该友台的条目（引用）
+        self._current_active = False        # 当前友台流程进行中（抄收→追问→确认窗口）：
+                                            # 期间收到新呼号视为插队→静默记录+排队，不打断
+        self._waiting = []                  # 等候排队的插队者（{"call","signal","session"}）
         # 结构化字段永久化：呼号 → {qth, device, antenna, power, signal}（CSV 导出用）
         self._fields = {}
         self._checkin_times = {}            # 呼号 → 抄收时刻 ISO 串（CSV 导出用）
@@ -1021,11 +1024,13 @@ class NetControlSession:
         quiet_end = float(nc_cfg("quiet_end_seconds", default=10))
         grace = float(nc_cfg("grace_seconds", default=300))
         max_count = int(nc_cfg("max_checked_in", default=200))
+        idle_gap = float(nc_cfg("idle_call_seconds", default=300))   # 空闲多久重新呼叫
+        last_idle_call = start
         deadline = start + max(max_net, min_window)
         hard = deadline + grace
         logger.info(f"点名开放收听：最短 {min_window:.0f}s，总时长 {max_net:.0f}s，"
                     f"到点后连续 {quiet_end:.0f}s 无应答即收尾"
-                    f"（硬上限 {hard - start:.0f}s）")
+                    f"（硬上限 {hard - start:.0f}s；空闲 {idle_gap:.0f}s 重新呼叫）")
         while not self._stop.is_set():
             now = time.time()
             if len(self._checked_in) >= max_count:
@@ -1036,6 +1041,18 @@ class NetControlSession:
             if now >= deadline and now - self._last_activity >= quiet_end:
                 logger.info(f"已到点名总时长，且连续 {quiet_end:.0f}s 无应答，收尾")
                 break
+            # 空闲重新呼叫：长时间无应答活动 → 重播点名开始时的呼叫，邀请友台上台
+            # （播报后的中继回波/应答会刷新 _last_activity，自然不会连续重播）
+            if now - self._last_activity >= idle_gap \
+                    and now - last_idle_call >= idle_gap:
+                logger.info(f"点名已空闲 {now - self._last_activity:.0f}s，"
+                            f"重新呼叫（{idle_gap:.0f}s 无应答）")
+                self._speak(self._fmt(nc_cfg("idle_call_text", default=(
+                    "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是{net_name}，"
+                    "我是主控{ctrl_call}，点名继续开放，请抄收到信号的友台依次上台报告"
+                    "呼号、QTH、使用设备、天线、功率，这里是{ctrl_phonetic} {ctrl_call}，Over")),
+                    ))
+                last_idle_call = now
             try:
                 pcm16, dur, wav, session = self._seg_queue.get(timeout=1.0)
             except queue.Empty:
@@ -1110,8 +1127,12 @@ class NetControlSession:
             self._speak(self._fmt(nc_cfg("dup_text", default="{call_phonetic} 已经抄收过，"
                                                              "请下一位友台。"),
                                   call=call, call_phonetic=callsign_phonetic(call)))
+            self._end_current()        # 重复抄收=收尾窗口，轮到排队中的下一位
             return
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
+            if self._current_active:
+                # 当前友台正在抄收/追问/确认中：新呼号=插队，静默记录+排队，不打断
+                return self._queue_interloper(call, signal, raw, session)
             return self._do_checkin(call, signal, wav, raw, session, score)
         # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
         # 点名流程中友台报完呼号后，补充 QTH/设备/天线/功率时通常不再重复呼号
@@ -1165,6 +1186,7 @@ class NetControlSession:
                             "抄收，{call_phonetic}，呼号确认无误，信息已记录，请下一位友台。Over"),
                             call=self._current_call,
                             call_phonetic=callsign_phonetic(self._current_call)))
+                        self._end_current()   # 收尾窗口：轮到排队中的下一位
                         return
                     if is_duplicate(new_call, self._checked_calls):
                         logger.info(f"重复抄收 {new_call}（纠正提取），跳过")
@@ -1174,6 +1196,7 @@ class NetControlSession:
                         self._speak(self._fmt(nc_cfg("dup_text", default=
                             "{call_phonetic} 已经抄收过，请下一位友台。"),
                             call=new_call, call_phonetic=callsign_phonetic(new_call)))
+                        self._end_current()   # 收尾窗口：轮到排队中的下一位
                         return
                     # 替换抄收：纠正=之前抄错，用新呼号替换当前友台旧记录
                     for i, e in enumerate(self._checked_in):
@@ -1209,6 +1232,7 @@ class NetControlSession:
                     "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
+                self._end_current()   # 确认收尾：轮到排队中的下一位（若有）
                 return
             # 结构化字段提取：确认的是结构化内容（QTH/设备/天线/功率/信号），
             # 不再把整句话原样复诵（实测 19:47 "主控是否抄收"被复诵成废话）
@@ -1339,10 +1363,15 @@ class NetControlSession:
             call=call, call_phonetic=callsign_phonetic(call), missing=labels))
         return True
 
-    def _do_checkin(self, call, signal, wav, raw, session, score):
-        """抄收一位友台：入册 + 恢复额度 + 建立当前友台上下文 + 播确认 + 实时落盘。"""
-        entry = [call, signal or "", wav or "", raw or "", ""]
-        self._checked_in.append(entry)
+    def _do_checkin(self, call, signal, wav, raw, session, score, entry=None):
+        """抄收一位友台：入册 + 恢复额度 + 建立当前友台上下文 + 播确认 + 实时落盘。
+        entry 传入时复用该条目（插队者此前已静默记录，正式轮到时不再重复入册）。"""
+        if entry is None:
+            entry = [call, signal or "", wav or "", raw or "", ""]
+            self._checked_in.append(entry)
+        else:
+            if signal and not entry[1]:
+                entry[1] = signal          # 插队占位时缺信号，正式抄收补记
         self._checked_calls.add(call.upper())
         # 呼号段若已含结构化信息（"我的QTH在…"）一并记录
         fd = dict(extract_report_fields(raw))
@@ -1357,6 +1386,7 @@ class NetControlSession:
         self._current_call = call.upper()
         self._current_session = session
         self._current_entry = entry
+        self._current_active = True        # 抄收→追问→确认窗口：期间新呼号=插队，不打断
         self._asked_fields.setdefault(call.upper(), set())  # 结构化追问独立计数
         ack = self._fmt(nc_cfg("ack_text", default=
             "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
@@ -1365,6 +1395,36 @@ class NetControlSession:
         logger.info(f"抄收 {call} 信号 {signal or '—'}（置信度 {score}）")
         self._speak(ack)
         self._flush_csv()          # 实时落盘：新友台抄收即写入
+
+    def _queue_interloper(self, call, signal, raw, session):
+        """当前友台进行中收到新呼号（插队）：静默记录到点名 CSV，不播报回应、
+        不强调秩序，加入等候队列；当前友台收尾后自动轮到（不丢不打断）。"""
+        call = (call or "").upper()
+        if not call:
+            return
+        if call in self._checked_calls \
+                or any(w["call"] == call for w in self._waiting):
+            logger.info(f"插队呼号 {call} 已在册/等待中，忽略")
+            return
+        entry = [call, signal or "", "", "", ""]   # 记录到文件（全量落盘随 _flush_csv）
+        self._checked_in.append(entry)
+        self._waiting.append({"call": call, "signal": signal or "", "session": session})
+        logger.info(f"当前友台 {self._current_call} 进行中，{call} 插队已静默记录，等候排队")
+        self._flush_csv()
+
+    def _end_current(self):
+        """当前友台流程收尾：解除进行中状态；若有人在等候排队，自动轮到下一位。"""
+        self._current_active = False
+        if self._waiting:
+            self._serve_next_waiting()
+
+    def _serve_next_waiting(self):
+        """轮到等候排队的下一位插队者：正式抄收（复用已记录的占位条目，播确认）。"""
+        w = self._waiting.pop(0)
+        entry = next((e for e in self._checked_in if e[0].upper() == w["call"]), None)
+        logger.info(f"轮到排队友台 {w['call']} 正式抄收")
+        self._do_checkin(w["call"], w.get("signal", ""), None, "",
+                         w.get("session"), 100, entry=entry)
 
     def _looks_like_report(self, raw):
         """LLM 兜底触发预检：只有文本"看起来像"点名应答（含解释法词/呼号特征/

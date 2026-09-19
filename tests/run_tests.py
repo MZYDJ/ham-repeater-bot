@@ -693,13 +693,15 @@ def test_same_session_new_call():
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     sess._asr_text = lambda p: "我的QTH在咸阳市"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    # 同 session 新友台补报完整呼号 → 应重新抄收而非归入 BH3XX 补充信息
+    # 同 session 新友台补报完整呼号 → 不被补充信息吞；BH3XX 流程未收尾
+    # → 新行为：静默入册+排队（插队），不打断当前友台
     sess._asr_text = lambda p: "这里是BJ九EFU，能否超收"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    check("新呼号被抄收", [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"],
+    check("新呼号被入册", [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"],
           f"checked={sess._checked_in}")
-    check("上下文切换", sess._current_call == "BJ9EFU",
-          f"call={sess._current_call}")
+    check("插队排队不切换", sess._current_call == "BH3XX"
+          and [w["call"] for w in sess._waiting] == ["BJ9EFU"],
+          f"call={sess._current_call} waiting={sess._waiting}")
 
 
 def test_echo_other_speaker():
@@ -837,6 +839,67 @@ def test_speech_supersede_waits():
     check("信道空闲立即发射", sess._wait_channel_idle(drain=False, newer_than=5) is True)
 
 
+def test_interloper_queued():
+    print("[插队：当前友台进行中，新呼号静默记录+排队，收尾后轮候]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    # A 正常抄收（进入进行中状态）
+    sess._asr_text = lambda p: "这里是BG9ABC"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 抄收且进行中", sess._current_active and
+          [c for c, *_ in sess._checked_in] == ["BG9ABC"], f"checked={sess._checked_in}")
+    # B 插队：高分新呼号 → 不播报、入册、排队
+    n0 = len(spoken)
+    sess._asr_text = lambda p: "这里是BG9XYZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("插队静默不播报", len(spoken) == n0, f"spoken={spoken}")
+    check("插队已入册", [c for c, *_ in sess._checked_in] == ["BG9ABC", "BG9XYZ"],
+          f"checked={sess._checked_in}")
+    check("插队已排队", [w["call"] for w in sess._waiting] == ["BG9XYZ"],
+          f"waiting={sess._waiting}")
+    # 重复插队忽略（不重复入册/排队）
+    sess._asr_text = lambda p: "BG9XYZ再次呼叫"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=9)
+    check("重复插队忽略", len(sess._waiting) == 1 and len(sess._checked_in) == 2,
+          f"waiting={sess._waiting} checked={sess._checked_in}")
+    # A 补充全部字段后确认 → 收尾 → B 自动轮候正式抄收（播 ack）
+    sess._fields["BG9ABC"] = {"signal": "59", "qth": "咸阳", "device": "手机",
+                              "antenna": "无", "power": "5瓦"}
+    sess._asr_text = lambda p: "完全正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 确认后轮到 B 正式抄收",
+          [c for c, *_ in sess._checked_in] == ["BG9ABC", "BG9XYZ"]
+          and not sess._waiting and sess._current_call == "BG9XYZ",
+          f"checked={sess._checked_in} waiting={sess._waiting} cur={sess._current_call}")
+    check("B 已播确认", any("X-ray Yankee Zulu" in s and "抄收" in s for s in spoken)
+          and sess._current_call == "BG9XYZ",
+          f"spoken={spoken}")
+
+
+def test_idle_recall():
+    print("[空闲重新呼叫：点名中长时间无应答 → 重播开场呼叫]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW", "repeater_call": "BR9AB",
+                     "net_name": "测试点名", "ctrl_phonetic": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    import threading as _th
+    sess._stop = _th.Event()
+    import direct_announce as _da
+    _da.CFG.setdefault("net_control", {})["idle_call_seconds"] = 1
+    _da.CFG.setdefault("net_control", {})["max_net_seconds"] = 60
+    t = _th.Timer(2.5, sess._stop.set)
+    t.start()
+    try:
+        sess._run_open()
+    finally:
+        t.cancel()
+    check("空闲 1s 后重播呼叫", any("CQ" in s for s in spoken), f"spoken={spoken}")
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -917,6 +980,7 @@ def main():
                test_echo_other_speaker, test_llm_fallback, test_vad_stuck_release,
                test_llm_call_cap, test_tts_synth_drains_queue,
                test_speech_supersede_waits,
+               test_interloper_queued, test_idle_recall,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
