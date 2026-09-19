@@ -625,15 +625,16 @@ def test_wait_channel_idle():
 
 
 def test_echo_filter():
-    print("[中继台回波过滤 _is_echo]")
+    print("[中继台回波过滤 _is_echo（简化：仅短段+空文本）]")
     sess = net_control.NetControlSession(link=None)
     sess._speak = lambda t: None
     check("未发射过非回波", not sess._is_echo("", 0.6))
     sess._last_tx_end = time.time()
-    sess._last_spoken_text = "这里是BI9BZW，抄收你的信号，请报告QTH"
     check("窗口内短空段→回波", sess._is_echo("", 0.5), f"last={sess._last_tx_end}")
-    check("文本重合→回波", sess._is_echo("抄收你的信号", 0.8))
-    check("文本不重合→非回波", not sess._is_echo("这里是BH3XX信号59", 0.8))
+    check("窗口内短段有文字→非回波（回波无长文字，实测结论）",
+          not sess._is_echo("抄收你的信号", 0.8))
+    check("窗口内短段有呼号→非回波",
+          not sess._is_echo("这里是BH3XX信号59", 0.8))
     check("段太长→非回波", not sess._is_echo("", 3.0))
     sess._last_tx_end = time.time() - 10
     check("超时窗外→非回波", not sess._is_echo("", 0.5))
@@ -1149,7 +1150,6 @@ def test_spell_merge_retry():
     check("拼读段不刷请重复", len(spoken) == n0, f"spoken={spoken}")
     # 友台拼完停顿 → 主循环空闲轮 flush → 合并解出 BG9BFZ
     sess._spell_buf[5]["ts"] -= 5.0   # 模拟停顿超过 spell_gap_seconds
-    sess._seg_end_at[5] = sess._seg_end_at[5] - 5.0   # 回波窗口同步回拨（真实停顿>4s）
     sess._spell_flush_all()
     check("拼读合并解出 BG9BFZ",
           sess._current_call == "BG9BFZ"
@@ -1173,7 +1173,6 @@ def test_spell_merge_not_half():
         sess._asr_text = lambda p, t=pt: t
         sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
     sess._spell_buf[6]["ts"] -= 5.0
-    sess._seg_end_at[6] = sess._seg_end_at[6] - 5.0
     sess._spell_flush_all()
     check("半截 BG9B 不误抄",
           sess._current_call is None
@@ -1184,7 +1183,6 @@ def test_spell_merge_not_half():
         sess._asr_text = lambda p, t=pt: t
         sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
     sess._spell_buf[6]["ts"] -= 5.0
-    sess._seg_end_at[6] = sess._seg_end_at[6] - 5.0
     sess._spell_flush_all()
     check("重新完整拼读解出 BG9BFZ",
           sess._current_call == "BG9BFZ"

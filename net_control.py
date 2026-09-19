@@ -425,7 +425,7 @@ class VoiceCapture:
                  max_segment_ms=None, out_rate=16000, save_dir=None, on_segment=None,
                  ptt_release_delay_ms=None):
         self.threshold = threshold if threshold is not None else nc_cfg("vad_threshold", default=800)
-        self.silence_end_ms = silence_end_ms if silence_end_ms is not None else nc_cfg("silence_end_ms", default=1000)
+        self.silence_end_ms = silence_end_ms if silence_end_ms is not None else nc_cfg("silence_end_ms", default=2000)
         self.min_segment_ms = min_segment_ms if min_segment_ms is not None else nc_cfg("min_segment_ms", default=400)
         self.max_segment_ms = max_segment_ms if max_segment_ms is not None else nc_cfg("max_segment_ms", default=15000)
         # PTT 抬起后延迟收尾（毫秒）：对方松 PTT 后不立即切段，再等这段窗口内的
@@ -990,15 +990,12 @@ class NetControlSession:
         self._checkin_times = {}            # 呼号 → 抄收时刻 ISO 串（CSV 导出用）
         self._csv_path = None               # 实时点名记录 CSV 路径（点名开始即建，持续更新）
         self._last_tx_end = None            # 最近一次发射结束时刻（中继台回波过滤用）
-        self._last_spoken_text = ""         # 最近一次播报文本（回波文本重合判定用）
         self._speech_seq = 0                # 播报序号：新话术生成即 +1；等待发射的旧话术
                                             # 检测到序号前进就放弃（只播最新，接话不滞后）
         self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
         self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
         self._talking_active = {}               # session → 最后语音活动时刻（陈旧超时用）
-        self._seg_end_at = {}                   # session → 上一段切出时刻（对方回波过滤用）
-        self._seg_text = {}                     # session → 上一段 ASR 文本
         self._ever_talk = False                 # 本会话是否收到过任何开始讲话信令
         self._gate_started = time.time()
         self._preempted = threading.Event()     # 播报发射中检测到他人讲话（抢占让位）
@@ -1070,6 +1067,19 @@ class NetControlSession:
         try:
             self._ensure_capture()
             self._ensure_csv()          # 实时记录：点名一开始即建 CSV，中断也不丢
+            # 点名接收侧复用常驻链路（_on_downlink 挂在 PersistentAnnouncer 上）：
+            # 开场白前先等常驻就绪（最多 8s），避免 ensure_session 不健康走临时
+            # 短链 → suspend 断开常驻 → 开场白后重连空窗漏掉友台首答
+            # （实测 21:12:14 开场白 → 21:12:16 重连，2s 空窗）。
+            if self.link is not None:
+                for _ in range(8):
+                    if self._stop.is_set():
+                        break
+                    s = self.link.ensure_session()
+                    if s is not None:
+                        self.link.release()
+                        break
+                    time.sleep(1.0)
             self._speak(self._fmt(nc_cfg("opening_text", default=
                 "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是每周{weekday}晚"
                 "{net_name}，我是今晚主控{ctrl_call}，今天是{date}，现在是北京时间{time}，"
@@ -1172,9 +1182,6 @@ class NetControlSession:
         self._last_activity = time.time()
         logger.info(f"收到应答段 {dur:.1f}s（{Path(wav).name if wav else '未落盘'}）"
                     f"{' session=' + str(session) if session is not None else ''}")
-        # 该 session 上一段切出时刻与文本（供本段的"对方回波"过滤比对；
-        # 记录的是上一段，当前段处理完再更新，供下一段比对）
-        prev_end = self._seg_end_at.get(session) if session is not None else None
         raw = self._asr_text(pcm16)
         logger.info(f"ASR: {raw}")
         res = decode_callsign(raw, regex=nc_cfg("callsign_regex", default=""))
@@ -1185,14 +1192,10 @@ class NetControlSession:
         # 友台 A 讲完（"这里是BG9AA"）B 立即报名（"这里是BG9BB"），模板化开场
         # 文本重合≥70% + 同 session → 若按旧逻辑 B 的报名被当 A 的回波静默吞掉。
         if (call is None or call.upper() in self._checked_calls) \
-                and self._is_echo(raw, dur, session, prev_end):
+                and self._is_echo(raw, dur):
             logger.info(f"疑似中继台回波，忽略（{raw!r} dur={dur:.1f}s"
                         f"{' session=' + str(session) if session is not None else ''}）")
             return
-        # 当前段处理完毕，更新记录供下一段回波比对
-        if session is not None:
-            self._seg_end_at[session] = time.time()
-            self._seg_text[session] = raw
         thr = int(nc_cfg("confidence_threshold", default=60))
         # 空/纯语气词段（放麦尾音、环境声、回波残余）→ 静默：
         # 不播"请重复呼号"、不消耗重复请求额度（实测 20:15 放麦后 0.6s 空段
@@ -2064,7 +2067,6 @@ class NetControlSession:
             return
         text = text.strip()
         logger.info(f"点名播报: {text}")
-        self._last_spoken_text = text      # 回波过滤：与紧随其后收到的短段比对
         self._speech_seq += 1              # 新话术序号：旧话术等待发射时据此让位
         my_seq = self._speech_seq
         mp3 = ""
@@ -2260,55 +2262,21 @@ class NetControlSession:
             logger.warning(f"点名记录导出失败: {e}")
             return None
 
-    def _is_echo(self, raw, dur, session=None, prev_end=None):
-        """中继台回波过滤，两类来源（任一命中即丢弃）：
-        ① 自己发射后紧接的短段（自身语音经中继台转回）：时间窗口内
-           （echo_holdoff_seconds 默认 1.5s）+ 段长较短（≤1.5s）+ 文本为空或
-           与刚播报文本连续重合 ≥70%。
-        ② 任一说话人讲完后的短段（对方 PTT 松开后，其语音尾巴/末句也经
-           中继台转回，实测 <1s）：距该 session 上一段切出 ≤1.5s + 段短
-           + 文本为空或与上一段文本连续重合 ≥70%。"""
+    def _is_echo(self, raw, dur):
+        """中继台回波过滤（简化版）：只判"自己发射后 holdoff 窗口内的短段"。
+        回波实测是 0.6s 级的尾音/杂音，**不会有可识别出文字的长回波**
+        （用户实测结论）——能识别出文字的段（哪怕 ≤1.5s）一律走正常流程：
+        新呼号跳过（_process_segment 已按 call 判断）、主控呼号忽略、空段
+        静默忽略，各分支已兜住。
+        不再使用文本重合判据：模板化开场"这里是BG9xx"与上段/播报文本连续
+        重合 ≥70%，会把第二位友台报名、拼读重拼首段误杀（21:12-21:16 实测）。"""
         holdoff = float(nc_cfg("echo_holdoff_seconds", default=1.5))
         maxseg = float(nc_cfg("echo_segment_max_seconds", default=1.5))
-        # ① 自己发射后（文本与刚播报内容比对）
         if self._last_tx_end is not None:
             if (time.time() - self._last_tx_end <= holdoff
-                    and dur <= maxseg and self._text_overlap(raw,
-                        self._last_spoken_text)):
-                return True
-        # ② 对方讲完后（文本与上一段比对；prev_end 由调用方传入，即
-        #    该 session 上一段切出时刻，避免把当前段自己误当"上一段"）。
-        #    拼读会话中（该 session 有未处理拼读缓存）跳过判据②：拼读段都是
-        #    短段+短文本+同 session，逐字母重拼时首段与上段文本常完全一致
-        #    （"Bravo"…"Bravo"），按旧逻辑会被当尾音回波误杀。
-        if (session is not None and prev_end is not None
-                and session not in self._spell_buf):
-            prev_text = self._seg_text.get(session, "")
-            if (time.time() - prev_end <= holdoff
-                    and dur <= maxseg
-                    and self._text_overlap(raw, prev_text)):
+                    and dur <= maxseg and not (raw or "").strip()):
                 return True
         return False
-
-    @staticmethod
-    def _text_overlap(raw, prev):
-        """回波文本判据：空文本 或 与参考文本最长连续重合 ≥70%。
-        参考文本为空时仅空文本算回波。"""
-        if not (raw or "").strip():
-            return True
-        if not prev:
-            return False
-        short, long_ = (raw, prev) if len(raw) <= len(prev) else (prev, raw)
-        best = 0
-        for i in range(len(short)):
-            for j in range(len(long_)):
-                k = 0
-                while (i + k < len(short) and j + k < len(long_)
-                       and short[i + k] == long_[j + k]):
-                    k += 1
-                if k > best:
-                    best = k
-        return best and best / max(1, len(short)) >= 0.7
 
     def _teardown(self):
         if self.link is not None and self.link._on_downlink is self._on_downlink:
