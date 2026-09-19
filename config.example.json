@@ -13,7 +13,16 @@
     }
   },
   "tts": {
+    "engine": "cosyvoice",
     "voice": "zh-CN-XiaoxiaoNeural",
+    "cosyvoice_model": "cosyvoice-v3.5-flash",
+    "cosyvoice_voice": "",
+    "cosyvoice_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+    "cosyvoice_format": "mp3",
+    "cosyvoice_sample_rate": 24000,
+    "cosyvoice_volume": 50,
+    "cosyvoice_rate": 1.0,
+    "cosyvoice_pitch": 1.0,
     "timeout_inner": 28,
     "timeout_join": 30,
     "max_retries": 3,

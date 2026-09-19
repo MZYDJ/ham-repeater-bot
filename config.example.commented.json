@@ -19,14 +19,27 @@
 
   // ==================== tts：语音合成（Edge-TTS） ====================
   "tts": {
-    "voice": "zh-CN-XiaoxiaoNeural", // 播报用的语音角色（微软晓晓），可换 zh-CN-YunxiNeural 等
-    "timeout_inner": 28,             // 单次合成内部超时（秒）。比外层少2秒，确保线程一定能退出
-    "timeout_join": 30,              // 外层等待线程结束的超时（秒）。合成卡死时兜底
-    "max_retries": 3,                // 合成失败后重试次数（含首次共3次）
-    "retry_delay": 5.0,              // 每次重试前的等待秒数
-    "cache_expire_days": 2,          // TTS 音频缓存有效期（天）。过期后重新合成
-    "prefill_hours": 48              // 蓄水池提前量（小时）：提前预合成未来48小时内所有
-                                     // 播报时段的音频，准点播报不依赖当时网络
+    "engine": "cosyvoice",             // 点名播报合成引擎：cosyvoice（默认，阿里云百炼，快且稳）| edge（Edge-TTS 兜底）
+    "voice": "zh-CN-XiaoxiaoNeural",   // edge 引擎用的语音角色（点名 engine=cosyvoice 时本字段不生效）
+    // —— CosyVoice 引擎配置（engine=cosyvoice 时生效）——
+    // 复用 asr.api_key（同一百炼账号；ASR 与语音合成免费额度相互独立、不共享）
+    "cosyvoice_model": "cosyvoice-v3.5-flash",  // 语音合成模型；可换 cosyvoice-v3-flash（有系统音色 longanhuan 等，免创建音色）
+    "cosyvoice_voice": "",             // 必填：音色 ID。v3.5 系列无系统音色，需先在百炼控制台
+                                       // 用"声音设计/声音复刻"创建音色（创建免费），把音色 ID 填这里；
+                                       // 若用 cosyvoice-v3-flash 可填系统音色 longanhuan（中英混读）
+    "cosyvoice_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation", // 合成接口（仅华北2-北京地域）
+    "cosyvoice_format": "mp3",         // 音频格式 mp3/wav/pcm/opus
+    "cosyvoice_sample_rate": 24000,    // 采样率 Hz
+    "cosyvoice_volume": 50,            // 音量 0~100
+    "cosyvoice_rate": 1.0,             // 语速 0.5~2.0
+    "cosyvoice_pitch": 1.0,            // 音调 0.5~2.0
+    "timeout_inner": 28,               // 单次合成内部超时（秒）。比外层少2秒，确保线程一定能退出
+    "timeout_join": 30,                // 外层等待线程结束的超时（秒）。合成卡死时兜底
+    "max_retries": 3,                  // 合成失败后重试次数（含首次共3次）
+    "retry_delay": 5.0,                // 每次重试前的等待秒数
+    "cache_expire_days": 2,            // TTS 音频缓存有效期（天）。过期后重新合成
+    "prefill_hours": 48                // 蓄水池提前量（小时）：提前预合成未来48小时内所有
+                                       // 播报时段的音频，准点播报不依赖当时网络
   },
 
   // ==================== announce：播报内容与时段 ====================

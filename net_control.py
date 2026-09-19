@@ -693,12 +693,66 @@ class LlmClient:
 
 
 # ====================== TTS（独立于 announce.py，避免循环依赖） ======================
+def _cosyvoice_synth(text, cache_path, timeout=28):
+    """阿里云百炼 CosyVoice 非流式合成，写入 mp3 文件。
+    复用 asr.api_key（同一百炼账号、独立免费额度）；模型/音色见 tts.cosyvoice_*。
+    - cosyvoice-v3.5-flash/v3.5-plus 仅华北2（北京）地域可用，且无系统音色，
+      需先在百炼控制台"声音设计/声音复刻"创建音色，把音色 ID 填入 tts.cosyvoice_voice
+    - 响应兼容 output.audio(base64) 与 output.audio_url 两种返回"""
+    import base64
+    import json
+    import urllib.request
+    api_key = direct_announce.cfg_get("asr", "api_key", default="")
+    model = direct_announce.cfg_get("tts", "cosyvoice_model",
+                                    default="cosyvoice-v3.5-flash")
+    voice = direct_announce.cfg_get("tts", "cosyvoice_voice", default="")
+    base = direct_announce.cfg_get("tts", "cosyvoice_base", default=(
+        "https://dashscope.aliyuncs.com/api/v1/services/"
+        "aigc/multimodal-generation/generation"))
+    if not api_key or not voice:
+        raise RuntimeError("CosyVoice 未配置：asr.api_key 或 tts.cosyvoice_voice")
+    payload = {
+        "model": model,
+        "input": {"text": text, "voice": voice},
+        "parameters": {
+            "format": direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3"),
+            "sample_rate": int(direct_announce.cfg_get(
+                "tts", "cosyvoice_sample_rate", default=24000)),
+            "volume": int(direct_announce.cfg_get(
+                "tts", "cosyvoice_volume", default=50)),
+            "rate": float(direct_announce.cfg_get(
+                "tts", "cosyvoice_rate", default=1.0)),
+            "pitch": float(direct_announce.cfg_get(
+                "tts", "cosyvoice_pitch", default=1.0)),
+        },
+    }
+    req = urllib.request.Request(
+        base, data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": "Bearer " + api_key,
+                 "Content-Type": "application/json"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    output = data.get("output", {}) or {}
+    audio = output.get("audio")
+    if audio:
+        cache_path.write_bytes(base64.b64decode(audio))
+        return
+    audio_url = output.get("audio_url")
+    if audio_url:
+        with urllib.request.urlopen(audio_url, timeout=timeout) as r:
+            cache_path.write_bytes(r.read())
+        return
+    raise RuntimeError(f"CosyVoice 无音频返回: {data.get('message') or data}")
+
+
 def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=30,
                max_retries=2, retry_delay=5.0):
-    """Edge-TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
-    与 announce.py 同款"缓存 + libmpg123 dry-run 校验"策略，键为全文 md5。"""
+    """点名 TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
+    tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice（快、稳、复用 asr.api_key）；
+    tts.engine=edge → Edge-TTS 兜底。与 announce.py 同款"缓存 + dry-run 校验"，键为全文 md5。"""
     import hashlib
-    import asyncio
+    engine = direct_announce.cfg_get("tts", "engine", default="cosyvoice")
     if voice is None:
         voice = direct_announce.cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
     if cache_dir is None:
@@ -707,14 +761,18 @@ def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=
     cache_path = Path(cache_dir) / f"nc_{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
     if cache_path.exists() and direct_announce.dry_validate_mp3(cache_path):
         return str(cache_path)
-    import edge_tts
     for attempt in range(1, max_retries + 1):
         err = []
         def _syn():
-            async def _run():
-                await edge_tts.Communicate(text, voice).save(str(cache_path))
             try:
-                asyncio.run(asyncio.wait_for(_run(), timeout=timeout_inner))
+                if engine == "cosyvoice":
+                    _cosyvoice_synth(text, cache_path, timeout=timeout_inner)
+                else:
+                    import asyncio
+                    import edge_tts
+                    async def _run():
+                        await edge_tts.Communicate(text, voice).save(str(cache_path))
+                    asyncio.run(asyncio.wait_for(_run(), timeout=timeout_inner))
             except Exception as e:
                 err.append(f"{type(e).__name__}: {e}")
         t = threading.Thread(target=_syn, daemon=True)

@@ -534,6 +534,49 @@ def test_report_fields():
     check("噪音无字段", r == [], f"{r}")
 
 
+def test_cosyvoice_tts():
+    print("[CosyVoice TTS 配置与引擎选择]")
+    import direct_announce as da
+    saved = dict(da.CFG)
+    try:
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": ""},
+                       "tts": {"cosyvoice_voice": "sound_x"}})
+        try:
+            net_control._cosyvoice_synth("测试", Path("/tmp/nc_cv_test.mp3"), timeout=1)
+            check("缺 key 应报错", False, "未报错")
+        except RuntimeError as e:
+            check("缺 key 报错", "asr.api_key" in str(e), str(e))
+
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": "sk-t"}, "tts": {}})
+        try:
+            net_control._cosyvoice_synth("测试", Path("/tmp/nc_cv_test.mp3"), timeout=1)
+            check("缺音色应报错", False, "未报错")
+        except RuntimeError as e:
+            check("缺音色报错", "cosyvoice_voice" in str(e), str(e))
+
+        # 合成失败（缺 key 等）→ synth_text 重试后返回空串，不崩溃、不阻塞点名
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": ""},
+                       "tts": {"engine": "cosyvoice"},
+                       "net_control": {"tts_cache_dir": "/tmp/nc_cv_cache"}})
+        out = net_control.synth_text("测试播报", timeout_inner=1, timeout_join=2,
+                                     max_retries=1, retry_delay=0)
+        check("缺配置合成返回空", out == "", f"out={out!r}")
+        # engine=edge 分支（缺 key 时走 edge 也会失败返回空，不抛异常）
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": ""},
+                       "tts": {"engine": "edge"},
+                       "net_control": {"tts_cache_dir": "/tmp/nc_cv_cache"}})
+        out = net_control.synth_text("测试播报", timeout_inner=1, timeout_join=2,
+                                     max_retries=1, retry_delay=0)
+        check("edge 分支失败返回空", out == "", f"out={out!r}")
+    finally:
+        da.CFG.clear()
+        da.CFG.update(saved)
+
+
 def test_wait_channel_idle():
     print("[先听后说：抢麦前等待信道空闲]")
     sess = net_control.NetControlSession(link=None)
@@ -843,6 +886,7 @@ def main():
                test_asr_body, test_vocab_echo_reject, test_conn_reuse,
                test_config_defaults, test_retry_reset, test_llm_gate_and_missing_fields,
                test_info_followup, test_report_clean, test_report_fields,
+               test_cosyvoice_tts,
                test_wait_channel_idle, test_export_csv, test_echo_filter,
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,
                test_ctrl_call_filter, test_same_session_new_call,

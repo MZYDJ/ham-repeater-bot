@@ -337,7 +337,7 @@ def _net_start():
     except Exception as e:
         logger.error(f"net_control 模块导入失败: {e}")
         return
-    sess = net_control.NetControlSession(link=_native_link, tts_func=get_tts_file)
+    sess = net_control.NetControlSession(link=_native_link)  # 点名 TTS 走 net_control.synth_text（tts.engine 可切 CosyVoice/Edge），定时播报仍用 get_tts_file
     sess.start()
     _net_session = sess
     logger.info("点名主播会话已启动")
