@@ -1129,6 +1129,69 @@ def test_similar_callsign_cross_session_replace():
           f"waiting={sess._waiting}")
 
 
+def test_spell_merge_retry():
+    print("[拼读合并：被请重复后逐字母拼读碎段 → 停顿后合并解出完整呼号]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 先造成重复请求流程（低置信度无呼号段消耗额度）
+    sess._asr_text = lambda p: "哦我要高分耐"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=5)
+    check("进入重复请求流程", sess._retry_pending and sess._retry_left == 0,
+          f"pending={sess._retry_pending} left={sess._retry_left}")
+    n0 = len(spoken)
+    # 逐字母拼读（每段 1s 短段，同 session）：Bravo Golf Nine Bravo Foxtrot Zulu
+    for pt in ["Bravo", "Golf", "Nine", "Bravo", "Foxtrot", "Zulu"]:
+        sess._asr_text = lambda p, t=pt: t
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=5)
+    check("拼读段不刷请重复", len(spoken) == n0, f"spoken={spoken}")
+    # 友台拼完停顿 → 主循环空闲轮 flush → 合并解出 BG9BFZ
+    sess._spell_buf[5]["ts"] -= 5.0   # 模拟停顿超过 spell_gap_seconds
+    sess._seg_end_at[5] = sess._seg_end_at[5] - 5.0   # 回波窗口同步回拨（真实停顿>4s）
+    sess._spell_flush_all()
+    check("拼读合并解出 BG9BFZ",
+          sess._current_call == "BG9BFZ"
+          and [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"cur={sess._current_call} checked={sess._checked_in}")
+    check("合并后恢复重复额度", sess._retry_left == 1 and not sess._retry_pending,
+          f"left={sess._retry_left}")
+
+
+def test_spell_merge_not_half():
+    print("[拼读合并：半截拼读（BG9B）不立即误抄，等待完整拼读]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "哦我要高分耐"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
+    # 只拼 4 词（半截合法呼号 BG9B）后停顿 → flush 不应抄半截 BG9B
+    for pt in ["Bravo", "Golf", "Nine", "Bravo"]:
+        sess._asr_text = lambda p, t=pt: t
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
+    sess._spell_buf[6]["ts"] -= 5.0
+    sess._seg_end_at[6] = sess._seg_end_at[6] - 5.0
+    sess._spell_flush_all()
+    check("半截 BG9B 不误抄",
+          sess._current_call is None
+          and [c for c, *_ in sess._checked_in] == [],
+          f"cur={sess._current_call} checked={sess._checked_in}")
+    # 友台重新完整拼读（半截已丢弃，新缓存）→ 合并解出 BG9BFZ
+    for pt in ["Bravo", "Golf", "Nine", "Bravo", "Foxtrot", "Zulu"]:
+        sess._asr_text = lambda p, t=pt: t
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
+    sess._spell_buf[6]["ts"] -= 5.0
+    sess._seg_end_at[6] = sess._seg_end_at[6] - 5.0
+    sess._spell_flush_all()
+    check("重新完整拼读解出 BG9BFZ",
+          sess._current_call == "BG9BFZ"
+          and [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"cur={sess._current_call} checked={sess._checked_in}")
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -1216,6 +1279,7 @@ def main():
                test_suspend_resume,
                test_power_highpower_and_device_gt12, test_duplicate_report_fields,
                test_relay_same_session_interloper, test_similar_callsign_cross_session_replace,
+               test_spell_merge_retry, test_spell_merge_not_half,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

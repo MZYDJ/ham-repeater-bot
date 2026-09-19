@@ -50,6 +50,24 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(levelname)s - %(message)s")
 
+
+class _NormalCloseFilter(logging.Filter):
+    """websocket-client 库把 WebSocket 正常关闭（code 1000，服务器 Bye/本端主动
+    close 后收到）也打 ERROR——实测 21:16:20 两条"Connection closed normally
+    (code 1000)"吓人但属预期行为。仅将这类正常关闭降为 DEBUG，真错误保留。"""
+    def filter(self, record):
+        msg = record.getMessage()
+        if "Connection closed normally" in msg or "code 1000" in msg:
+            record.levelno = logging.DEBUG
+            record.levelname = "DEBUG"
+        return True
+
+
+for _lib in ("websocket", "websockets", "websocket-client"):
+    _lg = logging.getLogger(_lib)
+    if not any(isinstance(f, _NormalCloseFilter) for f in _lg.filters):
+        _lg.addFilter(_NormalCloseFilter())
+
 # ====================== 配置访问（复用 direct_announce 的 CFG） ======================
 def nc_cfg(*path, default=None):
     return direct_announce.cfg_get("net_control", *path, default=default)
@@ -66,6 +84,8 @@ PHONETIC_ITU = {
     "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
     "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
     "niner": "9", "tree": "3", "fower": "4", "fife": "5",
+    # ASR 对解释法单词的常见听写变体（中英混识实测）：Foxtrot→Florida/follow/fox
+    "florida": "F", "fox": "F", "follow": "F",
 }
 # 常见中文音译变体（本地台网习惯可经配置 net_control.extra_vocab 扩展；此处覆盖主流写法）
 PHONETIC_ZH = {
@@ -78,6 +98,9 @@ PHONETIC_ZH = {
     "塞拉": "S", "探戈": "T", "尤尼弗姆": "U", "尤尼福姆": "U", "维克多": "V",
     "威士忌": "W", "艾克斯": "X", "艾克斯瑞": "X", "爱克斯": "X", "杨基": "Y",
     "扬基": "Y", "祖鲁": "Z",
+    # ASR 中文音译变体实测（21:14 日志）："佛罗里达之路"=Foxtrot Zulu、
+    # "弗雷"=Foxtrot（"反而我弗雷打住了"）、"高"不作为单字映射（防"高功率"污染）
+    "佛罗里达": "F", "之路": "Z", "弗雷": "F",
 }
 CN_DIGITS = {"零": "0", "一": "1", "二": "2", "两": "2", "三": "3", "四": "4",
              "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
@@ -946,6 +969,11 @@ class NetControlSession:
         self._failed = 0
         self._retry_pending = False
         self._retry_left = int(nc_cfg("max_retry", default=1))
+        # 拼读合并缓存：session → {"text", "ts"}。友台被请重复呼号后常用
+        # 逐字母解释法拼读（"Bravo / Golf / Nine / ..."），VAD 按字母间停顿
+        # 切成 0.5~1.5s 短段逐段 ASR（实测 21:15 场景），单段拼不出呼号 →
+        # 同 session 短段文本累积，停顿后统一解码。
+        self._spell_buf = {}
         # "当前正在点名"的友台上下文：抄收呼号后保留，后续不带呼号的补充段
         # （QTH/设备/天线/功率等）按来源 session 归入该友台，不再当"未抄收"。
         self._current_call = None           # 当前台上友台呼号（大写）
@@ -1108,6 +1136,7 @@ class NetControlSession:
             except queue.Empty:
                 self._capture_pump()       # 时间驱动收尾：链路静默时也切段（不靠下一个人顶）
                 self._flush_pending_report()   # 合并确认：友台说完停稳后统一播报
+                self._spell_flush_all()        # 拼读合并：拼读停止后统一解码
                 continue
             self._capture_pump()
             self._process_segment(pcm16, dur, wav, session)
@@ -1171,58 +1200,49 @@ class NetControlSession:
         if not call and not clean_report_text(raw):
             logger.info(f"空/语气词段静默忽略（{raw!r}）")
             return
+        # 报名意图（无呼号时全局生效，不依赖当前友台）：点名开始后无人成功
+        # 抄收时，报名者的"请求参加测试点名"等话语若无呼号会落到低置信度分支
+        # 被额度耗尽静默吞掉（实测 21:14:12"请求参加测试点名测试，是否收到？"）
+        # → 引导重报完整呼号，不消耗重复额度。
+        if call is None:
+            info0 = clean_report_text(raw)
+            if info0:
+                kw0 = info0.lower()
+                if any(k in kw0 for k in ("请求参加", "参加点名", "参加测试",
+                                          "点名测试", "请求加入", "想参加",
+                                          "参加一下", "报名")):
+                    logger.info(f"报名意图但未解出呼号，引导重报: {info0}")
+                    if self._current_call:
+                        self._speak(self._fmt(nc_cfg("repeat_text", default=
+                            "{call_phonetic}，请再报一次您的完整呼号，Over"),
+                            call=self._current_call,
+                            call_phonetic=callsign_phonetic(self._current_call)))
+                    else:
+                        self._speak("请再报一次您的完整呼号，Over")
+                    return
         # 主控自身呼号：开场白/播报的回声、友台报主控呼号 → 不视为友台
         ctrl = (self._net_ctx or {}).get("ctrl_call", "")
         if call and ctrl and call.upper() == ctrl.upper():
             logger.info(f"主控自身呼号 {call}，忽略（回波/自我识别）")
             return
         if call and is_duplicate(call, self._checked_calls):
-            # 重复抄收：先看本段是否在补报缺失字段（实测 20:51:26 友台重复报
-            # "抄你的信号五九"→ 信号59 应补录，而不是直接"已经抄收过"吞掉）
-            if self._current_call == call and self._apply_report_fields(call, raw, signal):
-                logger.info(f"{call} 重复抄收但补报字段已记录: {raw}")
-                return
-            logger.info(f"重复抄收 {call}，跳过")
-            self._dups += 1
-            self._retry_pending = False
-            self._retry_left = int(nc_cfg("max_retry", default=1))  # 有效应答，恢复重复请求额度
-            self._speak(self._fmt(nc_cfg("dup_text", default="{call_phonetic} 已经抄收过，"
-                                                             "请下一位友台。"),
-                                  call=call, call_phonetic=callsign_phonetic(call)))
-            self._end_current()        # 重复抄收=收尾窗口，轮到排队中的下一位
-            return
+            return self._handle_duplicate(call, signal, raw)
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
-            if self._current_active:
-                # 当前友台进行中收到新呼号，两种语义：
-                # ① 识别修正（同一友台纠正/ASR 听错）：新呼号与当前友台高度相似
-                #    （编辑距离≤1，如 ASR 把 BFZ 听成 BLZ）→ 替换旧记录，不打断。
-                #    仅限"刚抄收、尚未报信息"的早期窗口：已记录结构化信息后再
-                #    重报（20:15:15 实测"BFZ 在等确认时又说话"）不覆盖已确认记录，
-                #    回"呼号已记录"反馈。
-                # ② 另一友台插队：呼号不相似（BG9AA vs BG9BB）→ 静默排队等候，
-                #    不顶掉当前友台。
-                # 判定依据是**呼号相似度而非 session**：中继转发场景所有友台
-                # 同 session（用户实测确认），同 session 不代表同一人；反过来
-                # 跨设备（不同 session）也可能是一人纠正。保守倾向排队——
-                # 修正被误判为插队只多等一轮（不丢人），插队被误判为修正会
-                # 顶掉当前友台（丢人）。
-                if (self._current_call or "").upper() != call.upper():
-                    similar = callsign_similar(self._current_call, call)
-                    if similar:
-                        if self._current_entry and self._current_entry[4]:
-                            logger.info(f"{self._current_call} 已记录信息，重报 "
-                                        f"{call} 不替换（识别修正仅限早期窗口）: {raw}")
-                            self._speak(self._fmt(nc_cfg("ask_ack_text", default=
-                                "抄收，{call_phonetic}，您的呼号已记录，"
-                                "请报告您的QTH、使用设备、天线、功率，Over"),
-                                call=self._current_call,
-                                call_phonetic=callsign_phonetic(self._current_call)))
-                            return
-                        return self._replace_checkin(call, signal, wav, raw, session, score)
-                # 呼号不相似（另一个人，无论 session）→ 插队：静默记录+排队，不打断
-                return self._queue_interloper(call, signal, raw, session)
-            return self._do_checkin(call, signal, wav, raw, session, score)
+            return self._handle_callsign(call, signal, score, raw, wav, session)
         # ---- 无呼号：先判断是否为"当前友台的信息补充段" ----
+        # 拼读合并（无呼号/低分 + 短段 + **重复请求流程中**）：友台被请重复后
+        # 逐字母解释法拼读（VAD 按字母间停顿切成短段，实测 21:15 场景）→
+        # 累积同 session 短段文本统一解码，避免"请重复"刷屏与呼号丢失。
+        # 仅在 retry 流程启用：确认/纠正等短段（"正确""对"）不在该流程，
+        # 不会被吞；正常段直接解出呼号也走不到这里。
+        _in_retry = (self._retry_pending or self._retry_left < int(
+            nc_cfg("max_retry", default=1)))
+        if (call is None or score < thr) and _in_retry \
+                and self._is_spell_piece(raw, dur):
+            if self._spell_feed(raw, dur, session, wav):
+                return
+        else:
+            self._spell_buf.pop(session, None)   # 非拼读段/非retry：新话题，清缓存
         # 点名流程中友台报完呼号后，补充 QTH/设备/天线/功率时通常不再重复呼号
         # （17:26:51 实测段"我的QTH在咸阳市…设备即时通…五瓦功率发射"即此场景）。
         # 归入条件：无新呼号（有呼号低分也必须走重试/抄收，不能吞——
@@ -1499,6 +1519,128 @@ class NetControlSession:
             "抄收，{call_phonetic}，信息已记录，请再补充您的{missing}，Over"),
             call=call, call_phonetic=callsign_phonetic(call), missing=labels))
         return True
+
+    def _handle_duplicate(self, call, signal, raw):
+        """重复抄收：先看本段是否在补报缺失字段（实测 20:51:26 友台重复报
+        "抄你的信号五九"→ 信号59 应补录，而不是直接"已经抄收过"吞掉）。"""
+        if self._current_call == call and self._apply_report_fields(call, raw, signal):
+            logger.info(f"{call} 重复抄收但补报字段已记录: {raw}")
+            return
+        logger.info(f"重复抄收 {call}，跳过")
+        self._dups += 1
+        self._retry_pending = False
+        self._retry_left = int(nc_cfg("max_retry", default=1))  # 有效应答，恢复重复请求额度
+        self._speak(self._fmt(nc_cfg("dup_text", default="{call_phonetic} 已经抄收过，"
+                                                         "请下一位友台。"),
+                              call=call, call_phonetic=callsign_phonetic(call)))
+        self._end_current()        # 重复抄收=收尾窗口，轮到排队中的下一位
+
+    def _handle_callsign(self, call, signal, score, raw, wav, session):
+        """有呼号且高分（≥置信度阈值）的统一处理。_process_segment 主分支；
+        拼读合并 flush（碎段拼出完整呼号）也复用同一套分支——重复抄收 /
+        识别修正 / 插队排队 / 正式抄收，行为与正常段完全一致。"""
+        if self._current_active:
+            # 当前友台进行中收到新呼号，两种语义：
+            # ① 识别修正（同一友台纠正/ASR 听错）：新呼号与当前友台高度相似
+            #    （编辑距离≤1，如 ASR 把 BFZ 听成 BLZ）→ 替换旧记录，不打断。
+            #    仅限"刚抄收、尚未报信息"的早期窗口：已记录结构化信息后再
+            #    重报（20:15:15 实测"BFZ 在等确认时又说话"）不覆盖已确认记录，
+            #    回"呼号已记录"反馈。
+            # ② 另一友台插队：呼号不相似（BG9AA vs BG9BB）→ 静默排队等候，
+            #    不顶掉当前友台。
+            # 判定依据是**呼号相似度而非 session**：中继转发场景所有友台
+            # 同 session（用户实测确认），同 session 不代表同一人；反过来
+            # 跨设备（不同 session）也可能是一人纠正。保守倾向排队——
+            # 修正被误判为插队只多等一轮（不丢人），插队被误判为修正会
+            # 顶掉当前友台（丢人）。
+            if (self._current_call or "").upper() != call.upper():
+                similar = callsign_similar(self._current_call, call)
+                if similar:
+                    if self._current_entry and self._current_entry[4]:
+                        logger.info(f"{self._current_call} 已记录信息，重报 "
+                                    f"{call} 不替换（识别修正仅限早期窗口）: {raw}")
+                        self._speak(self._fmt(nc_cfg("ask_ack_text", default=
+                            "抄收，{call_phonetic}，您的呼号已记录，"
+                            "请报告您的QTH、使用设备、天线、功率，Over"),
+                            call=self._current_call,
+                            call_phonetic=callsign_phonetic(self._current_call)))
+                        return
+                    return self._replace_checkin(call, signal, wav, raw, session, score)
+            # 呼号不相似（另一个人，无论 session）→ 插队：静默记录+排队，不打断
+            return self._queue_interloper(call, signal, raw, session)
+        return self._do_checkin(call, signal, wav, raw, session, score)
+
+    # ---------- 拼读合并（VAD 切碎的逐字母解释法拼读） ----------
+    @staticmethod
+    def _is_spell_piece(raw, dur):
+        """逐字母拼读片段特征：短段（≤2.5s）+ 短文本（≤16 字，含任意词）。
+        刻意宽松（不要求含解释法词）——ASR 对解释法单词的听写很乱
+        （21:15 实测 "无奈"=Nine、"弗雷"=Foxtrot），严格过滤会漏掉真实拼读；
+        宽松进缓存的乱文本 decode 不出合法呼号时无害（超时自动清理）。"""
+        raw = (raw or "").strip()
+        if not raw or dur is None or dur > 2.5:
+            return False
+        return 1 <= len(raw) <= 16
+
+    def _spell_flush(self, session):
+        """处理该 session 已停顿的拼读缓存：拼接文本 decode 出高分呼号 →
+        走 _handle_callsign 统一分支（抄收/修正/排队），无果则丢弃。
+        只在重复请求流程中启用（_retry_pending 或额度已消耗）——拼读
+        纠正发生在"请重复"之后；正常段直接解出呼号，不走此路径。
+        词数 <5 视为半截（"Bravo Golf Nine Bravo"=BG9B 类 1 位后缀/未拼完）
+        直接丢弃等友台重新完整拼读，避免半截合法呼号被误抄。"""
+        buf = self._spell_buf.get(session)
+        if not buf:
+            return False
+        text = buf["text"].strip()
+        in_retry = self._retry_pending or self._retry_left < int(
+            nc_cfg("max_retry", default=1))
+        if not in_retry or not text or len(_tokenize(text)) < 5:
+            self._spell_buf.pop(session, None)
+            if in_retry and text and len(_tokenize(text)) >= 1:
+                self._failed += 1    # 半截拼读失败：计入未抄收
+            return False
+        r = decode_callsign(text)
+        call, score = r["callsign"], r["score"]
+        if not call or score < int(nc_cfg("spell_min_score", default=80)):
+            self._spell_buf.pop(session, None)
+            self._failed += 1    # 一轮拼读未解出：计入未抄收（与低置信度语义一致）
+            return False
+        self._spell_buf.pop(session, None)
+        logger.info(f"拼读合并解出呼号: {text!r} → {call}（置信度 {score}）")
+        self._handle_callsign(call, r["signal"], score, text, "", session)
+        return True
+
+    def _spell_feed(self, raw, dur, session, wav):
+        """拼读段累积：同 session 短段文本追加（间隔>gap 先 flush 上批）。
+        只累积不立即解码——拼读是逐字母进行的，"Bravo Golf Nine Bravo"前
+        4 词就合法（BG9B），立即解码会抄半截呼号；统一等友台拼完停顿后
+        （主循环空闲轮 _spell_flush_all）再解码整批。返回 True 表示该段
+        已作为拼读消费（不刷"请重复"）。"""
+        now = time.time()
+        gap = float(nc_cfg("spell_gap_seconds", default=4.0))
+        buf = self._spell_buf.get(session)
+        if buf and now - buf["ts"] > gap:
+            self._spell_flush(session)
+            buf = None
+        if buf:
+            buf["text"] = (buf["text"] + " " + (raw or "")).strip()[-80:]
+            buf["ts"] = now
+        else:
+            self._spell_buf[session] = {"text": (raw or "").strip(), "ts": now}
+        # 吞段即计入未抄收（与低置信度分支每段 +1 的统计语义一致；
+        # 后续 flush 解出呼号会走正式抄收，成功计数以 checked 为准）
+        self._failed += 1
+        return True
+
+    def _spell_flush_all(self):
+        """主循环空闲轮调用：清理超时未处理的拼读缓存（友台拼完即停、
+        无后续段触发时靠此收尾）。"""
+        gap = float(nc_cfg("spell_gap_seconds", default=4.0))
+        now = time.time()
+        for session in list(self._spell_buf.keys()):
+            if now - self._spell_buf[session]["ts"] > gap:
+                self._spell_flush(session)
 
     def _do_checkin(self, call, signal, wav, raw, session, score, entry=None):
         """抄收一位友台：入册 + 恢复额度 + 建立当前友台上下文 + 播确认 + 实时落盘。
@@ -2135,8 +2277,12 @@ class NetControlSession:
                         self._last_spoken_text)):
                 return True
         # ② 对方讲完后（文本与上一段比对；prev_end 由调用方传入，即
-        #    该 session 上一段切出时刻，避免把当前段自己误当"上一段"）
-        if session is not None and prev_end is not None:
+        #    该 session 上一段切出时刻，避免把当前段自己误当"上一段"）。
+        #    拼读会话中（该 session 有未处理拼读缓存）跳过判据②：拼读段都是
+        #    短段+短文本+同 session，逐字母重拼时首段与上段文本常完全一致
+        #    （"Bravo"…"Bravo"），按旧逻辑会被当尾音回波误杀。
+        if (session is not None and prev_end is not None
+                and session not in self._spell_buf):
             prev_text = self._seg_text.get(session, "")
             if (time.time() - prev_end <= holdoff
                     and dur <= maxseg
