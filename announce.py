@@ -359,6 +359,20 @@ def _next_announce_time(now: datetime.datetime) -> datetime.datetime:
     if t.minute < 30:
         return t.replace(minute=30)
     return (t + datetime.timedelta(hours=1)).replace(minute=0)
+def _native_link_suspend():
+    """临时直连播报期间暂停常驻链路保活/重连（防同账号互踢：实测 20:30
+    常驻被顶→退避重连又顶掉直连播报连接的互踢循环）。"""
+    if _native_link is not None:
+        try:
+            _native_link.suspend()
+        except Exception:
+            pass
+def _native_link_resume():
+    if _native_link is not None:
+        try:
+            _native_link.resume()
+        except Exception:
+            pass
 def _native_prewarm():
     """预热阶段（XX:29/XX:59 触发）：
     1. 预构建下一准点的音频包（省去准点后 ~2.3s 解码编码）
@@ -373,6 +387,7 @@ def _native_prewarm():
     if _native_session:                      # 上次预热残留（播报未消费等异常），先清理
         if _native_session_temp:
             _native_session.close()
+            _native_link_resume()
         elif _native_link:
             _native_link.release()
         _native_session = None
@@ -403,6 +418,7 @@ def _native_prewarm():
         logger.info("常驻链路就绪（已健康检查）")
     else:
         try:                                  # 二级兜底：立即建临时短链
+            _native_link_suspend()            # 挂起常驻，防同账号互踢
             s = direct_announce.DirectAnnouncer(
                 username=TALK_USERNAME, password=TALK_PASSWORD)
             with contextlib.redirect_stdout(_StdoutToLogger()):
@@ -410,6 +426,7 @@ def _native_prewarm():
             _native_session_temp = True
             logger.info("临时短链预建完成（常驻链路不可用）")
         except Exception as e:
+            _native_link_resume()             # 建链失败：恢复常驻保活
             logger.warning(f"临时短链预建失败（准点现场流程兜底）: {e}")
             s = None
     if s is None:
@@ -426,6 +443,7 @@ def _native_prewarm():
         logger.warning(f"抢麦失败（准点现场流程兜底）: {e}")
         if _native_session_temp:
             s.close()
+            _native_link_resume()             # 临时短链弃用：恢复常驻保活
         elif _native_link:
             _native_link.release()
         _native_session = None
@@ -440,11 +458,16 @@ def _native_play(session, packets):
         logger.error("直连播报返回失败")
 def _announce_native(tts_file: str):
     """直连播报（现场完整流程，容错兜底）：编码→登录→抢麦→匀速发包→放麦→断开。
-    抛出的异常由 announce_task 外层 except 统一记录并触发企业微信告警。"""
+    抛出的异常由 announce_task 外层 except 统一记录并触发企业微信告警。
+    建独立连接前挂起常驻链路（防同账号互踢），播完恢复。"""
     t0 = time.time()
-    with contextlib.redirect_stdout(_StdoutToLogger()):
-        ok = direct_announce.announce_once(
-            tts_file, username=TALK_USERNAME, password=TALK_PASSWORD)
+    _native_link_suspend()
+    try:
+        with contextlib.redirect_stdout(_StdoutToLogger()):
+            ok = direct_announce.announce_once(
+                tts_file, username=TALK_USERNAME, password=TALK_PASSWORD)
+    finally:
+        _native_link_resume()
     if ok:
         logger.info(f"直连播报完成，耗时 {time.time() - t0:.1f} 秒")
     else:
@@ -474,6 +497,7 @@ def announce_task():
             finally:
                 if temp:                       # 临时短链：用完即弃
                     s.close()
+                    _native_link_resume()      # 常驻恢复保活（临时链已断开，不再互踢）
                 elif _native_link:             # 常驻链路：还给守护线程继续保活
                     _native_link.release()
             return

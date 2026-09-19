@@ -1026,6 +1026,19 @@ def test_idle_recall():
     check("空闲 1s 后重播呼叫", any("CQ" in s for s in spoken), f"spoken={spoken}")
 
 
+def test_suspend_resume():
+    print("[常驻链路 suspend/resume：临时直连期间暂停保活，防同账号互踢]")
+    import direct_announce as _da
+    link = _da.PersistentAnnouncer(username="u", password="p")
+    check("初始未挂起", not link._suspended and link._backoff == 30.0)
+    link.suspend()
+    check("suspend 置位", link._suspended is True)
+    link._backoff = 600.0          # 模拟退避翻倍
+    link.resume()
+    check("resume 复位并重置退避",
+          not link._suspended and link._backoff == 30.0)
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -1110,6 +1123,7 @@ def main():
                test_same_session_replace, test_report_merged_confirm,
                test_join_intent_guide, test_checkedin_repeat_feedback,
                test_replace_guard,
+               test_suspend_resume,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

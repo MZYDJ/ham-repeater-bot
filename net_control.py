@@ -1924,6 +1924,8 @@ class NetControlSession:
                         return
                     try:
                         if s is None:          # 无常驻链路（独立运行场景）：临时短链
+                            if self.link is not None and hasattr(self.link, "suspend"):
+                                self.link.suspend()   # 挂起常驻，防同账号互踢
                             s2 = direct_announce.DirectAnnouncer(
                                 username=direct_announce.cfg_get(
                                     "talk", "username", default=""),
@@ -1936,6 +1938,8 @@ class NetControlSession:
                                     s2.play(packets)
                             finally:
                                 s2.close()
+                                if self.link is not None and hasattr(self.link, "resume"):
+                                    self.link.resume()   # 临时链已断开，恢复常驻保活
                             return
                         # 发射中兜底：检测到他人语音立即放麦让位，不压对方
                         self._preempted.clear()

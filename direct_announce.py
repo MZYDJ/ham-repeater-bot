@@ -666,6 +666,7 @@ class PersistentAnnouncer:
         self._backoff = 30.0               # 被顶重连退避秒数
         self._last_ping = 0.0
         self._last_ok = 0.0                # 最近一次收到 Ping 回显的时刻
+        self._suspended = False            # 临时直连播报期间暂停保活/重连（防同账号互踢）
     # ---- 生命周期 ----
     def start(self):
         with self._lock:
@@ -717,6 +718,11 @@ class PersistentAnnouncer:
                 continue
             removed = False
             with self._lock:
+                if self._suspended:
+                    # 临时直连播报（announce_once/点名短链）期间：不 Ping 不重连，
+                    # 避免与临时连接并发登录同一账号触发服务器"同账号互踢"
+                    # （实测 20:30 常驻链路被顶、退避重连又顶回直连的互踢循环）
+                    continue
                 if self._busy.is_set():            # 锁内复检（防 TOCTOU）
                     continue
                 s = self._sess
@@ -793,6 +799,16 @@ class PersistentAnnouncer:
     def release(self):
         """播报结束，连接归还守护线程继续保活"""
         self._busy.clear()
+    def suspend(self):
+        """临时直连播报期间暂停守护保活/重连（防与临时连接同账号互踢）。
+        现有连接保留但不 Ping；resume 后恢复正常保活与重连。"""
+        with self._lock:
+            self._suspended = True
+    def resume(self):
+        """恢复常驻链路保活/重连（临时直连播报已结束，可安全回到单连接）。"""
+        with self._lock:
+            self._suspended = False
+            self._backoff = 30.0          # 重置退避：尽快恢复正常保活，避免长退避空窗
 def announce_once(mp3_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
                   username=USERNAME, password=PASSWORD, verbose=True):
     """完整播报一次（一步到位）：编码→登录→抢麦→延迟LEAD_DELAY→匀速发包→放麦。
