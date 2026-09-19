@@ -700,16 +700,17 @@ def test_same_session_new_call():
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     sess._asr_text = lambda p: "我的QTH在咸阳市"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    # 同 session 新友台补报完整呼号 → 不被补充信息吞；同 session 重报不同呼号
-    # = 同一友台识别修正 → 替换旧记录（CSV 只留正确呼号）
+    # 同 session 新友台补报完整呼号 → 不被补充信息吞；但当前友台已记录
+    # 结构化信息（识别修正仅限"刚抄收未报信息"的早期窗口，实测 20:15:15
+    # 已点过者重复说话不应覆盖已确认记录）→ 不替换，回"呼号已记录"反馈
     sess._asr_text = lambda p: "这里是BJ九EFU，能否超收"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    check("同session重报替换旧呼号",
-          [c for c, *_ in sess._checked_in] == ["BJ9EFU"],
+    check("已记录信息不替换旧呼号",
+          [c for c, *_ in sess._checked_in] == ["BH3XX"],
           f"checked={sess._checked_in}")
-    check("替换后当前为正确呼号", sess._current_call == "BJ9EFU"
-          and "BH3XX" not in sess._checked_calls,
-          f"call={sess._current_call} checked_calls={sess._checked_calls}")
+    check("当前友台不变且给反馈", sess._current_call == "BH3XX"
+          and any("呼号已记录" in s for s in spoken),
+          f"call={sess._current_call} spoken={spoken}")
 
 
 def test_echo_other_speaker():
@@ -944,6 +945,65 @@ def test_report_merged_confirm():
     check("无新内容不重复确认", len(spoken) == n0 + 2, f"spoken={spoken}")
 
 
+def test_join_intent_guide():
+    print("[报名意图但呼号未解出 → 引导重报（不静默，实测 20:15:15 场景）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 友台抄收（session=7）→ 当前友台进行中
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    # 同 session 报"这里B九B L Z请求参加点名测试"（呼号漏字母未解出）
+    sess._asr_text = lambda p: "主控主控，这里B九B L Z请求参加点名测试"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("报名意图引导重报", len(spoken) == n0 + 1 and "请再报一次您的完整呼号" in spoken[-1],
+          f"spoken={spoken}")
+
+
+def test_checkedin_repeat_feedback():
+    print("[已点过呼号再次报到 → 直接反馈'已经抄收过'（不静默）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 收尾（确认"正确"）后，再报同呼号（新 session，另一台设备重复上台）
+    sess._asr_text = lambda p: "正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    sess._asr_text = lambda p: "这里是BG9BFZ请求参加点名"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("已点过直接反馈", len(spoken) == n0 + 1 and "已经抄收过" in spoken[-1],
+          f"spoken={spoken}")
+
+
+def test_replace_guard():
+    print("[已记录信息后同 session 重报不同呼号 → 不替换（保护已确认记录）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 抄收 BFZ（session=7），补充信息 → entry[4] 非空
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    sess._asr_text = lambda p: "我的QTH在咸阳，设备泉盛K6"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 同 session 又报 BLZ（高分不同呼号）→ 不替换、不静默，播"呼号已记录"
+    sess._asr_text = lambda p: "这里是BG9BLZ请求参加点名测试"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("已记录信息不替换",
+          [c for c, *_ in sess._checked_in] == ["BG9BFZ"]
+          and sess._current_call == "BG9BFZ"
+          and "呼号已记录" in spoken[-1],
+          f"checked={sess._checked_in} cur={sess._current_call} spoken={spoken}")
+
+
 def test_idle_recall():
     print("[空闲重新呼叫：点名中长时间无应答 → 重播开场呼叫]")
     sess = net_control.NetControlSession(link=None)
@@ -1048,6 +1108,8 @@ def main():
                test_speech_supersede_waits,
                test_interloper_queued, test_idle_recall,
                test_same_session_replace, test_report_merged_confirm,
+               test_join_intent_guide, test_checkedin_repeat_feedback,
+               test_replace_guard,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

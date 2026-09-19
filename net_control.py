@@ -371,6 +371,8 @@ class VoiceCapture:
         self.out_rate = out_rate
         self.save_dir = Path(save_dir) if save_dir else None
         self.on_segment = on_segment
+        self._lock = threading.Lock()   # feed（keeper 线程）与 pump/_someone_speaking
+                                        # （主线程/播报线程）并发访问同一状态，必须互斥
         self._speaking = False
         self._buf48 = bytearray()
         self._silence_s = 0.0
@@ -398,39 +400,41 @@ class VoiceCapture:
         上层据此判定"已讲完"，避免 _speaking 无限卡 True。"""
         if not pcm48:
             return
-        self.last_feed_at = time.time()
-        if (self._speaking and session is not None
-                and self._seg_session is not None and session != self._seg_session):
-            self._finalize()                       # 换人：先收尾上一位的段
-        for off in range(0, len(pcm48) - self.FRAME_S + 1, self.FRAME_S):
-            frame = pcm48[off:off + self.FRAME_S]
-            rms = self._rms(frame)
-            active = rms > self._active_thr()
-            if not self._speaking:
-                if rms < self._noise:
-                    self._noise = rms
+        with self._lock:
+            self.last_feed_at = time.time()
+            if (self._speaking and session is not None
+                    and self._seg_session is not None and session != self._seg_session):
+                self._finalize()                       # 换人：先收尾上一位的段
+            for off in range(0, len(pcm48) - self.FRAME_S + 1, self.FRAME_S):
+                frame = pcm48[off:off + self.FRAME_S]
+                rms = self._rms(frame)
+                active = rms > self._active_thr()
+                if not self._speaking:
+                    if rms < self._noise:
+                        self._noise = rms
+                    else:
+                        self._noise += (rms - self._noise) * 0.002
+                    if active:
+                        self._speaking = True
+                        self._silence_s = 0.0
+                        self._buf48 = bytearray(frame)
+                        self._seg_session = session
                 else:
-                    self._noise += (rms - self._noise) * 0.002
-                if active:
-                    self._speaking = True
-                    self._silence_s = 0.0
-                    self._buf48 = bytearray(frame)
-                    self._seg_session = session
-            else:
-                self._buf48 += frame
-                if active:
-                    self._silence_s = 0.0
-                    self._defer_frames = 0          # 又有声音：取消 PTT 延迟收尾
-                elif self._defer_frames > 0:
-                    self._defer_frames -= 1         # 延迟窗口内：不计入静音（防断续）
-                else:
-                    self._silence_s += 0.02
-                dur = len(self._buf48) / (48000 * 2)
-                if (self._silence_s * 1000 >= self.silence_end_ms
-                        or dur >= self.max_segment_ms / 1000):
-                    self._finalize()
+                    self._buf48 += frame
+                    if active:
+                        self._silence_s = 0.0
+                        self._defer_frames = 0          # 又有声音：取消 PTT 延迟收尾
+                    elif self._defer_frames > 0:
+                        self._defer_frames -= 1         # 延迟窗口内：不计入静音（防断续）
+                    else:
+                        self._silence_s += 0.02
+                    dur = len(self._buf48) / (48000 * 2)
+                    if (self._silence_s * 1000 >= self.silence_end_ms
+                            or dur >= self.max_segment_ms / 1000):
+                        self._finalize()
 
     def _finalize(self):
+        # 调用方必须已持有 self._lock（feed/pump/force_finalize 内调用）
         pcm48 = bytes(self._buf48)
         session = self._seg_session
         self._speaking = False
@@ -464,38 +468,40 @@ class VoiceCapture:
         "收到应答段"日志滞后数秒、靠后面的人顶出来（21:54/21:55 日志）。
         由主循环/等待循环周期性调用，按实际流逝时间推进 PTT 延迟窗口与静音
         累计；feed 恢复有帧时（active）会清零静音，互不冲突。"""
-        if not self._speaking:
-            return
-        if self.last_feed_at is None:
-            return
-        idle = time.time() - self.last_feed_at
-        if idle <= 0:
-            return
-        # PTT 抬起延迟窗口（defer_frames 仅被 feed 逐帧递减，断帧时按时间折算）
-        if self._defer_frames > 0:
-            defer_s = self._defer_frames * 0.02
-            if idle >= defer_s:
-                self._defer_frames = 0
-                self._silence_s += idle - defer_s
+        with self._lock:
+            if not self._speaking:
+                return
+            if self.last_feed_at is None:
+                return
+            idle = time.time() - self.last_feed_at
+            if idle <= 0:
+                return
+            # PTT 抬起延迟窗口（defer_frames 仅被 feed 逐帧递减，断帧时按时间折算）
+            if self._defer_frames > 0:
+                defer_s = self._defer_frames * 0.02
+                if idle >= defer_s:
+                    self._defer_frames = 0
+                    self._silence_s += idle - defer_s
+                else:
+                    self._defer_frames -= max(1, int(idle / 0.02))
+                    return                     # 延迟窗口内：不推进静音
             else:
-                self._defer_frames -= max(1, int(idle / 0.02))
-                return                     # 延迟窗口内：不推进静音
-        else:
-            self._silence_s += idle
-        if self._silence_s * 1000 >= self.silence_end_ms:
-            self._finalize()
+                self._silence_s += idle
+            if self._silence_s * 1000 >= self.silence_end_ms:
+                self._finalize()
 
     def force_finalize(self, defer_ms=0):
         """外部（如 UserTalking 结束信令）要求结束当前语音段。
         - defer_ms=0（默认）：立即切段（讲话人切换用，不吞尾字）
         - defer_ms>0（PTT 抬起）：延迟 defer_ms 毫秒再切，期间若又检测到声音
           （断续/中继台转发停顿）则取消收尾；避免"一句话没说完就断"。"""
-        if not self._speaking:
-            return
-        if defer_ms > 0:
-            self._defer_frames = max(self._defer_frames, defer_ms // 20)
-            return
-        self._finalize()
+        with self._lock:
+            if not self._speaking:
+                return
+            if defer_ms > 0:
+                self._defer_frames = max(self._defer_frames, defer_ms // 20)
+                return
+            self._finalize()
 
 
 # ====================== ASR 客户端（qwen3-asr-flash，OpenAI 兼容） ======================
@@ -1137,9 +1143,21 @@ class NetControlSession:
         if call and score >= int(nc_cfg("confidence_threshold", default=60)):
             if self._current_active:
                 # 同 session 重报不同呼号 = 同一友台纠正/识别修正（如 ASR 把 BFZ
-                # 听成 BLZ，友台随后重报正确呼号）→ 替换旧记录，不打断不排队
+                # 听成 BLZ，友台随后重报正确呼号）→ 替换旧记录，不打断不排队。
+                # 仅限"刚抄收、尚未报信息"的早期窗口：已记录结构化信息后再
+                # 重报不同呼号（20:15:15 实测"BFZ 在等确认时又说话"）视为重复
+                # 确认，不覆盖已确认记录，回"呼号已记录"反馈。
                 if session is not None and session == self._current_session \
                         and (self._current_call or "").upper() != call.upper():
+                    if self._current_entry and self._current_entry[4]:
+                        logger.info(f"{self._current_call} 已记录信息，同 session 重报 "
+                                    f"{call} 不替换（识别修正仅限早期窗口）: {raw}")
+                        self._speak(self._fmt(nc_cfg("ask_ack_text", default=
+                            "抄收，{call_phonetic}，您的呼号已记录，"
+                            "请报告您的QTH、使用设备、天线、功率，Over"),
+                            call=self._current_call,
+                            call_phonetic=callsign_phonetic(self._current_call)))
+                        return
                     return self._replace_checkin(call, signal, wav, raw, session, score)
                 # 不同 session（另一个人）→ 插队：静默记录+排队，不打断
                 return self._queue_interloper(call, signal, raw, session)
@@ -1288,6 +1306,17 @@ class NetControlSession:
             if "呼号" in kw:
                 # 友台在补报呼号（"我的呼号是BG9"之类未拼完整）→ 请其报完整呼号
                 logger.info(f"{self._current_call} 补报呼号: {info}")
+                self._speak(self._fmt(nc_cfg("repeat_text", default=
+                    "{call_phonetic}，请再报一次您的完整呼号，Over"),
+                    call=self._current_call,
+                    call_phonetic=callsign_phonetic(self._current_call)))
+                return
+            # 报名意图（"这里B九B L Z请求参加点名测试"实测 20:15:15：呼号被
+            # ASR 漏字母未解出，不能静默吞掉）→ 引导重报完整呼号
+            join_kw = ("请求参加", "参加点名", "参加测试", "点名测试",
+                       "请求加入", "想参加", "参加一下", "报名")
+            if any(k in kw for k in join_kw):
+                logger.info(f"{self._current_call} 报名意图但未解出呼号，引导重报: {info}")
                 self._speak(self._fmt(nc_cfg("repeat_text", default=
                     "{call_phonetic}，请再报一次您的完整呼号，Over"),
                     call=self._current_call,
@@ -1731,18 +1760,19 @@ class NetControlSession:
         if self._talking_sessions:
             return True
         if self._capture is not None:
-            if self._capture._speaking:
-                idle = float(nc_cfg("vad_idle_seconds", default=2))
-                last = self._capture.last_feed_at
-                if last is None or time.time() - last > idle:
-                    # 正在采集但已 idle 超时：无新帧（对方讲完/链路静默），
-                    # 强制复位采集，避免"信道永久占用"
-                    if last is not None:
-                        logger.info(f"VAD 采集空闲超时（{idle:.0f}s 无新帧），"
-                                    f"复位说话状态")
-                    self._capture._speaking = False
-                    return False
-                return True
+            with self._capture._lock:      # 与 keeper 线程 feed 互斥，防读半状态
+                if self._capture._speaking:
+                    idle = float(nc_cfg("vad_idle_seconds", default=2))
+                    last = self._capture.last_feed_at
+                    if last is None or time.time() - last > idle:
+                        # 正在采集但已 idle 超时：无新帧（对方讲完/链路静默），
+                        # 强制复位采集，避免"信道永久占用"
+                        if last is not None:
+                            logger.info(f"VAD 采集空闲超时（{idle:.0f}s 无新帧），"
+                                        f"复位说话状态")
+                        self._capture._speaking = False
+                        return False
+                    return True
         return False
 
     def _capture_pump(self):
