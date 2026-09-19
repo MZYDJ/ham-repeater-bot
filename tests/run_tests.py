@@ -350,11 +350,15 @@ def test_retry_reset():
     # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 结构化提取并复诵确认
     sess._asr_text = lambda pcm: "我的设备是泉盛K6，天线原机天线，五瓦"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
-    check("同台补充信息归入", len(spoken) == 4 and "信息已记录" in spoken[2]
-          and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
-          and "功率 5 瓦" in spoken[2]
+    # 合并确认：补充段只累积不立即播（避免连播打断），force flush 后统一确认一次
+    check("同台补充信息归入（不立即播）", len(spoken) == 2
           and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
           f"spoken={spoken} entry={sess._current_entry}")
+    sess._flush_pending_report(force=True)
+    check("合并确认含全部字段", len(spoken) == 4 and "信息已记录" in spoken[2]
+          and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
+          and "功率 5 瓦" in spoken[2],
+          f"spoken={spoken}")
     check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
     check("缺 QTH 主动追问", "请再补充您的QTH" in spoken[3],
           f"spoken={spoken}")
@@ -390,6 +394,9 @@ def test_info_followup():
     check("补充段归入友台1", sess._current_call == "BH3XX"
           and "QTH" in (sess._current_entry[4] or ""),
           f"call={sess._current_call} entry={sess._current_entry}")
+    # 合并确认：补充段只累积不立即播，force flush 后统一确认一次
+    check("补充段不立即播报", len(spoken) == 1, f"spoken={spoken}")
+    sess._flush_pending_report(force=True)
     check("补充段复诵信息", len(spoken) == 2 and "信息已记录" in spoken[1]
           and "QTH 咸阳市渭城区" in spoken[1] and "设备 泉盛K6" in spoken[1]
           and "功率 5 瓦" in spoken[1],
@@ -902,6 +909,41 @@ def test_same_session_replace():
           f"spoken={spoken}")
 
 
+def test_report_merged_confirm():
+    print("[信息合并确认：一句话被 VAD 切成多段 → 只播一次完整确认]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    import direct_announce as _da
+    _da.CFG.setdefault("net_control", {})["report_merge_gap_seconds"] = 0.5
+    # 友台报呼号（抄收，播 ack）
+    sess._asr_text = lambda p: "这里是BG9BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    # 同一句话被切成 3 段：设备 → 功率 → QTH（间隔 < 合并窗口）
+    sess._asr_text = lambda p: "使用设备全胜U二"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("第一段不立即播报", len(spoken) == n0, f"spoken={spoken}")
+    sess._asr_text = lambda p: "五瓦"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("第二段仍不播报", len(spoken) == n0, f"spoken={spoken}")
+    sess._asr_text = lambda p: "QTH团结路"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("第三段仍不播报", len(spoken) == n0, f"spoken={spoken}")
+    # 停稳超过合并窗口 → 播一次合并确认（含全部字段）+ 缺失字段追问
+    time.sleep(0.8)
+    sess._flush_pending_report()
+    check("合并确认只播一次且含全部字段",
+          len(spoken) == n0 + 2 and "设备 全胜U二" in spoken[n0]
+          and "功率 5 瓦" in spoken[n0] and "QTH 团结路" in spoken[n0],
+          f"spoken={spoken}")
+    # 再次 flush（无新内容）→ 不重复播
+    sess._flush_pending_report(force=True)
+    check("无新内容不重复确认", len(spoken) == n0 + 2, f"spoken={spoken}")
+
+
 def test_idle_recall():
     print("[空闲重新呼叫：点名中长时间无应答 → 重播开场呼叫]")
     sess = net_control.NetControlSession(link=None)
@@ -1005,7 +1047,7 @@ def main():
                test_llm_call_cap, test_tts_synth_drains_queue,
                test_speech_supersede_waits,
                test_interloper_queued, test_idle_recall,
-               test_same_session_replace,
+               test_same_session_replace, test_report_merged_confirm,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

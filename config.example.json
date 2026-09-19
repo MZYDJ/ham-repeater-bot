@@ -92,6 +92,7 @@
     "grace_seconds": 300,
     "idle_call_seconds": 300,
     "idle_call_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是{net_name}，我是主控{ctrl_call}，点名继续开放，请抄收到信号的友台依次上台报告呼号、QTH、使用设备、天线、功率，这里是{ctrl_phonetic} {ctrl_call}，Over",
+    "report_merge_gap_seconds": 4,
     "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
     "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
     "info_ack_text": "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over",

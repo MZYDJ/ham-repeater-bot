@@ -907,6 +907,9 @@ class NetControlSession:
         self._current_active = False        # 当前友台流程进行中（抄收→追问→确认窗口）：
                                             # 期间收到新呼号视为插队→静默记录+排队，不打断
         self._waiting = []                  # 等候排队的插队者（{"call","signal","session"}）
+        self._pending_at = None             # 最近一次补充信息段时刻：友台一句话被 VAD
+                                            # 切成多段时，合并累积、停稳后统一确认一次
+        self._last_confirmed_info = {}      # 各友台最近一次合并确认播报过的 entry[4]（防重复）
         # 结构化字段永久化：呼号 → {qth, device, antenna, power, signal}（CSV 导出用）
         self._fields = {}
         self._checkin_times = {}            # 呼号 → 抄收时刻 ISO 串（CSV 导出用）
@@ -1057,6 +1060,7 @@ class NetControlSession:
                 pcm16, dur, wav, session = self._seg_queue.get(timeout=1.0)
             except queue.Empty:
                 self._capture_pump()       # 时间驱动收尾：链路静默时也切段（不靠下一个人顶）
+                self._flush_pending_report()   # 合并确认：友台说完停稳后统一播报
                 continue
             self._capture_pump()
             self._process_segment(pcm16, dur, wav, session)
@@ -1079,6 +1083,7 @@ class NetControlSession:
                     timeout=float(nc_cfg("roster_call_timeout", default=12)))
             except queue.Empty:
                 self._capture_pump()       # 时间驱动收尾：链路静默时也切段
+                self._flush_pending_report()   # 合并确认：友台说完停稳后统一播报
                 self._speak(self._fmt(nc_cfg("no_reply_text",
                                              default="无人应答，继续下一位。")))
                 continue
@@ -1191,7 +1196,7 @@ class NetControlSession:
                             "抄收，{call_phonetic}，呼号确认无误，信息已记录，请下一位友台。Over"),
                             call=self._current_call,
                             call_phonetic=callsign_phonetic(self._current_call)))
-                        self._end_current()   # 收尾窗口：轮到排队中的下一位
+                        self._end_current(flush=False)   # 友台已确认，不再重复问
                         return
                     if is_duplicate(new_call, self._checked_calls):
                         logger.info(f"重复抄收 {new_call}（纠正提取），跳过")
@@ -1237,7 +1242,7 @@ class NetControlSession:
                     "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
-                self._end_current()   # 确认收尾：轮到排队中的下一位（若有）
+                self._end_current(flush=False)   # 友台已确认，不再重复问"是否正确"
                 return
             # 结构化字段提取：确认的是结构化内容（QTH/设备/天线/功率/信号），
             # 不再把整句话原样复诵（实测 19:47 "主控是否抄收"被复诵成废话）
@@ -1263,20 +1268,12 @@ class NetControlSession:
                 if self._current_entry[1]:
                     fd.setdefault("signal", self._current_entry[1])
                 self._fields.setdefault(self._current_call, {}).update(fd)
-                tmpl = nc_cfg("info_ack_text", default=
-                    "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over")
-                if "{fields}" in tmpl:
-                    self._speak(self._fmt(tmpl, call=self._current_call,
-                        call_phonetic=callsign_phonetic(self._current_call),
-                        fields=field_str))
-                else:                      # 用户自定义旧模板（无 {fields}）→ 兼容整句复诵
-                    self._speak(self._fmt(tmpl, call=self._current_call,
-                        call_phonetic=callsign_phonetic(self._current_call),
-                        info=info))
                 self._flush_csv()          # 实时落盘：结构化字段更新即写入
-                # 结构化信息仍未记全 → 追问缺失项（每字段最多问一次），齐了才请下一位
-                if self._ask_missing(self._current_call):
-                    return
+                # 合并确认：友台一句话被 VAD 切成多段（实测 20:06:55-20:07:02 六段
+                # 报完设备/功率/天线/QTH/信号），每段立即播"是否正确"会连播六次打断
+                # 对方且互相顶替。改为只累积字段、停稳 report_merge_gap_seconds
+                # （默认 4s）后由 _flush_pending_report 统一确认一次。
+                self._pending_at = time.time()
                 return
             # 无结构化字段的文本分类：
             if any(k in kw for k in ask_kw):
@@ -1348,6 +1345,45 @@ class NetControlSession:
         fd = self._fields.get(call, {}) or {}
         return [k for k in REQUIRED_FIELDS
                 if not str(fd.get(k) or "").strip()]
+
+    def _flush_pending_report(self, force=False):
+        """合并确认：友台连续多段补充信息（同一句话被 VAD 切碎）→ 只播一次完整确认。
+        距最后一段超过 report_merge_gap_seconds（默认 4s）或 force（收尾前）时触发；
+        entry[4] 无新增内容（_last_confirmed_info 相同）则不重复播报。"""
+        if self._pending_at is None or not self._current_active:
+            self._pending_at = None
+            return
+        gap = float(nc_cfg("report_merge_gap_seconds", default=4))
+        if not force and time.time() - self._pending_at < gap:
+            return
+        self._pending_at = None
+        entry = self._current_entry
+        if entry is None:
+            return
+        info = (entry[4] or "").strip()
+        if not info or info == self._last_confirmed_info.get(self._current_call):
+            return
+        self._last_confirmed_info[self._current_call] = info
+        fields = self._fields.get(self._current_call, {}) or {}
+        if fields:
+            field_str = "、".join(
+                f"{FIELD_LABEL.get(k, k)} {v}" for k, v in fields.items())
+        else:
+            field_str = info
+        logger.info(f"{self._current_call} 信息合并确认: {field_str}")
+        tmpl = nc_cfg("info_ack_text", default=
+            "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over")
+        if "{fields}" in tmpl:
+            self._speak(self._fmt(tmpl, call=self._current_call,
+                call_phonetic=callsign_phonetic(self._current_call),
+                fields=field_str))
+        else:                      # 用户自定义旧模板（无 {fields}）→ 兼容整句复诵
+            self._speak(self._fmt(tmpl, call=self._current_call,
+                call_phonetic=callsign_phonetic(self._current_call),
+                info=info))
+        # 结构化信息仍未记全 → 追问缺失项（每字段最多问一次），齐了才请下一位
+        if self._ask_missing(self._current_call):
+            return
 
     def _ask_missing(self, call):
         """结构化信息未记全 → 主动追问缺失项（每字段每友台最多问一次，防无限循环）。
@@ -1435,8 +1471,12 @@ class NetControlSession:
         logger.info(f"当前友台 {self._current_call} 进行中，{call} 插队已静默记录，等候排队")
         self._flush_csv()
 
-    def _end_current(self):
-        """当前友台流程收尾：解除进行中状态；若有人在等候排队，自动轮到下一位。"""
+    def _end_current(self, flush=True):
+        """当前友台流程收尾：解除进行中状态；若有人在等候排队，自动轮到下一位。
+        flush=True 时先补播未确认的信息合并确认（不丢不拖）；友台已主动确认
+        （"正确"）则 flush=False，不再重复问"是否正确"。"""
+        if flush:
+            self._flush_pending_report(force=True)
         self._current_active = False
         if self._waiting:
             self._serve_next_waiting()

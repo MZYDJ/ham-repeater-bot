@@ -146,6 +146,8 @@
     "idle_call_seconds": 300,         // 开放点名中连续多少秒无应答 → 重新呼叫（默认 300=5 分钟）。
                                       // 播报后的回波/应答会刷新"最近活动"，不会连续重复呼叫
     "idle_call_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是{net_name}，我是主控{ctrl_call}，点名继续开放，请抄收到信号的友台依次上台报告呼号、QTH、使用设备、天线、功率，这里是{ctrl_phonetic} {ctrl_call}，Over",  // 空闲重新呼叫话术（点名开始时的呼叫）
+    "report_merge_gap_seconds": 4,        // 信息合并确认窗口（秒）：友台一句话被 VAD 切成多段时，
+                                          // 只累积字段不逐段播报，停稳该时长后统一确认一次（默认 4s）。
     "grace_seconds": 300,             // 到点后的硬性宽限（秒）。防止持续有人讲话导致
                                       // 点名无限延长，宽限耗尽强制收尾（默认 300=5 分钟）
     "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
