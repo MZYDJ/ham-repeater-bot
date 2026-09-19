@@ -813,6 +813,30 @@ def test_tts_synth_drains_queue():
         _da.build_audio = orig_build
 
 
+def test_speech_supersede_waits():
+    print("[接话只播最新：新话术生成后旧话术让位]")
+    sess = net_control.NetControlSession(link=None)
+    sess._capture_pump = lambda: None
+    sess._drain_queue = lambda depth=0: 0
+    sess._someone_speaking = lambda: True   # mock 信道一直被占用
+    # 1) 无新话术：等到超时仍返回 True（原行为不变）
+    sess._speech_seq = 0
+    t0 = time.time()
+    ok = sess._wait_channel_idle(drain=False, newer_than=0)
+    check("无新话术等满超时仍发射", ok is True and time.time() - t0 >= 1.5,
+          f"ok={ok} t={time.time()-t0:.2f}")
+    # 2) 等待期间新话术生成（序号前进）→ 立即放弃本句返回 False
+    sess._speech_seq = 1
+    t0 = time.time()
+    ok = sess._wait_channel_idle(drain=False, newer_than=0)
+    check("有新话术立即放弃旧话术", ok is False and time.time() - t0 < 1.0,
+          f"ok={ok} t={time.time()-t0:.2f}")
+    # 3) 信道空闲：无论序号如何立即返回 True
+    sess._someone_speaking = lambda: False
+    sess._speech_seq = 5
+    check("信道空闲立即发射", sess._wait_channel_idle(drain=False, newer_than=5) is True)
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -892,6 +916,7 @@ def main():
                test_ctrl_call_filter, test_same_session_new_call,
                test_echo_other_speaker, test_llm_fallback, test_vad_stuck_release,
                test_llm_call_cap, test_tts_synth_drains_queue,
+               test_speech_supersede_waits,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")

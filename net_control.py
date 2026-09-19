@@ -910,6 +910,8 @@ class NetControlSession:
         self._csv_path = None               # 实时点名记录 CSV 路径（点名开始即建，持续更新）
         self._last_tx_end = None            # 最近一次发射结束时刻（中继台回波过滤用）
         self._last_spoken_text = ""         # 最近一次播报文本（回波文本重合判定用）
+        self._speech_seq = 0                # 播报序号：新话术生成即 +1；等待发射的旧话术
+                                            # 检测到序号前进就放弃（只播最新，接话不滞后）
         self._last_activity = time.time()       # 最近一次应答活动时间（"到点后安静N秒"判定用）
         self._talking_gate = bool(nc_cfg("use_talking_gate", default=True))
         self._talking_sessions = set()          # 服务器已广播"开始讲话"的远端 session
@@ -1630,10 +1632,14 @@ class NetControlSession:
             except Exception:
                 pass
 
-    def _wait_channel_idle(self, drain=True):
+    def _wait_channel_idle(self, drain=True, newer_than=None):
         """先听后说：抢麦前等待信道空闲。当前无人讲话 → 立即返回；
         有人在讲 → 等待对方讲完（最多 tx_wait_timeout 秒，超时仍发射，
         避免点名流程被无限拖住）。返回 True 表示可发射。
+
+        newer_than：本句的播报序号。等待期间若已有更新的播报请求生成
+        （self._speech_seq > newer_than），说明本句已过时（友台又说了后续
+        内容/新友台上麦），放弃本句返回 False——只播最新话术，接话不滞后。
 
         等待期间**继续识别**：TTS 合成完成、等待发射的窗口里，友台可能接连
         上麦（多人排队），此时不能停泵丢段——循环里同步消费 _seg_queue 并
@@ -1646,6 +1652,9 @@ class NetControlSession:
                     f"期间继续识别…")
         deadline = time.time() + timeout
         while time.time() < deadline and not self._stop.is_set():
+            if newer_than is not None and self._speech_seq > newer_than:
+                logger.info("已生成更新的点名播报，放弃本句（接话只播最新）")
+                return False
             if not self._someone_speaking():
                 logger.info("信道已空闲，开始播报")
                 return True
@@ -1694,6 +1703,8 @@ class NetControlSession:
         text = text.strip()
         logger.info(f"点名播报: {text}")
         self._last_spoken_text = text      # 回波过滤：与紧随其后收到的短段比对
+        self._speech_seq += 1              # 新话术序号：旧话术等待发射时据此让位
+        my_seq = self._speech_seq
         mp3 = ""
         try:
             if self.tts_func:
@@ -1715,6 +1726,9 @@ class NetControlSession:
         if not mp3:
             logger.error("点名 TTS 无输出，跳过该句播报")
             return
+        if self._speech_seq > my_seq:      # 合成期间已有更新话术：跳过构建/发射
+            logger.info("合成期间已生成更新的点名播报，跳过本句（旧话术）")
+            return
         try:
             packets, n = direct_announce.build_audio(mp3)
         except Exception as e:
@@ -1734,6 +1748,10 @@ class NetControlSession:
                 with self._play_lock:
                     if self._stop.is_set():
                         return
+                    # 等锁期间已有更新的播报请求：本句已过时，放弃（只播最新）
+                    if self._speech_seq > my_seq:
+                        logger.info("已生成更新的点名播报，跳过本句（旧话术）")
+                        return
                     s = None
                     if self.link is not None:
                         for _ in range(30):    # 等广播让出 busy（含嵌套排队场景，最多30s）
@@ -1747,7 +1765,8 @@ class NetControlSession:
                         return
                     # 先听后说：抢麦前等待信道空闲（当前无人讲话才按下 PTT）
                     if s is not None:
-                        self._wait_channel_idle(drain=False)
+                        if not self._wait_channel_idle(drain=False, newer_than=my_seq):
+                            return          # 等信道期间已有更新播报，放弃本句
                     if self._stop.is_set():
                         return
                     try:
