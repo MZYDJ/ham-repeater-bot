@@ -693,8 +693,48 @@ class LlmClient:
 
 
 # ====================== TTS（独立于 announce.py，避免循环依赖） ======================
+def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
+    """阿里云百炼 CosyVoice 官方 SDK 合成（dashscope.audio.tts_v2.SpeechSynthesizer，
+    WebSocket 流式，与官方示例一致；首包延迟低，支持 cosyvoice-v3.5-plus/flash 复刻音色）。
+    写入 mp3 文件。复用 asr.api_key；模型/音色见 tts.cosyvoice_*。"""
+    import dashscope
+    from dashscope.audio.tts_v2 import SpeechSynthesizer
+    api_key = direct_announce.cfg_get("asr", "api_key", default="")
+    model = direct_announce.cfg_get("tts", "cosyvoice_model",
+                                    default="cosyvoice-v3.5-flash")
+    voice = direct_announce.cfg_get("tts", "cosyvoice_voice", default="")
+    if not api_key or not voice:
+        raise RuntimeError("CosyVoice 未配置：asr.api_key 或 tts.cosyvoice_voice")
+    dashscope.api_key = api_key
+    try:
+        synthesizer = SpeechSynthesizer(
+            model=model, voice=voice,
+            format=direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3"),
+            sample_rate=int(direct_announce.cfg_get(
+                "tts", "cosyvoice_sample_rate", default=24000)),
+            volume=int(direct_announce.cfg_get("tts", "cosyvoice_volume", default=50)),
+            rate=float(direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0)),
+            pitch=float(direct_announce.cfg_get("tts", "cosyvoice_pitch", default=1.0)),
+            timeout=timeout,
+        )
+    except TypeError:                    # 旧版 dashscope 无 timeout 构造参数
+        synthesizer = SpeechSynthesizer(
+            model=model, voice=voice,
+            format=direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3"),
+            sample_rate=int(direct_announce.cfg_get(
+                "tts", "cosyvoice_sample_rate", default=24000)),
+            volume=int(direct_announce.cfg_get("tts", "cosyvoice_volume", default=50)),
+            rate=float(direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0)),
+            pitch=float(direct_announce.cfg_get("tts", "cosyvoice_pitch", default=1.0)),
+        )
+    audio = synthesizer.call(text)
+    if not audio:
+        raise RuntimeError("CosyVoice SDK 返回空音频")
+    cache_path.write_bytes(audio)
+
+
 def _cosyvoice_synth(text, cache_path, timeout=28):
-    """阿里云百炼 CosyVoice 非流式合成，写入 mp3 文件。
+    """阿里云百炼 CosyVoice HTTP 接口合成（兜底，SDK 不可用时使用），写入 mp3 文件。
     复用 asr.api_key（同一百炼账号、独立免费额度）；模型/音色见 tts.cosyvoice_*。
     - cosyvoice-v3.5-flash/v3.5-plus 仅华北2（北京）地域可用，且无系统音色，
       需先在百炼控制台"声音设计/声音复刻"创建音色，把音色 ID 填入 tts.cosyvoice_voice
@@ -749,7 +789,8 @@ def _cosyvoice_synth(text, cache_path, timeout=28):
 def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=30,
                max_retries=2, retry_delay=5.0):
     """点名 TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
-    tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice（快、稳、复用 asr.api_key）；
+    tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice：优先官方 SDK（tts_v2 WebSocket，
+    与官方示例一致），SDK 未安装时自动回退 HTTP 接口；复用 asr.api_key。
     tts.engine=edge → Edge-TTS 兜底。与 announce.py 同款"缓存 + dry-run 校验"，键为全文 md5。"""
     import hashlib
     engine = direct_announce.cfg_get("tts", "engine", default="cosyvoice")
@@ -766,6 +807,12 @@ def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=
         def _syn():
             try:
                 if engine == "cosyvoice":
+                    if direct_announce.cfg_get("tts", "cosyvoice_sdk", default=True):
+                        try:
+                            _cosyvoice_synth_sdk(text, cache_path, timeout=timeout_inner)
+                            return
+                        except ImportError:
+                            logger.warning("dashscope SDK 未安装，点名 TTS 回退 HTTP 接口")
                     _cosyvoice_synth(text, cache_path, timeout=timeout_inner)
                 else:
                     import asyncio
@@ -780,6 +827,8 @@ def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=
         t.join(timeout=timeout_join)
         if not t.is_alive() and cache_path.exists() and direct_announce.dry_validate_mp3(cache_path):
             return str(cache_path)
+        if err:
+            logger.warning(f"点名 TTS 合成失败 (第{attempt}/{max_retries}次): {err[0]}")
         if cache_path.exists():
             try:
                 cache_path.unlink()

@@ -15,6 +15,7 @@
   "tts": {
     "engine": "cosyvoice",
     "voice": "zh-CN-XiaoxiaoNeural",
+    "cosyvoice_sdk": true,
     "cosyvoice_model": "cosyvoice-v3.5-flash",
     "cosyvoice_voice": "",
     "cosyvoice_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",

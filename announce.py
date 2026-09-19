@@ -347,7 +347,10 @@ def _net_stop():
         _net_session.stop()
         _net_session = None
 def schedule_net_control():
-    task_queue.put("net_control")
+    # 点名启动不排队：蓄水池/预热 TTS（edge 重试 3 次可达 ~100s）会阻塞任务队列，
+    # 若点名 job 排队等待会晚开始（实测晚 73s）。_net_start 内部仅启动会话线程
+    # 立即返回，发射互斥由常驻链路 busy 锁保证，与队列串行不冲突。
+    _net_start()
 def _next_announce_time(now: datetime.datetime) -> datetime.datetime:
     """下一个准点播报时刻（minute ∈ {0,30}）"""
     t = now.replace(second=0, microsecond=0)

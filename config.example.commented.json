@@ -23,6 +23,9 @@
     "voice": "zh-CN-XiaoxiaoNeural",   // edge 引擎用的语音角色（点名 engine=cosyvoice 时本字段不生效）
     // —— CosyVoice 引擎配置（engine=cosyvoice 时生效）——
     // 复用 asr.api_key（同一百炼账号；ASR 与语音合成免费额度相互独立、不共享）
+    "cosyvoice_sdk": true,             // true=用官方 dashscope SDK（tts_v2 SpeechSynthesizer，WebSocket 流式，
+                                       //   与官方示例一致，v3.5-plus/flash 复刻音色推荐）；容器未装 dashscope
+                                       //   时自动回退 HTTP 接口并打告警日志
     "cosyvoice_model": "cosyvoice-v3.5-flash",  // 语音合成模型；可换 cosyvoice-v3-flash（有系统音色 longanhuan 等，免创建音色）
     "cosyvoice_voice": "",             // 必填：音色 ID。v3.5 系列无系统音色，需先在百炼控制台
                                        // 用"声音设计/声音复刻"创建音色（创建免费），把音色 ID 填这里；
