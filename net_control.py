@@ -454,6 +454,16 @@ class VoiceCapture:
         self.last_feed_at = None        # 最近一次收到音频帧的时刻（采集卡死检测用）
         self.last_seg_end_at = None     # 最近一次切出语音段的时刻（主控抢麦前的
                                         # 短窗口"仍视为占用"判据，防打断对方）
+        # 信令整段模式：对讲机半双工下 PTT（UserTalking talking=true→false）
+        # 才是"一句话"的权威边界。talking=true 起讲的新段标记 _ptt_bound，
+        # 该段不因 VAD 静音切段（对方说话中停顿≠说完），只在 PTT 松开
+        # （force_finalize）或超长兜底时收尾；无信令（降级纯 VAD）时
+        # _ptt_bound=False，回退静音切段。_pending_ptt_bound 为 talking=true
+        # 到达时刻（0=无），起讲时 5s 内继承为当前段约束。
+        # ptt_bound_mode=false 可关停整段模式，回退纯 VAD 静音切段。
+        self.ptt_bound_mode = bool(nc_cfg("ptt_bound_mode", default=True))
+        self._ptt_bound = False
+        self._pending_ptt_bound = 0.0
 
     def _rms(self, frame):
         s = array.array('h')
@@ -492,6 +502,12 @@ class VoiceCapture:
                         self._silence_s = 0.0
                         self._buf48 = bytearray(frame)
                         self._seg_session = session
+                        # 起讲继承信令约束：talking=true 后 5s 内起讲 → 本段
+                        # 由 PTT 边界管理（静音不切段），等 talking=false 收尾
+                        if (self._pending_ptt_bound
+                                and time.time() - self._pending_ptt_bound <= 5.0):
+                            self._ptt_bound = True
+                        self._pending_ptt_bound = 0.0
                 else:
                     self._buf48 += frame
                     if active:
@@ -502,7 +518,11 @@ class VoiceCapture:
                     else:
                         self._silence_s += 0.02
                     dur = len(self._buf48) / (48000 * 2)
-                    if (self._silence_s * 1000 >= self.silence_end_ms
+                    # 信令整段（_ptt_bound）：静音不切段——对讲机半双工下对方
+                    # 说话中停顿≠说完，等 PTT 松开（force_finalize）才是句边界；
+                    # 仅保留超长截断兜底。无信令约束的段（VAD 兜底）照旧静音切段。
+                    if ((not self._ptt_bound
+                            and self._silence_s * 1000 >= self.silence_end_ms)
                             or dur >= self.max_segment_ms / 1000):
                         self._finalize()
 
@@ -515,6 +535,7 @@ class VoiceCapture:
         self._silence_s = 0.0
         self._seg_session = None
         self._defer_frames = 0
+        self._ptt_bound = False              # 段已切出，信令约束随之结束
         dur = len(pcm48) / (48000 * 2)
         if dur < self.min_segment_ms / 1000:
             return
@@ -541,7 +562,9 @@ class VoiceCapture:
         _speaking 段会挂到下一个讲话人 PTT 才被 force_finalize 顶出——实测
         "收到应答段"日志滞后数秒、靠后面的人顶出来（21:54/21:55 日志）。
         由主循环/等待循环周期性调用，按实际流逝时间推进 PTT 延迟窗口与静音
-        累计；feed 恢复有帧时（active）会清零静音，互不冲突。"""
+        累计；feed 恢复有帧时（active）会清零静音，互不冲突。
+        信令整段（_ptt_bound）的段：静音累计**不触发切段**（对方停顿≠说完），
+        仅在链路彻底静默超过 max_segment_ms 或收到 talking=false 时收尾。"""
         with self._lock:
             if not self._speaking:
                 return
@@ -561,6 +584,13 @@ class VoiceCapture:
                     return                     # 延迟窗口内：不推进静音
             else:
                 self._silence_s += idle
+            # 信令约束段：静音不作为句边界（等 PTT 松开才切，对方停顿≠说完）。
+            # 兜底：静音累计 ≥ 2×silence_end_ms（对方说完但 talking=false 信令
+            # 偶发丢失/平台不下发）→ 强制切段送 ASR，防"整段模式"卡死点名。
+            if self._ptt_bound:
+                if self._silence_s * 1000 >= self.silence_end_ms * 2:
+                    self._finalize()
+                return
             if self._silence_s * 1000 >= self.silence_end_ms:
                 self._finalize()
 
@@ -576,6 +606,15 @@ class VoiceCapture:
                 self._defer_frames = max(self._defer_frames, defer_ms // 20)
                 return
             self._finalize()
+
+    def mark_ptt_bound(self):
+        """收到 UserTalking talking=true（对方按下 PTT）：记录信令到达时刻，
+        下一次起讲的段继承为"信令整段"（静音不切段，等 talking=false 收尾）。
+        对讲机半双工下 PTT 起落才是"一句话"的权威边界。"""
+        if not self.ptt_bound_mode:
+            return
+        with self._lock:
+            self._pending_ptt_bound = time.time()
 
 
 # ====================== ASR 客户端（qwen3-asr-flash，OpenAI 兼容） ======================
@@ -1919,8 +1958,9 @@ class NetControlSession:
                     if sess is not None:
                         self._talking_sessions.discard(sess)
                         self._talking_active.pop(sess, None)
-                    # PTT 抬起：延迟 ptt_release_delay_ms 再收尾（防断续断句），
-                    # 延迟窗口内有声音会自动取消
+                    # PTT 抬起（talking=false）＝本句话说完的权威边界：延迟
+                    # ptt_release_delay_ms 再收尾（防断续断句），延迟窗口内
+                    # 有声音会自动取消；信令约束段在此收尾，不再等 VAD 静音。
                     self._capture.force_finalize(
                         defer_ms=nc_cfg("ptt_release_delay_ms", default=3000))
                 elif talking == 1:
@@ -1929,6 +1969,7 @@ class NetControlSession:
                         self._talking_sessions.add(sess)
                         self._talking_active[sess] = time.time()
                     self._capture.force_finalize()   # 上一位的段在此收尾（讲话人切换）
+                    self._capture.mark_ptt_bound()   # 本段受 PTT 边界约束（整段模式）
         except Exception:
             pass
 
@@ -1978,6 +2019,14 @@ class NetControlSession:
             if time.time() - last > stale:
                 self._talking_sessions.discard(s)
                 self._talking_active.pop(s, None)
+                # 信令丢失（对方讲完但 talking=false 未下发）：解除该段的
+                # 整段约束，恢复 VAD 静音收尾兜底（否则段会一直挂到 2×silence）
+                if (self._capture is not None
+                        and self._capture._ptt_bound
+                        and (self._capture._seg_session is None
+                             or self._capture._seg_session == s)):
+                    with self._capture._lock:
+                        self._capture._ptt_bound = False
                 logger.info(f"讲话信令陈旧超时（{stale:.0f}s 无语音），"
                             f"释放 session {s} 的信道占用")
         if self._talking_sessions:
@@ -1985,6 +2034,12 @@ class NetControlSession:
         if self._capture is not None:
             with self._capture._lock:      # 与 keeper 线程 feed 互斥，防读半状态
                 if self._capture._speaking:
+                    # 信令整段：占用判定以信令活性为准——对方 PTT 按住断续
+                    # 说话（停顿后继续说），VAD idle 复位会把段误判为"已讲完"
+                    # → 主控抢麦打断。信令约束段的收尾只由 talking=false 触发，
+                    # 故这里不因 idle 复位，等段真正切出（_speaking=False）。
+                    if self._capture._ptt_bound:
+                        return True
                     idle = float(nc_cfg("vad_idle_seconds", default=2))
                     last = self._capture.last_feed_at
                     if last is None or time.time() - last > idle:

@@ -168,6 +168,44 @@ def test_voice_capture():
     check("延迟耗尽后切段", len(segs6) == 1,
           f"segs6={[(round(d,2), w) for d, w in segs6]}")
 
+    # 信令整段（_ptt_bound）：talking=true 起讲的段，说话中停顿不切段，
+    # 等 PTT 抬起（force_finalize）才作为完整一段切出（对讲机半双工边界）
+    segs7 = []
+    cap7 = VoiceCapture(threshold=2000, silence_end_ms=300, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs7.append((d, w)))
+    cap7.mark_ptt_bound()                        # UserTalking talking=true
+    cap7.feed(bytes(tone[:9600]))                # 200ms 语音（起讲，继承 ptt_bound）
+    with mock.patch("net_control.time.time", return_value=cap7.last_feed_at + 0.5):
+        cap7.pump()                              # 静音 0.5s > silence_end 300ms，
+                                                 # 但信令约束 → 不切段（停顿≠说完）
+    check("信令整段：静音停顿不切段", len(segs7) == 0,
+          f"segs7={[(round(d,2), w) for d, w in segs7]}")
+    cap7.feed(bytes(tone[:9600]))                # 停顿后继续说（仍同一段）
+    cap7.force_finalize(defer_ms=0)              # PTT 抬起 → 完整段切出
+    check("信令整段：PTT 抬起才切", len(segs7) == 1 and 0.18 <= segs7[0][0] <= 0.22,
+          f"segs7={[(round(d,2), w) for d, w in segs7]}")
+
+    # 信令整段兜底：对方说完但 talking=false 丢失 → 静音超 2×silence_end 强制切
+    segs8 = []
+    cap8 = VoiceCapture(threshold=2000, silence_end_ms=300, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs8.append((d, w)))
+    cap8.mark_ptt_bound()
+    cap8.feed(bytes(tone[:9600]))
+    with mock.patch("net_control.time.time", return_value=cap8.last_feed_at + 0.7):
+        cap8.pump()                              # 静音 0.7s ≥ 2×300ms → 兜底切段
+    check("信令整段：静音超2倍兜底切段", len(segs8) == 1,
+          f"segs8={[(round(d,2), w) for d, w in segs8]}")
+
+    # 无信令约束（VAD 兜底）：照旧静音切段（平台不下发信令时的降级路径）
+    segs9 = []
+    cap9 = VoiceCapture(threshold=2000, silence_end_ms=300, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs9.append((d, w)))
+    cap9.feed(bytes(tone[:9600]))                # 无 mark_ptt_bound → 普通 VAD 段
+    with mock.patch("net_control.time.time", return_value=cap9.last_feed_at + 0.5):
+        cap9.pump()                              # 静音 0.5s > 300ms → 切段
+    check("无信令约束走 VAD 切段", len(segs9) == 1,
+          f"segs9={[(round(d,2), w) for d, w in segs9]}")
+
 
 def test_wav_and_resample():
     print("[WAV 落盘与重采样]")

@@ -108,6 +108,7 @@
     "min_segment_ms": 400,
     "max_segment_ms": 30000,
     "seg_grace_seconds": 3,
+    "ptt_bound_mode": true,
     "ptt_release_delay_ms": 3000,
     "use_talking_gate": true,
     "asr_min_seconds": 1.0,
@@ -136,7 +137,6 @@
       "model": "glm-4.5-flash",
       "base_url": "https://open.bigmodel.cn/api/paas/v4"
     },
-    "ptt_release_delay_ms": 1000,
     "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",
     "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over"
   }
