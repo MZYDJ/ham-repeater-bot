@@ -26,7 +26,7 @@ def cfg_get(*path, default=None):
     return direct_announce.cfg_get(*path, default=default)
 # 滔滔链路账号（来自配置 talk 段；与 direct_announce 同源）
 TALK_USERNAME = cfg_get("talk", "username", default="")
-TALK_PASSWORD = cfg_get(	alk", "password", default="")
+TALK_PASSWORD = cfg_get("talk", "password", default="")
 # TTS 配置
 TTS_VOICE = cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
 TTS_TIMEOUT_INNER = cfg_get("tts", "timeout_inner", default=28)   # 内层协程超时（秒）
