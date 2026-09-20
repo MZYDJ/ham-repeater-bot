@@ -254,6 +254,14 @@ def test_decode_callsign():
     check("解释法部分连写", r["callsign"] == "BI9GCW", f"{r}")
     r = decode_callsign("please repeat your callsign")
     check("普通英文句不产生呼号", r["callsign"] is None, f"{r}")
+    # 重复呼号去重（实测 22:02 "B R九A B B R九A B" 被最左最长误取 BR9ABB）
+    r = decode_callsign("B R九A B B R九A B。")
+    check("重复呼号取单遍", r["callsign"] == "BR9AB", f"{r}")
+    r = decode_callsign("B R九A B B R九A B B R九A B。")
+    check("重复呼号三遍取单遍", r["callsign"] == "BR9AB", f"{r}")
+    # Beta 词表（实测 22:03 "Bravo Romeo Nine Alpha Beta"→BR9AB 非 BR9ABE）
+    r = decode_callsign("错了错了，这里是B二九A B，Bravo Romeo Nine Alpha Beta。")
+    check("Beta 映射为B", r["callsign"] == "BR9AB", f"{r}")
 
 
 def test_asr_body():
@@ -1086,6 +1094,57 @@ def test_suspend_resume():
           not link._suspended and link._backoff == 30.0)
 
 
+def test_keeper_busy_cede_and_waitfor_onmsg():
+    print("[常驻抢麦失败根因：busy 期间 keeper 让位 + wait_for 回执不被 on_msg 劫走]")
+    import direct_announce as _da
+    import struct as _st
+
+    class _FakeSock:
+        def __init__(self):
+            self.buf = b""
+            self.injected = []
+        def settimeout(self, t):
+            pass
+        def recv(self, n):
+            if self.injected:
+                self.buf += self.injected.pop(0)
+            if not self.buf:
+                raise _sok.timeout
+            d, self.buf = self.buf[:n], self.buf[n:]
+            return d
+
+    def _frame(t, payload):
+        return _st.pack(">HI", t, len(payload)) + payload
+
+    # 1) busy 期间 keeper 不 drain（socket 由播报线程独占读）
+    link = _da.PersistentAnnouncer(username="u", password="p")
+    fake_c = type("FC", (), {"drain_calls": 0, "drain": lambda self, idle_rounds=2: setattr(self, "drain_calls", self.drain_calls + 1) or []})()
+    link._sess = type("S", (), {"c": fake_c, "session": 1, "close": lambda self: None})()
+    link._busy.set()
+    for _ in range(5):
+        if link._busy.is_set():
+            continue
+        link._sess.c.drain()
+    check("busy 期间 keeper 不 drain", fake_c.drain_calls == 0,
+          f"drain_calls={fake_c.drain_calls}")
+    link._busy.clear()
+
+    # 2) wait_for 等待 ApplyMic 回执时，途中下行经 on_msg 转发、回执不被劫走
+    import socket as _sok
+    applymic_ack = _frame(14, b"\x10\x00\x18\x01")
+    talk_sig = _frame(15, b"\x08\xff\xff\xff\xff\x07\x10\x00\x18\x01")
+    sock = _FakeSock()
+    sock.injected = [talk_sig, applymic_ack]
+    c = _da.Client.__new__(_da.Client)
+    c.sock = sock
+    c.buf = b""
+    c.send = lambda t, p: None
+    got = []
+    t, p = c.wait_for(6, (14,), on_msg=lambda t2, p2: got.append(t2))
+    check("回执类型 14 被 wait_for 返回", t == 14, f"t={t}")
+    check("途中下行 15 经 on_msg 转发", got == [15], f"got={got}")
+
+
 def test_power_highpower_and_device_gt12():
     print("[20:49 实测长句：功率档位词+设备型号中文数字（森海科斯G T幺二）]")
     text = ("我QTH是兴平南关西路，设备情况森海科斯G T幺二，原机天线，"
@@ -1322,6 +1381,7 @@ def main():
                test_join_intent_guide, test_checkedin_repeat_feedback,
                test_replace_guard,
                test_suspend_resume,
+               test_keeper_busy_cede_and_waitfor_onmsg,
                test_power_highpower_and_device_gt12, test_duplicate_report_fields,
                test_relay_same_session_interloper, test_similar_callsign_cross_session_replace,
                test_spell_merge_retry, test_spell_merge_not_half,

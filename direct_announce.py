@@ -543,12 +543,17 @@ class Client:
                 msgs.append((t, self.buf[6:6 + l]))
                 self.buf = self.buf[6 + l:]
         return msgs
-    def wait_for(self, seconds, wanted_types):
+    def wait_for(self, seconds, wanted_types, on_msg=None):
         end = time.time() + seconds
         while time.time() < end:
             for t, p in self.pump(0.5):
                 if t in wanted_types:
                     return t, p
+                if on_msg is not None:        # 非目标消息转发（播报线程独占读期间不丢下行）
+                    try:
+                        on_msg(t, p)
+                    except Exception:
+                        pass
         return None, None
     def close(self):
         try:
@@ -574,10 +579,13 @@ class DirectAnnouncer:
     announce_once() 是一步到位的便捷组合（CLI / 容错兜底用）。
     凭据由构造函数传入，不依赖模块级硬编码。"""
     def __init__(self, host=HOST, port=PORT, use_tls=True,
-                 username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL):
+                 username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL,
+                 on_msg=None):
         self.host, self.port, self.use_tls = host, port, use_tls
         self.username, self.password, self.ent_id = username, password, ent_id
         self.model = model
+        self.on_msg = on_msg            # 可选下行回调（t, p）：播报线程读到非目标消息时
+                                        # 转发（点名接收侧在抢麦/发包期间不能丢下行）
         self.c = None
         self.session = None
     def connect(self):
@@ -587,10 +595,13 @@ class DirectAnnouncer:
         self.session = login(self.c, self.username, self.password, self.ent_id, self.model)
         print("登录成功 session=%s" % self.session)
     def take_mic(self):
-        """抢麦 + 上报开始说话（UI显示说话人/中继台建链触发）"""
+        """抢麦 + 上报开始说话（UI显示说话人/中继台建链触发）。
+        播报线程独占读取 socket（PersistentAnnouncer.keeper 在 busy 期间让位）：
+        wait_for 读到 ApplyMic 回执前，途中收到的其他下行（他人抢台信令/语音包）
+        经 on_msg 回调出去，点名接收侧不丢数据。"""
         c = self.c
         c.send(14, build_apply_mic(True))
-        t, p = c.wait_for(6, (14,))
+        t, p = c.wait_for(6, (14,), on_msg=self.on_msg)
         d = pb_dict(p) if t == 14 else {}
         if t is None or not d.get(3):
             raise RuntimeError("抢麦失败: %s" % (d or "6秒无响应"))
@@ -601,7 +612,10 @@ class DirectAnnouncer:
         再匀速发包(120ms/包)→尾巴冲刷→上报停止说话→放麦→收回执。成功返回 True。
         必须在 take_mic() 之后调用。
         abort_check：每批发包前调用的回调（返回 True 表示信道被他人占用/抢台，
-        立即停止发包并放麦让位，返回 False）。用于点名播报时检测他人讲话。"""
+        立即停止发包并放麦让位，返回 False）。用于点名播报时检测他人讲话。
+        发包循环内周期性 pump 下行：①保持他人抢台检测（abort_check 依赖
+        下行 UserTalking 信令）；②busy 期间 socket 由本线程独占读取（keeper
+        让位），非目标消息经 on_msg 转发给点名接收侧。"""
         c = self.c
         if verbose:
             print("延迟 %.0fms 后开始发包" % (LEAD_DELAY * 1000))
@@ -620,6 +634,11 @@ class DirectAnnouncer:
             n_sent += 1
             if verbose and n_sent % 50 == 0:
                 print("  已发 %d/%d 包 (%.0f%%)" % (n_sent, len(packets), 100 * n_sent / len(packets)))
+            # 发包间隙读下行：放在 sleep 前（pump 最多阻塞 20ms，被等待窗口吸收，
+            # 不破坏 120ms 绝对节奏）。保持他人抢台检测 + busy 期 socket 独占读取。
+            if self.on_msg is not None:
+                for t, p in c.pump(0.02):
+                    self.on_msg(t, p)
             target = start + (i + 1) * PACKET_PERIOD   # 绝对时钟对齐，消除累计漂移
             delay = target - time.time()
             if delay > 0:
@@ -651,13 +670,15 @@ class PersistentAnnouncer:
     上限防互踢风暴）；断线异常 → 守护线程自动重连，失败 10s 后再试。"""
     def __init__(self, host=HOST, port=PORT, use_tls=True,
                  username=USERNAME, password=PASSWORD, ent_id=None, model=MODEL,
-                 ping_interval=2.5, on_event=None, on_downlink=None):
+                 ping_interval=2.5, on_event=None, on_downlink=None, on_msg=None):
         self._cfg = dict(host=host, port=port, use_tls=use_tls,
                          username=username, password=password, ent_id=ent_id,
                          model=model)
         self._ping_interval = ping_interval
         self._on_event = on_event          # on_event(kind, detail)：removed/reconnected/dead
         self._on_downlink = on_downlink    # on_downlink(msg_type, payload)：下行泵每帧回调（点名接收侧用）
+        self.on_msg = on_msg               # 播报线程独占读期间的额外下行回调（同上，busy 期由
+                                           # DirectAnnouncer 内部 pump 触发，点名接收侧不丢数据）
         self._sess = None                  # 当前 DirectAnnouncer
         self._lock = threading.Lock()      # 串行化 socket IO 与会话获取
         self._busy = threading.Event()     # 播报独占标志
@@ -686,7 +707,7 @@ class PersistentAnnouncer:
                 self._sess = None
     def _rebuild(self):
         """建立新连接替换旧的（须持锁调用）"""
-        s = DirectAnnouncer(**self._cfg)
+        s = DirectAnnouncer(**self._cfg, on_msg=self.on_msg)
         s.connect()
         if self._sess:
             try:
@@ -701,20 +722,11 @@ class PersistentAnnouncer:
         while not self._stop.is_set():
             time.sleep(0.5)
             if self._busy.is_set():
-                # 播报独占期间仍泵下行（只读不写：socket 全双工，与播报线程 send 并发安全），
-                # 供点名接收侧做"他人抢台检测"——若 busy 时完全停泵，
-                # 播报期间友台说话会完全听不到（实测 19:46 抢台被无视的根因）
-                s = self._sess
-                if s is not None and s.c is not None:
-                    try:
-                        for t, p in s.c.drain():
-                            if self._on_downlink is not None:
-                                try:
-                                    self._on_downlink(t, p)
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
+                # 播报独占期间**完全不碰 socket**：take_mic/play 在播报线程内
+                # 独占读取（on_msg 泵下行），keeper 若同时 drain 会把 ApplyMic
+                # 回执/下行消息抢走 → 主线程 wait_for 6s 无回执报"抢麦失败"
+                # （实测 22:05-22:06 连续 3 次常驻抢麦失败、短链兜底的根因）。
+                # 他人抢台检测由 DirectAnnouncer.play 的 on_msg 泵保持，不丢。
                 continue
             removed = False
             with self._lock:

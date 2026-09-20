@@ -86,6 +86,8 @@ PHONETIC_ITU = {
     "niner": "9", "tree": "3", "fower": "4", "fife": "5",
     # ASR 对解释法单词的常见听写变体（中英混识实测）：Foxtrot→Florida/follow/fox
     "florida": "F", "fox": "F", "follow": "F",
+    # Beta（非标准但业余圈/ASR 常见，实测 22:03 "Bravo Romeo Nine Alpha Beta"）
+    "beta": "B",
 }
 # 常见中文音译变体（本地台网习惯可经配置 net_control.extra_vocab 扩展；此处覆盖主流写法）
 PHONETIC_ZH = {
@@ -221,6 +223,27 @@ def decode_callsign(text, regex=""):
             seq.append(m)
         unknowns += unk
     full = "".join(seq)
+    # 重复呼号去重：友台常把呼号报两遍（"B R九A B B R九A B"→全串
+    # "BR9ABBR9AB"），最左最长匹配会把第二遍的首字母吸进后缀
+    # （BR9ABB）。收集所有合法呼号子串，若存在两个相同呼号紧接
+    # （c1==c2 且 i2==j1），说明是重复播报，截断到第一遍结束。
+    all_calls = []
+    for i in range(len(full)):
+        for j in range(i + 1, len(full) + 1):
+            if call_re.fullmatch(full[i:j]):
+                all_calls.append((i, j, full[i:j]))
+    dup_end = None
+    for (i1, j1, c1) in all_calls:
+        for (i2, j2, c2) in all_calls:
+            if (i1, j1) == (i2, j2):
+                continue
+            if c1 == c2 and i2 == j1:      # 第二遍紧接第一遍结束处
+                dup_end = j1
+                break
+        if dup_end is not None:
+            break
+    if dup_end is not None:
+        full = full[:dup_end]
     best = None
     for i in range(len(full)):                     # 最左
         for j in range(len(full), i, -1):          # 最长（后缀纯字母，无数字粘连）
@@ -1048,6 +1071,7 @@ class NetControlSession:
         self._ever_talk = False                 # 本会话是否收到过任何开始讲话信令
         self._gate_started = time.time()
         self._preempted = threading.Event()     # 播报发射中检测到他人讲话（抢占让位）
+        self._shortlink_tx = False              # 短链兜底播报发射中（回声防采集）
         self._asr = None
         self._llm = None
         self._llm_calls = 0                 # 每轮点名 LLM 兜底调用计数（防超时拖死）
@@ -1896,6 +1920,8 @@ class NetControlSession:
                 (pcm16, dur, wav, session)))
         if self.link is not None:
             self.link._on_downlink = self._on_downlink      # 注册下行分发（点名期间）
+            self.link.on_msg = self._on_downlink            # 播报线程独占读期间的下行回调
+                                                            # （keeper busy 让位后由 play 泵触发）
         logger.info(f"接收侧就绪（VAD 阈值 {self._capture.threshold}，"
                     f"静音收尾 {self._capture.silence_end_ms}ms，"
                     f"信令门控 {'开' if self._talking_gate else '关'}）")
@@ -1915,7 +1941,8 @@ class NetControlSession:
             own = None
             if self.link is not None and self.link._sess is not None:
                 own = self.link._sess.session
-            busy = self.link is not None and self.link._busy.is_set()
+            busy = (self._shortlink_tx
+                    or (self.link is not None and self.link._busy.is_set()))
             if not busy:
                 # 自动降级：60s 内从未收到任何开始讲话信令 → 纯 VAD（不丢应答）
                 if (self._talking_gate and not self._ever_talk
@@ -2270,25 +2297,31 @@ class NetControlSession:
         避免整句丢失。返回 True=成功。"""
         if self.link is not None and hasattr(self.link, "suspend"):
             self.link.suspend()
+        self._shortlink_tx = True      # 短链发射期间：_on_downlink 只做抢占检测
+                                       # （常驻已 suspend、own 为 None，不采集防回声）
         last_err = None
-        for _try in range(2):
-            s2 = direct_announce.DirectAnnouncer(
-                username=direct_announce.cfg_get("talk", "username", default=""),
-                password=direct_announce.cfg_get("talk", "password", default=""))
-            try:
-                with contextlib.redirect_stdout(_StdoutToLogger(logger)):
-                    s2.connect()
-                    s2.take_mic()
-                    s2.play(packets)
-                if self.link is not None and hasattr(self.link, "resume"):
-                    self.link.resume()   # 临时链已断开，恢复常驻保活
-                return True
-            except Exception as e:
-                last_err = e
+        try:
+            for _try in range(2):
+                s2 = direct_announce.DirectAnnouncer(
+                    username=direct_announce.cfg_get("talk", "username", default=""),
+                    password=direct_announce.cfg_get("talk", "password", default=""),
+                    on_msg=self._on_downlink)   # 短链播报期间下行仍转发接收侧
                 try:
-                    s2.close()
-                except Exception:
-                    pass
+                    with contextlib.redirect_stdout(_StdoutToLogger(logger)):
+                        s2.connect()
+                        s2.take_mic()
+                        s2.play(packets)
+                    if self.link is not None and hasattr(self.link, "resume"):
+                        self.link.resume()   # 临时链已断开，恢复常驻保活
+                    return True
+                except Exception as e:
+                    last_err = e
+                    try:
+                        s2.close()
+                    except Exception:
+                        pass
+        finally:
+            self._shortlink_tx = False
         if last_err is not None:
             logger.error(f"点名播报短链重试仍失败: {last_err}")
         if self.link is not None and hasattr(self.link, "resume"):
