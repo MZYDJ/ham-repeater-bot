@@ -320,6 +320,23 @@ def extract_report_fields(text):
                   r"\s*([^，。；,;.!！?？\s]{2,24})", text, re.I)
     if m and not re.search(r"[A-Za-z]\d[A-Za-z]{1,3}", m.group(1)):
         fields.append(("qth", m.group(1).strip()))
+    # 天线：两种常见语序——"天线原机天线"（天线在前）与"原机天线/八木天线"（天线在后）。
+    # 优先"天线在前"（避免把"天线原机天线"误切为 xxx天线），再试"天线在后"。
+    # 值清洗：去掉"使用的是/用的/使用"等引导词（"天线使用的是个一米五的"→"个一米五的"）。
+    # **先提取天线并把"天线…的"从句从文本剔除**，再匹配设备——否则"天线使用
+    # 的是个一米五的"会被设备兜底句式误取成 device="个1米5的"（实测 21:21:05）。
+    ant_text = text
+    m = re.search(r"天线(?:是|为|的|用的)?\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,12})",
+                  text, re.I)
+    if m:
+        ant = re.sub(r"^(?:使用的是|用的|使用)", "", m.group(1).strip())
+        fields.append(("antenna", ant))
+        ant_text = text[:m.start()] + text[m.end():]
+    else:
+        m = re.search(r"([\u4e00-\u9fffA-Za-z0-9\-]{2,6})天线", text)
+        if m:
+            fields.append(("antenna", m.group(1) + "天线"))
+            ant_text = text[:m.start()] + text[m.end():]
     # 设备：覆盖"设备是手机/电台为K6/用的是手机/使用手机/用手机"等句式。
     # 先匹配"设备/机器/电台/手台/车台"关键词（"我使用的设备是手机"→手机），
     # 再兜底"用/使用"句式（"用的是手机"→手机）；排除疑问词防误取。
@@ -327,26 +344,16 @@ def extract_report_fields(text):
     # 数字+空格，"G T幺二"应并回设备名）→ 分隔符含"情况/的话"等，匹配集含
     # 空格，事后压缩空格并把型号中文数字转阿拉伯（幺二→12）。
     m = re.search(r"(?:设备|机器|电台|手台|车台)(?:是|为|的|的是|用的|情况|的话)?"
-                  r"\s*([\u4e00-\u9fffA-Za-z0-9 \-]{2,20})", text, re.I)
+                  r"\s*([\u4e00-\u9fffA-Za-z0-9 \-]{2,20})", ant_text, re.I)
     if not m:
         m = re.search(r"(?:用的是|使用的是|用|使用)(?:的)?(?:是)?"
-                      r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", text, re.I)
+                      r"\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,16})", ant_text, re.I)
     if m and not re.search(r"什么|哪个|怎样|怎么|多少|干嘛|干吗", m.group(1)):
         dev = m.group(1).strip()
         dev = re.sub(r"\s+", "", dev)      # "G T幺二" → "GT幺二"
         dev = re.sub(r"[零幺一二三四五六七八九洞两]",
                      lambda c: CN_DIGITS.get(c.group(0), c.group(0)), dev)
         fields.append(("device", dev))
-    # 天线：两种常见语序——"天线原机天线"（天线在前）与"原机天线/八木天线"（天线在后）。
-    # 优先"天线在前"（避免把"天线原机天线"误切为 xxx天线），再试"天线在后"。
-    m = re.search(r"天线(?:是|为|的|用的)?\s*([\u4e00-\u9fffA-Za-z0-9\-]{2,12})",
-                  text, re.I)
-    if m:
-        fields.append(("antenna", m.group(1).strip()))
-    else:
-        m = re.search(r"([\u4e00-\u9fffA-Za-z0-9\-]{2,6})天线", text)
-        if m:
-            fields.append(("antenna", m.group(1) + "天线"))
     # 功率：阿拉伯数字 + 中文数字（"5瓦/五瓦"），不带单位读法（瓦）；
     # 或档位词（"高功率/中功率/低功率/大功率"——实测 20:49 "高功率发射"）。
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:瓦|W)", text, re.I) or \
@@ -425,13 +432,13 @@ class VoiceCapture:
                  max_segment_ms=None, out_rate=16000, save_dir=None, on_segment=None,
                  ptt_release_delay_ms=None):
         self.threshold = threshold if threshold is not None else nc_cfg("vad_threshold", default=800)
-        self.silence_end_ms = silence_end_ms if silence_end_ms is not None else nc_cfg("silence_end_ms", default=2000)
+        self.silence_end_ms = silence_end_ms if silence_end_ms is not None else nc_cfg("silence_end_ms", default=3000)
         self.min_segment_ms = min_segment_ms if min_segment_ms is not None else nc_cfg("min_segment_ms", default=400)
-        self.max_segment_ms = max_segment_ms if max_segment_ms is not None else nc_cfg("max_segment_ms", default=15000)
+        self.max_segment_ms = max_segment_ms if max_segment_ms is not None else nc_cfg("max_segment_ms", default=30000)
         # PTT 抬起后延迟收尾（毫秒）：对方松 PTT 后不立即切段，再等这段窗口内的
         # 断续语音（中继台转发偶发停顿），避免"一句话没说完就断成两段"
         self.ptt_release_delay_ms = (ptt_release_delay_ms if ptt_release_delay_ms is not None
-                                     else nc_cfg("ptt_release_delay_ms", default=1000))
+                                     else nc_cfg("ptt_release_delay_ms", default=3000))
         self.out_rate = out_rate
         self.save_dir = Path(save_dir) if save_dir else None
         self.on_segment = on_segment
@@ -445,6 +452,8 @@ class VoiceCapture:
         self._seg_session = None        # 当前段来源 session（讲话人标识，点名上下文关联用）
         self._defer_frames = 0          # PTT 抬起后的延迟收尾剩余帧数（20ms/帧）
         self.last_feed_at = None        # 最近一次收到音频帧的时刻（采集卡死检测用）
+        self.last_seg_end_at = None     # 最近一次切出语音段的时刻（主控抢麦前的
+                                        # 短窗口"仍视为占用"判据，防打断对方）
 
     def _rms(self, frame):
         s = array.array('h')
@@ -510,6 +519,7 @@ class VoiceCapture:
         if dur < self.min_segment_ms / 1000:
             return
         pcm16 = direct_announce.resample_linear(pcm48, 48000, self.out_rate)
+        self.last_seg_end_at = time.time()   # 段切出时刻（占用判据的短窗口起点）
         wav_path = ""
         if self.save_dir:
             self._seq += 1
@@ -1912,7 +1922,7 @@ class NetControlSession:
                     # PTT 抬起：延迟 ptt_release_delay_ms 再收尾（防断续断句），
                     # 延迟窗口内有声音会自动取消
                     self._capture.force_finalize(
-                        defer_ms=nc_cfg("ptt_release_delay_ms", default=1000))
+                        defer_ms=nc_cfg("ptt_release_delay_ms", default=3000))
                 elif talking == 1:
                     self._ever_talk = True
                     if sess is not None:
@@ -1985,6 +1995,15 @@ class NetControlSession:
                                         f"复位说话状态")
                         self._capture._speaking = False
                         return False
+                    return True
+                # 刚切出过段（对方刚讲完/中继转发停顿），短窗口内仍视为占用：
+                # 防止主控在这几秒内抢麦打断对方"还没说完的补充信息"
+                # （实测 21:20:31-34 对方报信息被 VAD 切成 3 段，段切出瞬间
+                # 主控抢麦成功把对方整句报告压断 → 21:20:35-45 主控播报
+                # 压住对方，对方 21:20:56 才断续继续）。
+                seg_grace = float(nc_cfg("seg_grace_seconds", default=3))
+                if (self._capture.last_seg_end_at is not None
+                        and time.time() - self._capture.last_seg_end_at < seg_grace):
                     return True
         return False
 
@@ -2131,8 +2150,17 @@ class NetControlSession:
                     # 先听后说：抢麦前等待信道空闲（当前无人讲话才按下 PTT）
                     if s is not None:
                         if not self._wait_channel_idle(drain=False, newer_than=my_seq):
-                            return          # 等信道期间已有更新播报，放弃本句
+                            # 等信道期间已有更新播报，放弃本句：此时 busy 已被
+                            # ensure_session 置位，必须先 release，否则锁泄漏 →
+                            # 后续所有播报 ensure_session 30 次全 None，"链路忙
+                            # 或不可用"跳过（实测 21:21:26 放弃本句 → 21:21:58
+                            # 新句被"链路忙"吞掉的根因）
+                            if self.link is not None:
+                                self.link.release()
+                            return
                     if self._stop.is_set():
+                        if s is not None and self.link is not None:
+                            self.link.release()
                         return
                     try:
                         if s is None:          # 无常驻链路（独立运行场景）：临时短链
