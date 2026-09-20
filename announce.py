@@ -26,7 +26,7 @@ def cfg_get(*path, default=None):
     return direct_announce.cfg_get(*path, default=default)
 # 滔滔链路账号（来自配置 talk 段；与 direct_announce 同源）
 TALK_USERNAME = cfg_get("talk", "username", default="")
-TALK_PASSWORD = cfg_get("talk", "password", default="")
+TALK_PASSWORD = cfg_get(	alk", "password", default="")
 # TTS 配置
 TTS_VOICE = cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
 TTS_TIMEOUT_INNER = cfg_get("tts", "timeout_inner", default=28)   # 内层协程超时（秒）
@@ -146,7 +146,9 @@ def tts_cache_path(text: str) -> Path:
     """TTS 缓存文件路径（以播报文本 md5 为键）"""
     return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
 def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) -> str:
-    """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试"""
+    """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试。
+    注：定时播报/蓄水池/预热走本函数（Edge-TTS）；点名走 net_control.synth_text
+    （tts.engine 可配 CosyVoice/Edge）。两者引擎相互独立、互不影响。"""
     if max_retries is None:
         max_retries = TTS_MAX_RETRIES
     if retry_delay is None:
@@ -337,7 +339,7 @@ def _net_start():
     except Exception as e:
         logger.error(f"net_control 模块导入失败: {e}")
         return
-    sess = net_control.NetControlSession(link=_native_link, tts_func=get_tts_file)
+    sess = net_control.NetControlSession(link=_native_link)  # 点名 TTS 走 net_control.synth_text（tts.engine 可切 CosyVoice/Edge），定时播报仍用 get_tts_file
     sess.start()
     _net_session = sess
     logger.info("点名主播会话已启动")
@@ -347,13 +349,30 @@ def _net_stop():
         _net_session.stop()
         _net_session = None
 def schedule_net_control():
-    task_queue.put("net_control")
+    # 点名启动不排队：蓄水池/预热 TTS（edge 重试 3 次可达 ~100s）会阻塞任务队列，
+    # 若点名 job 排队等待会晚开始（实测晚 73s）。_net_start 内部仅启动会话线程
+    # 立即返回，发射互斥由常驻链路 busy 锁保证，与队列串行不冲突。
+    _net_start()
 def _next_announce_time(now: datetime.datetime) -> datetime.datetime:
     """下一个准点播报时刻（minute ∈ {0,30}）"""
     t = now.replace(second=0, microsecond=0)
     if t.minute < 30:
         return t.replace(minute=30)
     return (t + datetime.timedelta(hours=1)).replace(minute=0)
+def _native_link_suspend():
+    """临时直连播报期间暂停常驻链路保活/重连（防同账号互踢：实测 20:30
+    常驻被顶→退避重连又顶掉直连播报连接的互踢循环）。"""
+    if _native_link is not None:
+        try:
+            _native_link.suspend()
+        except Exception:
+            pass
+def _native_link_resume():
+    if _native_link is not None:
+        try:
+            _native_link.resume()
+        except Exception:
+            pass
 def _native_prewarm():
     """预热阶段（XX:29/XX:59 触发）：
     1. 预构建下一准点的音频包（省去准点后 ~2.3s 解码编码）
@@ -368,6 +387,7 @@ def _native_prewarm():
     if _native_session:                      # 上次预热残留（播报未消费等异常），先清理
         if _native_session_temp:
             _native_session.close()
+            _native_link_resume()
         elif _native_link:
             _native_link.release()
         _native_session = None
@@ -398,6 +418,7 @@ def _native_prewarm():
         logger.info("常驻链路就绪（已健康检查）")
     else:
         try:                                  # 二级兜底：立即建临时短链
+            _native_link_suspend()            # 挂起常驻，防同账号互踢
             s = direct_announce.DirectAnnouncer(
                 username=TALK_USERNAME, password=TALK_PASSWORD)
             with contextlib.redirect_stdout(_StdoutToLogger()):
@@ -405,6 +426,7 @@ def _native_prewarm():
             _native_session_temp = True
             logger.info("临时短链预建完成（常驻链路不可用）")
         except Exception as e:
+            _native_link_resume()             # 建链失败：恢复常驻保活
             logger.warning(f"临时短链预建失败（准点现场流程兜底）: {e}")
             s = None
     if s is None:
@@ -421,6 +443,7 @@ def _native_prewarm():
         logger.warning(f"抢麦失败（准点现场流程兜底）: {e}")
         if _native_session_temp:
             s.close()
+            _native_link_resume()             # 临时短链弃用：恢复常驻保活
         elif _native_link:
             _native_link.release()
         _native_session = None
@@ -435,11 +458,16 @@ def _native_play(session, packets):
         logger.error("直连播报返回失败")
 def _announce_native(tts_file: str):
     """直连播报（现场完整流程，容错兜底）：编码→登录→抢麦→匀速发包→放麦→断开。
-    抛出的异常由 announce_task 外层 except 统一记录并触发企业微信告警。"""
+    抛出的异常由 announce_task 外层 except 统一记录并触发企业微信告警。
+    建独立连接前挂起常驻链路（防同账号互踢），播完恢复。"""
     t0 = time.time()
-    with contextlib.redirect_stdout(_StdoutToLogger()):
-        ok = direct_announce.announce_once(
-            tts_file, username=TALK_USERNAME, password=TALK_PASSWORD)
+    _native_link_suspend()
+    try:
+        with contextlib.redirect_stdout(_StdoutToLogger()):
+            ok = direct_announce.announce_once(
+                tts_file, username=TALK_USERNAME, password=TALK_PASSWORD)
+    finally:
+        _native_link_resume()
     if ok:
         logger.info(f"直连播报完成，耗时 {time.time() - t0:.1f} 秒")
     else:
@@ -469,6 +497,7 @@ def announce_task():
             finally:
                 if temp:                       # 临时短链：用完即弃
                     s.close()
+                    _native_link_resume()      # 常驻恢复保活（临时链已断开，不再互踢）
                 elif _native_link:             # 常驻链路：还给守护线程继续保活
                     _native_link.release()
             return
