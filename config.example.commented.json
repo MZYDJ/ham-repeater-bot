@@ -19,14 +19,30 @@
 
   // ==================== tts：语音合成（Edge-TTS） ====================
   "tts": {
-    "voice": "zh-CN-XiaoxiaoNeural", // 播报用的语音角色（微软晓晓），可换 zh-CN-YunxiNeural 等
-    "timeout_inner": 28,             // 单次合成内部超时（秒）。比外层少2秒，确保线程一定能退出
-    "timeout_join": 30,              // 外层等待线程结束的超时（秒）。合成卡死时兜底
-    "max_retries": 3,                // 合成失败后重试次数（含首次共3次）
-    "retry_delay": 5.0,              // 每次重试前的等待秒数
-    "cache_expire_days": 2,          // TTS 音频缓存有效期（天）。过期后重新合成
-    "prefill_hours": 48              // 蓄水池提前量（小时）：提前预合成未来48小时内所有
-                                     // 播报时段的音频，准点播报不依赖当时网络
+    "engine": "cosyvoice",             // 点名播报合成引擎：cosyvoice（默认，阿里云百炼，快且稳）| edge（Edge-TTS 兜底）
+    "voice": "zh-CN-XiaoxiaoNeural",   // edge 引擎用的语音角色（点名 engine=cosyvoice 时本字段不生效）
+    // —— CosyVoice 引擎配置（engine=cosyvoice 时生效）——
+    // 复用 asr.api_key（同一百炼账号；ASR 与语音合成免费额度相互独立、不共享）
+    "cosyvoice_sdk": true,             // true=用官方 dashscope SDK（tts_v2 SpeechSynthesizer，WebSocket 流式，
+                                       //   与官方示例一致，v3.5-plus/flash 复刻音色推荐）；容器未装 dashscope
+                                       //   时自动回退 HTTP 接口并打告警日志
+    "cosyvoice_model": "cosyvoice-v3.5-flash",  // 语音合成模型；可换 cosyvoice-v3-flash（有系统音色 longanhuan 等，免创建音色）
+    "cosyvoice_voice": "",             // 必填：音色 ID。v3.5 系列无系统音色，需先在百炼控制台
+                                       // 用"声音设计/声音复刻"创建音色（创建免费），把音色 ID 填这里；
+                                       // 若用 cosyvoice-v3-flash 可填系统音色 longanhuan（中英混读）
+    "cosyvoice_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation", // 合成接口（仅华北2-北京地域）
+    "cosyvoice_format": "mp3",         // 音频格式 mp3/wav/pcm/opus
+    "cosyvoice_sample_rate": 24000,    // 采样率 Hz
+    "cosyvoice_volume": 50,            // 音量 0~100
+    "cosyvoice_rate": 1.0,             // 语速 0.5~2.0
+    "cosyvoice_pitch": 1.0,            // 音调 0.5~2.0
+    "timeout_inner": 28,               // 单次合成内部超时（秒）。比外层少2秒，确保线程一定能退出
+    "timeout_join": 30,                // 外层等待线程结束的超时（秒）。合成卡死时兜底
+    "max_retries": 3,                  // 合成失败后重试次数（含首次共3次）
+    "retry_delay": 5.0,                // 每次重试前的等待秒数
+    "cache_expire_days": 2,            // TTS 音频缓存有效期（天）。过期后重新合成
+    "prefill_hours": 48                // 蓄水池提前量（小时）：提前预合成未来48小时内所有
+                                       // 播报时段的音频，准点播报不依赖当时网络
   },
 
   // ==================== announce：播报内容与时段 ====================
@@ -127,13 +143,18 @@
                                       // 到点后不立即结束：若仍有人在点名，等其说完——
                                       // 连续 quiet_end_seconds 秒无任何应答才收尾
     "quiet_end_seconds": 10,          // 到点后连续多少秒无人上台 → 触发最终结束语（默认 10s）
+    "idle_call_seconds": 300,         // 开放点名中连续多少秒无应答 → 重新呼叫（默认 300=5 分钟）。
+                                      // 播报后的回波/应答会刷新"最近活动"，不会连续重复呼叫
+    "idle_call_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是{net_name}，我是主控{ctrl_call}，点名继续开放，请抄收到信号的友台依次上台报告呼号、QTH、使用设备、天线、功率，这里是{ctrl_phonetic} {ctrl_call}，Over",  // 空闲重新呼叫话术（点名开始时的呼叫）
+    "report_merge_gap_seconds": 4,        // 信息合并确认窗口（秒）：友台一句话被 VAD 切成多段时，
+                                          // 只累积字段不逐段播报，停稳该时长后统一确认一次（默认 4s）。
     "grace_seconds": 300,             // 到点后的硬性宽限（秒）。防止持续有人讲话导致
                                       // 点名无限延长，宽限耗尽强制收尾（默认 300=5 分钟）
     "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
     "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
     "info_ack_text": "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over",  // 当前友台补充完信息后：按"结构化字段"复诵确认（QTH/设备/天线/功率/信号，{fields} 占位符），不是整句复诵。无结构化字段的废话（"那主播"）静默忽略
     "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",  // 友台短确认语（"正确/收到/确认"）后的收尾话术
-    "missing_ask_text": "抄收，{call_phonetic}，信息已记录，请再补充您的{missing}，Over",  // 结构化信息（信号/QTH/设备/天线/功率）未记全时主动追问缺失项（{missing} 占位符，自动列出未记录字段，如"请再补充您的QTH、功率"）；每字段每友台最多问一次，防无限循环；"没有天线""无"等已作为值记录视为已填
+    "missing_ask_text": "抄收，{call_phonetic}，信息已记录，请再补充您的{missing}，Over",  // 结构化信息（信号/QTH/设备/天线/功率）未记全时主动追问缺失项（{missing} 占位符，自动列出未记录字段，如"请再补充您的QTH、功率"）；每字段每友台最多问一次，防无限循环；"没有天线""无"等作为值记录视为已填
     "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over",  // 友台纠正（"不对/不正确/错了"）后请其重报
     "ask_ack_text": "抄收，{call_phonetic}，您的呼号已记录，请报告您的QTH、使用设备、天线、功率，Over",  // 友台询问"是否抄收/在吗"时确认已抄收并引导补报信息
     "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",
@@ -143,15 +164,29 @@
     "closing_text": "CQ CQ CQ，现在是北京时间{time}，{net_name}到此结束，我是本次主控{ctrl_call}，本次参与台网点名的共有{n}位友台，非常感谢各位友台积极参与，接下来各位友台可以自由通联，73！",
     // ---- 话音检测（VAD）----
     "vad_threshold": 800,       // 活动音能量阈值（16bit 样本 RMS；链路底噪大时调高）
-    "silence_end_ms": 1000,     // 静音多少毫秒判定"对方说完了"（UserTalking 结束信令+延迟收尾优先于它）。中继台讲话停顿多，600ms 易断句，建议 1000~1500
-    "ptt_release_delay_ms": 1000,  // PTT 抬起（talking=false）后延迟多少毫秒再收尾：中继台断续转发时避免"一句话没说完就断成两段"，窗口内有声音自动取消
+    "silence_end_ms": 3000,     // 静音多少毫秒判定"对方说完了"。中继台转发停顿多，
+                                // 1000ms 会把对方一句完整报告切成好几段（实测
+                                // 21:20:31-34 报信息被切成 1.2/1.0/1.4s 三小段）→
+                                // 建议 3000ms，停顿>3s 才算说完
+    "ptt_release_delay_ms": 3000,  // PTT 抬起（talking=false）后延迟多少毫秒再收尾：
+                                // 中继台断续转发时避免"一句话没说完就断成两段"，
+                                // 窗口内有声音自动取消。实测 1000ms 时信令翻转
+                                // 频繁把整句切成短段
     "tx_wait_timeout": 30,   // 先听后说：主控按下 PTT 前等待信道空闲的最长秒数（当前有人在讲话就等对方讲完；超时仍发射，避免点名被无限拖住）。等待期间会继续识别队列中友台的话
     "echo_holdoff_seconds": 1.5,  // 中继台回波过滤：自己发射结束后该秒数内的短语音段视为疑似回波
     "echo_segment_max_seconds": 1.5,  // 回波过滤：超过该时长的段不视为回波（真实友台抢答通常更长；且文本与刚播报/上一段内容连续重合≥70% 才判回波，避免误杀）
     "talking_stale_seconds": 4,  // 说话信令防自锁：UserTalking 结束信令偶发丢失会导致"信道永久占用"（每次播报前白等 30s），该 session 超过此秒数无新语音包即视为讲完并释放信道
     "vad_idle_seconds": 2,  // VAD 采集防卡死：正在采集但超过该秒数无新音频帧喂入（对方讲完、链路静默）→ 强制复位说话状态，根治"没人说话却信道占用中"
+    "seg_grace_seconds": 3,  // 段切出后的"仍视为占用"短窗口（秒）：对方刚讲完一段、主控
+                             // 抢麦前再等几秒，防止主控打断对方还没说完的补充信息
+    "ptt_bound_mode": true,  // 信令整段模式：对讲机半双工下 PTT（UserTalking talking=true
+                             // →false）才是"一句话"的权威边界。开启后 talking=true 起讲的
+                             // 语音段不再因 VAD 静音切段（对方说话中停顿≠说完），只在
+                             // PTT 抬起（talking=false）时整段切出送 ASR；信令缺失（平台
+                             // 不下发/偶发丢失）时自动降级回 VAD 静音切段兜底，不卡点名
     "min_segment_ms": 400,      // 短于此的语音段忽略（防误触发）
-    "max_segment_ms": 15000,    // 单段最长（超过强制截断，防失控）
+    "max_segment_ms": 30000,    // 单段最长（超过强制截断，防失控）。实测对方整句报告
+                                // 可达 20-30s，15000ms 会把长报告截断
     "use_talking_gate": true,   // 说话信令门控：仅采集服务器广播了"开始讲话"的远端语音，
                                 // 可过滤链路底噪误触发的假应答段。若 60s 内从未收到任何
                                 // 说话信令（个别平台不下发）会自动降级为纯 VAD，不丢应答
