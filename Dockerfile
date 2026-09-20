@@ -26,9 +26,12 @@ EOF
 ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # ========== 5. 安装Python业务依赖（固定版本） ==========
+# dashscope>=1.18 提供 tts_v2 SpeechSynthesizer（CosyVoice 点名 TTS 官方 SDK，
+# WebSocket 流式；net_control 已做旧版 timeout 参数兼容 + SDK 缺失自动回退 HTTP）
 RUN pip install --break-system-packages --no-cache-dir \
     edge-tts==7.2.8 \
-    APScheduler==3.11.3
+    APScheduler==3.11.3 \
+    "dashscope>=1.18.0"
 
 # ========== 6. 构建版本标记 ==========
 ARG BUILD_TIME=unknown
