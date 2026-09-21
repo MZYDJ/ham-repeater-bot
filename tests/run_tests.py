@@ -168,6 +168,44 @@ def test_voice_capture():
     check("延迟耗尽后切段", len(segs6) == 1,
           f"segs6={[(round(d,2), w) for d, w in segs6]}")
 
+    # 信令整段（_ptt_bound）：talking=true 起讲的段，说话中停顿不切段，
+    # 等 PTT 抬起（force_finalize）才作为完整一段切出（对讲机半双工边界）
+    segs7 = []
+    cap7 = VoiceCapture(threshold=2000, silence_end_ms=300, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs7.append((d, w)))
+    cap7.mark_ptt_bound()                        # UserTalking talking=true
+    cap7.feed(bytes(tone[:9600]))                # 200ms 语音（起讲，继承 ptt_bound）
+    with mock.patch("net_control.time.time", return_value=cap7.last_feed_at + 0.5):
+        cap7.pump()                              # 静音 0.5s > silence_end 300ms，
+                                                 # 但信令约束 → 不切段（停顿≠说完）
+    check("信令整段：静音停顿不切段", len(segs7) == 0,
+          f"segs7={[(round(d,2), w) for d, w in segs7]}")
+    cap7.feed(bytes(tone[:9600]))                # 停顿后继续说（仍同一段）
+    cap7.force_finalize(defer_ms=0)              # PTT 抬起 → 完整段切出
+    check("信令整段：PTT 抬起才切", len(segs7) == 1 and 0.18 <= segs7[0][0] <= 0.22,
+          f"segs7={[(round(d,2), w) for d, w in segs7]}")
+
+    # 信令整段兜底：对方说完但 talking=false 丢失 → 静音超 2×silence_end 强制切
+    segs8 = []
+    cap8 = VoiceCapture(threshold=2000, silence_end_ms=300, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs8.append((d, w)))
+    cap8.mark_ptt_bound()
+    cap8.feed(bytes(tone[:9600]))
+    with mock.patch("net_control.time.time", return_value=cap8.last_feed_at + 0.7):
+        cap8.pump()                              # 静音 0.7s ≥ 2×300ms → 兜底切段
+    check("信令整段：静音超2倍兜底切段", len(segs8) == 1,
+          f"segs8={[(round(d,2), w) for d, w in segs8]}")
+
+    # 无信令约束（VAD 兜底）：照旧静音切段（平台不下发信令时的降级路径）
+    segs9 = []
+    cap9 = VoiceCapture(threshold=2000, silence_end_ms=300, min_segment_ms=50,
+                        save_dir=None, on_segment=lambda p, d, w, s: segs9.append((d, w)))
+    cap9.feed(bytes(tone[:9600]))                # 无 mark_ptt_bound → 普通 VAD 段
+    with mock.patch("net_control.time.time", return_value=cap9.last_feed_at + 0.5):
+        cap9.pump()                              # 静音 0.5s > 300ms → 切段
+    check("无信令约束走 VAD 切段", len(segs9) == 1,
+          f"segs9={[(round(d,2), w) for d, w in segs9]}")
+
 
 def test_wav_and_resample():
     print("[WAV 落盘与重采样]")
@@ -216,6 +254,14 @@ def test_decode_callsign():
     check("解释法部分连写", r["callsign"] == "BI9GCW", f"{r}")
     r = decode_callsign("please repeat your callsign")
     check("普通英文句不产生呼号", r["callsign"] is None, f"{r}")
+    # 重复呼号去重（实测 22:02 "B R九A B B R九A B" 被最左最长误取 BR9ABB）
+    r = decode_callsign("B R九A B B R九A B。")
+    check("重复呼号取单遍", r["callsign"] == "BR9AB", f"{r}")
+    r = decode_callsign("B R九A B B R九A B B R九A B。")
+    check("重复呼号三遍取单遍", r["callsign"] == "BR9AB", f"{r}")
+    # Beta 词表（实测 22:03 "Bravo Romeo Nine Alpha Beta"→BR9AB 非 BR9ABE）
+    r = decode_callsign("错了错了，这里是B二九A B，Bravo Romeo Nine Alpha Beta。")
+    check("Beta 映射为B", r["callsign"] == "BR9AB", f"{r}")
 
 
 def test_asr_body():
@@ -350,13 +396,25 @@ def test_retry_reset():
     # 段3：同 session 友台补充信息（无呼号，正常点名流程）→ 结构化提取并复诵确认
     sess._asr_text = lambda pcm: "我的设备是泉盛K6，天线原机天线，五瓦"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
-    check("同台补充信息归入", len(spoken) == 4 and "信息已记录" in spoken[2]
-          and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
-          and "功率 5 瓦" in spoken[2]
+    # 合并确认：补充段只累积不立即播（避免连播打断），force flush 后统一确认一次
+    check("同台补充信息归入（不立即播）", len(spoken) == 2
           and sess._current_entry[4] and "泉盛K6" in sess._current_entry[4],
           f"spoken={spoken} entry={sess._current_entry}")
+    sess._flush_pending_report(force=True)
+    check("合并确认含全部字段", len(spoken) == 3 and "信息已记录" in spoken[2]
+          and "设备 泉盛K6" in spoken[2] and "天线 原机天线" in spoken[2]
+          and "功率 5 瓦" in spoken[2],
+          f"spoken={spoken}")
     check("补充段不消耗额度", sess._retry_left == 1, f"retry_left={sess._retry_left}")
-    check("缺 QTH 主动追问", "请再补充您的QTH" in spoken[3],
+    # 合并确认后不再立即追问缺失字段（22:06:16→22:06:34 主控连播两句抢话）；
+    # 缺失项等友台确认（"正确"）后再追问
+    check("合并确认后不立即追问", len(spoken) == 3,
+          f"spoken={spoken}")
+
+    # 段3b：友台确认"正确" → 缺失字段（QTH）此时追问
+    sess._asr_text = lambda pcm: "正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=2)
+    check("确认后追问缺失字段", len(spoken) == 4 and "请再补充您的QTH" in spoken[3],
           f"spoken={spoken}")
 
     # 段4：新 session 无呼号（新友台没报呼号）→ 引导报呼号
@@ -390,6 +448,9 @@ def test_info_followup():
     check("补充段归入友台1", sess._current_call == "BH3XX"
           and "QTH" in (sess._current_entry[4] or ""),
           f"call={sess._current_call} entry={sess._current_entry}")
+    # 合并确认：补充段只累积不立即播，force flush 后统一确认一次
+    check("补充段不立即播报", len(spoken) == 1, f"spoken={spoken}")
+    sess._flush_pending_report(force=True)
     check("补充段复诵信息", len(spoken) == 2 and "信息已记录" in spoken[1]
           and "QTH 咸阳市渭城区" in spoken[1] and "设备 泉盛K6" in spoken[1]
           and "功率 5 瓦" in spoken[1],
@@ -534,6 +595,49 @@ def test_report_fields():
     check("噪音无字段", r == [], f"{r}")
 
 
+def test_cosyvoice_tts():
+    print("[CosyVoice TTS 配置与引擎选择]")
+    import direct_announce as da
+    saved = dict(da.CFG)
+    try:
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": ""},
+                       "tts": {"cosyvoice_voice": "sound_x"}})
+        try:
+            net_control._cosyvoice_synth("测试", Path("/tmp/nc_cv_test.mp3"), timeout=1)
+            check("缺 key 应报错", False, "未报错")
+        except RuntimeError as e:
+            check("缺 key 报错", "asr.api_key" in str(e), str(e))
+
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": "sk-t"}, "tts": {}})
+        try:
+            net_control._cosyvoice_synth("测试", Path("/tmp/nc_cv_test.mp3"), timeout=1)
+            check("缺音色应报错", False, "未报错")
+        except RuntimeError as e:
+            check("缺音色报错", "cosyvoice_voice" in str(e), str(e))
+
+        # 合成失败（缺 key 等）→ synth_text 重试后返回空串，不崩溃、不阻塞点名
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": ""},
+                       "tts": {"engine": "cosyvoice"},
+                       "net_control": {"tts_cache_dir": "/tmp/nc_cv_cache"}})
+        out = net_control.synth_text("测试播报", timeout_inner=1, timeout_join=2,
+                                     max_retries=1, retry_delay=0)
+        check("缺配置合成返回空", out == "", f"out={out!r}")
+        # engine=edge 分支（缺 key 时走 edge 也会失败返回空，不抛异常）
+        da.CFG.clear()
+        da.CFG.update({"asr": {"api_key": ""},
+                       "tts": {"engine": "edge"},
+                       "net_control": {"tts_cache_dir": "/tmp/nc_cv_cache"}})
+        out = net_control.synth_text("测试播报", timeout_inner=1, timeout_join=2,
+                                     max_retries=1, retry_delay=0)
+        check("edge 分支失败返回空", out == "", f"out={out!r}")
+    finally:
+        da.CFG.clear()
+        da.CFG.update(saved)
+
+
 def test_wait_channel_idle():
     print("[先听后说：抢麦前等待信道空闲]")
     sess = net_control.NetControlSession(link=None)
@@ -575,15 +679,16 @@ def test_wait_channel_idle():
 
 
 def test_echo_filter():
-    print("[中继台回波过滤 _is_echo]")
+    print("[中继台回波过滤 _is_echo（简化：仅短段+空文本）]")
     sess = net_control.NetControlSession(link=None)
     sess._speak = lambda t: None
     check("未发射过非回波", not sess._is_echo("", 0.6))
     sess._last_tx_end = time.time()
-    sess._last_spoken_text = "这里是BI9BZW，抄收你的信号，请报告QTH"
     check("窗口内短空段→回波", sess._is_echo("", 0.5), f"last={sess._last_tx_end}")
-    check("文本重合→回波", sess._is_echo("抄收你的信号", 0.8))
-    check("文本不重合→非回波", not sess._is_echo("这里是BH3XX信号59", 0.8))
+    check("窗口内短段有文字→非回波（回波无长文字，实测结论）",
+          not sess._is_echo("抄收你的信号", 0.8))
+    check("窗口内短段有呼号→非回波",
+          not sess._is_echo("这里是BH3XX信号59", 0.8))
     check("段太长→非回波", not sess._is_echo("", 3.0))
     sess._last_tx_end = time.time() - 10
     check("超时窗外→非回波", not sess._is_echo("", 0.5))
@@ -650,13 +755,16 @@ def test_same_session_new_call():
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
     sess._asr_text = lambda p: "我的QTH在咸阳市"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    # 同 session 新友台补报完整呼号 → 应重新抄收而非归入 BH3XX 补充信息
+    # 同 session 新友台补报完整呼号 → 不被补充信息吞；但呼号完全不相似
+    # （BJ9EFU vs BH3XX，编辑距离大）→ 判定为另一友台插队排队，不顶当前友台
     sess._asr_text = lambda p: "这里是BJ九EFU，能否超收"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    check("新呼号被抄收", [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"],
-          f"checked={sess._checked_in}")
-    check("上下文切换", sess._current_call == "BJ9EFU",
-          f"call={sess._current_call}")
+    check("不相似呼号排队不替换",
+          [c for c, *_ in sess._checked_in] == ["BH3XX", "BJ9EFU"]
+          and sess._current_call == "BH3XX"
+          and any(w["call"] == "BJ9EFU" for w in sess._waiting),
+          f"checked={sess._checked_in} cur={sess._current_call} "
+          f"waiting={sess._waiting}")
 
 
 def test_echo_other_speaker():
@@ -770,6 +878,424 @@ def test_tts_synth_drains_queue():
         _da.build_audio = orig_build
 
 
+def test_speech_supersede_waits():
+    print("[接话只播最新：新话术生成后旧话术让位]")
+    sess = net_control.NetControlSession(link=None)
+    sess._capture_pump = lambda: None
+    sess._drain_queue = lambda depth=0: 0
+    sess._someone_speaking = lambda: True   # mock 信道一直被占用
+    # 1) 无新话术：等到超时仍返回 True（原行为不变）
+    sess._speech_seq = 0
+    t0 = time.time()
+    ok = sess._wait_channel_idle(drain=False, newer_than=0)
+    check("无新话术等满超时仍发射", ok is True and time.time() - t0 >= 1.5,
+          f"ok={ok} t={time.time()-t0:.2f}")
+    # 2) 等待期间新话术生成（序号前进）→ 立即放弃本句返回 False
+    sess._speech_seq = 1
+    t0 = time.time()
+    ok = sess._wait_channel_idle(drain=False, newer_than=0)
+    check("有新话术立即放弃旧话术", ok is False and time.time() - t0 < 1.0,
+          f"ok={ok} t={time.time()-t0:.2f}")
+    # 3) 信道空闲：无论序号如何立即返回 True
+    sess._someone_speaking = lambda: False
+    sess._speech_seq = 5
+    check("信道空闲立即发射", sess._wait_channel_idle(drain=False, newer_than=5) is True)
+
+
+def test_interloper_queued():
+    print("[插队：当前友台进行中，新呼号静默记录+排队，收尾后轮候]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    # A 正常抄收（进入进行中状态）
+    sess._asr_text = lambda p: "这里是BG9ABC"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 抄收且进行中", sess._current_active and
+          [c for c, *_ in sess._checked_in] == ["BG9ABC"], f"checked={sess._checked_in}")
+    # B 插队：高分新呼号 → 不播报、入册、排队
+    n0 = len(spoken)
+    sess._asr_text = lambda p: "这里是BG9XYZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("插队静默不播报", len(spoken) == n0, f"spoken={spoken}")
+    check("插队已入册", [c for c, *_ in sess._checked_in] == ["BG9ABC", "BG9XYZ"],
+          f"checked={sess._checked_in}")
+    check("插队已排队", [w["call"] for w in sess._waiting] == ["BG9XYZ"],
+          f"waiting={sess._waiting}")
+    # 重复插队忽略（不重复入册/排队）
+    sess._asr_text = lambda p: "BG9XYZ再次呼叫"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=9)
+    check("重复插队忽略", len(sess._waiting) == 1 and len(sess._checked_in) == 2,
+          f"waiting={sess._waiting} checked={sess._checked_in}")
+    # A 补充全部字段后确认 → 收尾 → B 自动轮候正式抄收（播 ack）
+    sess._fields["BG9ABC"] = {"signal": "59", "qth": "咸阳", "device": "手机",
+                              "antenna": "无", "power": "5瓦"}
+    sess._asr_text = lambda p: "完全正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 确认后轮到 B 正式抄收",
+          [c for c, *_ in sess._checked_in] == ["BG9ABC", "BG9XYZ"]
+          and not sess._waiting and sess._current_call == "BG9XYZ",
+          f"checked={sess._checked_in} waiting={sess._waiting} cur={sess._current_call}")
+    check("B 已播确认", any("X-ray Yankee Zulu" in s and "抄收" in s for s in spoken)
+          and sess._current_call == "BG9XYZ",
+          f"spoken={spoken}")
+
+
+def test_same_session_replace():
+    print("[同 session 重报不同呼号 = 识别修正替换（如 ASR 把 BFZ 听成 BLZ 后重报）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    # 第一次识别错误：BLZ（session=7）
+    sess._asr_text = lambda p: "主控主控，这里是BG九BLZ请求参加测试点名"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("错误呼号先被抄收", sess._current_call == "BG9BLZ", f"cur={sess._current_call}")
+    # 同 session 重报正确呼号 BFZ → 替换，CSV 只留 BFZ
+    sess._asr_text = lambda p: "主控，我的呼号是B G九B F Z，Bravo Golf Nine Bravo Foxtrot Zulu"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("同session重报替换",
+          [c for c, *_ in sess._checked_in] == ["BG9BFZ"]
+          and sess._current_call == "BG9BFZ"
+          and "BG9BLZ" not in sess._checked_calls,
+          f"checked={sess._checked_in} cur={sess._current_call}")
+    # 不播报请重复/不排队（走正常抄收确认）
+    check("替换后正常抄收确认", any("Foxtrot Zulu" in s and "抄收" in s for s in spoken),
+          f"spoken={spoken}")
+
+
+def test_report_merged_confirm():
+    print("[信息合并确认：一句话被 VAD 切成多段 → 只播一次完整确认]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    import direct_announce as _da
+    _da.CFG.setdefault("net_control", {})["report_merge_gap_seconds"] = 0.5
+    # 友台报呼号（抄收，播 ack）
+    sess._asr_text = lambda p: "这里是BG9BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    # 同一句话被切成 3 段：设备 → 功率 → QTH（间隔 < 合并窗口）
+    sess._asr_text = lambda p: "使用设备全胜U二"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("第一段不立即播报", len(spoken) == n0, f"spoken={spoken}")
+    sess._asr_text = lambda p: "五瓦"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("第二段仍不播报", len(spoken) == n0, f"spoken={spoken}")
+    sess._asr_text = lambda p: "QTH团结路"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("第三段仍不播报", len(spoken) == n0, f"spoken={spoken}")
+    # 停稳超过合并窗口 → 播一次合并确认（含全部字段）；缺失字段不再立即追问
+    # （等友台确认后追问，实测 22:06:16→22:06:34 连播两句抢话的根因）
+    time.sleep(0.8)
+    sess._flush_pending_report()
+    check("合并确认只播一次且含全部字段",
+          len(spoken) == n0 + 1 and "设备 全胜U2" in spoken[n0]
+          and "功率 5 瓦" in spoken[n0] and "QTH 团结路" in spoken[n0],
+          f"spoken={spoken}")
+    # 再次 flush（无新内容）→ 不重复播
+    sess._flush_pending_report(force=True)
+    check("无新内容不重复确认", len(spoken) == n0 + 1, f"spoken={spoken}")
+
+
+def test_join_intent_guide():
+    print("[报名意图但呼号未解出 → 引导重报（不静默，实测 20:15:15 场景）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 友台抄收（session=7）→ 当前友台进行中
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    # 同 session 报"这里B九B L Z请求参加点名测试"（呼号漏字母未解出）
+    sess._asr_text = lambda p: "主控主控，这里B九B L Z请求参加点名测试"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("报名意图引导重报", len(spoken) == n0 + 1 and "请再报一次您的完整呼号" in spoken[-1],
+          f"spoken={spoken}")
+
+
+def test_checkedin_repeat_feedback():
+    print("[已点过呼号再次报到 → 直接反馈'已经抄收过'（不静默）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 收尾（确认"正确"）后，再报同呼号（新 session，另一台设备重复上台）
+    sess._asr_text = lambda p: "正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    sess._asr_text = lambda p: "这里是BG9BFZ请求参加点名"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("已点过直接反馈", len(spoken) == n0 + 1 and "已经抄收过" in spoken[-1],
+          f"spoken={spoken}")
+
+
+def test_replace_guard():
+    print("[已记录信息后同 session 重报不同呼号 → 不替换（保护已确认记录）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 抄收 BFZ（session=7），补充信息 → entry[4] 非空
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    sess._asr_text = lambda p: "我的QTH在咸阳，设备泉盛K6"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 同 session 又报 BLZ（高分不同呼号）→ 不替换、不静默，播"呼号已记录"
+    sess._asr_text = lambda p: "这里是BG9BLZ请求参加点名测试"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("已记录信息不替换",
+          [c for c, *_ in sess._checked_in] == ["BG9BFZ"]
+          and sess._current_call == "BG9BFZ"
+          and "呼号已记录" in spoken[-1],
+          f"checked={sess._checked_in} cur={sess._current_call} spoken={spoken}")
+
+
+def test_idle_recall():
+    print("[空闲重新呼叫：点名中长时间无应答 → 重播开场呼叫]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW", "repeater_call": "BR9AB",
+                     "net_name": "测试点名", "ctrl_phonetic": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    import threading as _th
+    sess._stop = _th.Event()
+    import direct_announce as _da
+    _da.CFG.setdefault("net_control", {})["idle_call_seconds"] = 1
+    _da.CFG.setdefault("net_control", {})["max_net_seconds"] = 60
+    t = _th.Timer(2.5, sess._stop.set)
+    t.start()
+    try:
+        sess._run_open()
+    finally:
+        t.cancel()
+    check("空闲 1s 后重播呼叫", any("CQ" in s for s in spoken), f"spoken={spoken}")
+
+
+def test_suspend_resume():
+    print("[常驻链路 suspend/resume：临时直连期间暂停保活，防同账号互踢]")
+    import direct_announce as _da
+    link = _da.PersistentAnnouncer(username="u", password="p")
+    check("初始未挂起", not link._suspended and link._backoff == 30.0)
+    link.suspend()
+    check("suspend 置位", link._suspended is True)
+    link._backoff = 600.0          # 模拟退避翻倍
+    link.resume()
+    check("resume 复位并重置退避",
+          not link._suspended and link._backoff == 30.0)
+
+
+def test_keeper_busy_cede_and_waitfor_onmsg():
+    print("[常驻抢麦失败根因：busy 期间 keeper 让位 + wait_for 回执不被 on_msg 劫走]")
+    import direct_announce as _da
+    import struct as _st
+
+    class _FakeSock:
+        def __init__(self):
+            self.buf = b""
+            self.injected = []
+        def settimeout(self, t):
+            pass
+        def recv(self, n):
+            if self.injected:
+                self.buf += self.injected.pop(0)
+            if not self.buf:
+                raise _sok.timeout
+            d, self.buf = self.buf[:n], self.buf[n:]
+            return d
+
+    def _frame(t, payload):
+        return _st.pack(">HI", t, len(payload)) + payload
+
+    # 1) busy 期间 keeper 不 drain（socket 由播报线程独占读）
+    link = _da.PersistentAnnouncer(username="u", password="p")
+    fake_c = type("FC", (), {"drain_calls": 0, "drain": lambda self, idle_rounds=2: setattr(self, "drain_calls", self.drain_calls + 1) or []})()
+    link._sess = type("S", (), {"c": fake_c, "session": 1, "close": lambda self: None})()
+    link._busy.set()
+    for _ in range(5):
+        if link._busy.is_set():
+            continue
+        link._sess.c.drain()
+    check("busy 期间 keeper 不 drain", fake_c.drain_calls == 0,
+          f"drain_calls={fake_c.drain_calls}")
+    link._busy.clear()
+
+    # 2) wait_for 等待 ApplyMic 回执时，途中下行经 on_msg 转发、回执不被劫走
+    import socket as _sok
+    applymic_ack = _frame(14, b"\x10\x00\x18\x01")
+    talk_sig = _frame(15, b"\x08\xff\xff\xff\xff\x07\x10\x00\x18\x01")
+    sock = _FakeSock()
+    sock.injected = [talk_sig, applymic_ack]
+    c = _da.Client.__new__(_da.Client)
+    c.sock = sock
+    c.buf = b""
+    c.send = lambda t, p: None
+    got = []
+    t, p = c.wait_for(6, (14,), on_msg=lambda t2, p2: got.append(t2))
+    check("回执类型 14 被 wait_for 返回", t == 14, f"t={t}")
+    check("途中下行 15 经 on_msg 转发", got == [15], f"got={got}")
+
+
+def test_power_highpower_and_device_gt12():
+    print("[20:49 实测长句：功率档位词+设备型号中文数字（森海科斯G T幺二）]")
+    text = ("我QTH是兴平南关西路，设备情况森海科斯G T幺二，原机天线，"
+            "高功率，24楼高度发射，主控是否超收？Over")
+    fields = dict(net_control.extract_report_fields(text))
+    check("QTH 提取", fields.get("qth") == "兴平南关西路", f"fields={fields}")
+    check("设备去噪声+型号数字化",
+          fields.get("device") == "森海科斯GT12",
+          f"fields={fields}")
+    check("天线原机天线", fields.get("antenna") == "原机天线", f"fields={fields}")
+    check("高功率提取", fields.get("power") == "高功率", f"fields={fields}")
+
+
+def test_duplicate_report_fields():
+    print("[重复抄收但补报缺失字段：20:51:26 '抄你的信号五九' → 应补录而非跳过]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BI9BZY"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("首次抄收", sess._current_call == "BI9BZY"
+          and "抄收" in spoken[0] and "Zulu Yankee" in spoken[0],
+          f"cur={sess._current_call} spoken={spoken}")
+    # 已记 QTH/设备/天线，缺信号 → 友台重复报呼号+信号59
+    sess._asr_text = lambda p: "我的QTH是咸阳，设备手机，天线原装天线"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    n0 = len(spoken)
+    sess._asr_text = lambda p: "主控主控，这里是B I九B Z Y，抄你的信号五九，是否抄收？Over"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("重复呼号但补报信号59已记录",
+          sess._fields.get("BI9BZY", {}).get("signal") == "59"
+          and not any("已经抄收过" in s for s in spoken[n0:]),
+          f"fields={sess._fields} spoken={spoken[n0:]}")
+    # 纯重复（无新字段）→ 走"已经抄收过"
+    n1 = len(spoken)
+    sess._asr_text = lambda p: "这里是BI9BZY"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
+    check("纯重复仍回已经抄收过",
+          any("已经抄收过" in s for s in spoken[n1:]),
+          f"spoken={spoken[n1:]}")
+
+
+def test_relay_same_session_interloper():
+    print("[中继转发同 session：A 刚抄收 B 报不相似呼号 → 排队不顶 A（实测干扰场景）]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9AA"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 被抄收", sess._current_call == "BG9AA", f"cur={sess._current_call}")
+    # 同一 session（中继转发）B 报完全不相似的呼号 → 排队，不替换 A
+    sess._asr_text = lambda p: "这里是BG9BB"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("同session不相似→排队不顶A",
+          sess._current_call == "BG9AA"
+          and [c for c, *_ in sess._checked_in] == ["BG9AA", "BG9BB"]
+          and any(w["call"] == "BG9BB" for w in sess._waiting),
+          f"cur={sess._current_call} checked={sess._checked_in} "
+          f"waiting={sess._waiting}")
+    # 当前友台收尾 → 自动轮到 B
+    sess._end_current()
+    check("收尾后轮到 B", sess._current_call == "BG9BB",
+          f"cur={sess._current_call}")
+
+
+def test_similar_callsign_cross_session_replace():
+    print("[跨 session 相似呼号（BLZ↔BFZ 编辑距离1）→ 识别修正替换]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9BLZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("BLZ 先被抄收", sess._current_call == "BG9BLZ", f"cur={sess._current_call}")
+    # 另一设备（session=8）报相似呼号 → 识别修正，替换为 BFZ
+    sess._asr_text = lambda p: "这里是BG九BFZ，Bravo Foxtrot Zulu"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("相似呼号跨session替换",
+          [c for c, *_ in sess._checked_in] == ["BG9BFZ"]
+          and sess._current_call == "BG9BFZ"
+          and "BG9BLZ" not in sess._checked_calls
+          and not sess._waiting,
+          f"checked={sess._checked_in} cur={sess._current_call} "
+          f"waiting={sess._waiting}")
+
+
+def test_spell_merge_retry():
+    print("[拼读合并：被请重复后逐字母拼读碎段 → 停顿后合并解出完整呼号]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 先造成重复请求流程（低置信度无呼号段消耗额度）
+    sess._asr_text = lambda p: "哦我要高分耐"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=5)
+    check("进入重复请求流程", sess._retry_pending and sess._retry_left == 0,
+          f"pending={sess._retry_pending} left={sess._retry_left}")
+    n0 = len(spoken)
+    # 逐字母拼读（每段 1s 短段，同 session）：Bravo Golf Nine Bravo Foxtrot Zulu
+    for pt in ["Bravo", "Golf", "Nine", "Bravo", "Foxtrot", "Zulu"]:
+        sess._asr_text = lambda p, t=pt: t
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=5)
+    check("拼读段不刷请重复", len(spoken) == n0, f"spoken={spoken}")
+    # 友台拼完停顿 → 主循环空闲轮 flush → 合并解出 BG9BFZ
+    sess._spell_buf[5]["ts"] -= 5.0   # 模拟停顿超过 spell_gap_seconds
+    sess._spell_flush_all()
+    check("拼读合并解出 BG9BFZ",
+          sess._current_call == "BG9BFZ"
+          and [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"cur={sess._current_call} checked={sess._checked_in}")
+    check("合并后恢复重复额度", sess._retry_left == 1 and not sess._retry_pending,
+          f"left={sess._retry_left}")
+
+
+def test_spell_merge_not_half():
+    print("[拼读合并：半截拼读（BG9B）不立即误抄，等待完整拼读]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "哦我要高分耐"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
+    # 只拼 4 词（半截合法呼号 BG9B）后停顿 → flush 不应抄半截 BG9B
+    for pt in ["Bravo", "Golf", "Nine", "Bravo"]:
+        sess._asr_text = lambda p, t=pt: t
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
+    sess._spell_buf[6]["ts"] -= 5.0
+    sess._spell_flush_all()
+    check("半截 BG9B 不误抄",
+          sess._current_call is None
+          and [c for c, *_ in sess._checked_in] == [],
+          f"cur={sess._current_call} checked={sess._checked_in}")
+    # 友台重新完整拼读（半截已丢弃，新缓存）→ 合并解出 BG9BFZ
+    for pt in ["Bravo", "Golf", "Nine", "Bravo", "Foxtrot", "Zulu"]:
+        sess._asr_text = lambda p, t=pt: t
+        sess._process_segment(b"\x00" * 32000, 1.0, None, session=6)
+    sess._spell_buf[6]["ts"] -= 5.0
+    sess._spell_flush_all()
+    check("重新完整拼读解出 BG9BFZ",
+          sess._current_call == "BG9BFZ"
+          and [c for c, *_ in sess._checked_in] == ["BG9BFZ"],
+          f"cur={sess._current_call} checked={sess._checked_in}")
+
+
 def test_correct_extract_and_replace():
     print("[纠正分支：直接提取正确信息并替换抄收]")
     sess = net_control.NetControlSession(link=None)
@@ -843,11 +1369,22 @@ def main():
                test_asr_body, test_vocab_echo_reject, test_conn_reuse,
                test_config_defaults, test_retry_reset, test_llm_gate_and_missing_fields,
                test_info_followup, test_report_clean, test_report_fields,
+               test_cosyvoice_tts,
                test_wait_channel_idle, test_export_csv, test_echo_filter,
                test_wait_idle_consumes_queue, test_mixed_callsign_decode,
                test_ctrl_call_filter, test_same_session_new_call,
                test_echo_other_speaker, test_llm_fallback, test_vad_stuck_release,
                test_llm_call_cap, test_tts_synth_drains_queue,
+               test_speech_supersede_waits,
+               test_interloper_queued, test_idle_recall,
+               test_same_session_replace, test_report_merged_confirm,
+               test_join_intent_guide, test_checkedin_repeat_feedback,
+               test_replace_guard,
+               test_suspend_resume,
+               test_keeper_busy_cede_and_waitfor_onmsg,
+               test_power_highpower_and_device_gt12, test_duplicate_report_fields,
+               test_relay_same_session_interloper, test_similar_callsign_cross_session_replace,
+               test_spell_merge_retry, test_spell_merge_not_half,
                test_correct_extract_and_replace, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
