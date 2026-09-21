@@ -1053,6 +1053,10 @@ class NetControlSession:
         self._current_entry = None          # 指向 _checked_in 中该友台的条目（引用）
         self._current_active = False        # 当前友台流程进行中（抄收→追问→确认窗口）：
                                             # 期间收到新呼号视为插队→静默记录+排队，不打断
+        self._current_touch = 0.0           # 当前友台最近一次有效交互时刻：抄收/补充信息/
+                                            # 播报追问后刷新；插队者说话不刷新。用于
+                                            # "当前友台静默超时收尾"（默认 90s），避免
+                                            # 友台不回应就永久卡住、排队者轮不到
         self._waiting = []                  # 等候排队的插队者（{"call","signal","session"}）
         self._pending_at = None             # 最近一次补充信息段时刻：友台一句话被 VAD
                                             # 切成多段时，合并累积、停稳后统一确认一次
@@ -1214,6 +1218,14 @@ class NetControlSession:
                     "呼号、QTH、使用设备、天线、功率，这里是{ctrl_phonetic} {ctrl_call}，Over")),
                     ))
                 last_idle_call = now
+            # 当前友台静默超时收尾：抄收/追问/确认窗口内，当前友台长时间无任何
+            # 有效应答（不补充、不确认、不纠正）→ 播"暂时无回应"并收尾让位。
+            # 实测 22:16 确认句被吞后 BI9CC 挂 8 分钟、22:40 BR9AB 播完
+            # "是否正确？Over"后 7 分钟无回应 → 点名卡死、排队者轮不到；
+            # 插队者说话（_queue_interloper）不刷新 _current_touch，只有当前
+            # 友台自身的有效交互（抄收/补充/追问播报）才刷新计时。
+            if self._check_current_idle(now):
+                continue
             try:
                 pcm16, dur, wav, session = self._seg_queue.get(timeout=1.0)
             except queue.Empty:
@@ -1223,6 +1235,28 @@ class NetControlSession:
                 continue
             self._capture_pump()
             self._process_segment(pcm16, dur, wav, session)
+
+    def _check_current_idle(self, now=None):
+        """当前友台静默超时收尾（主循环每轮调用，也可单独测试）：
+        进行中（_current_active）且距最近有效交互超过 current_idle_timeout 秒
+        → 播"暂时无回应"并 _end_current 让位排队者。返回 True=已收尾（调用方
+        应 continue 跳过本轮取段）。插队者说话不刷新 _current_touch，只有
+        当前友台自身交互才刷新——插队者一直在说不会给当前友台无限续命。"""
+        if not self._current_active or not self._current_call:
+            return False
+        now = now or time.time()
+        cur_idle = float(nc_cfg("current_idle_timeout", default=90))
+        if now - self._current_touch < cur_idle:
+            return False
+        logger.info(f"当前友台 {self._current_call} 静默 "
+                    f"{now - self._current_touch:.0f}s（>{cur_idle:.0f}s）"
+                    f"无有效应答，收尾让位")
+        self._speak(self._fmt(nc_cfg("current_idle_text", default=
+            "{call_phonetic} 暂时无回应，先请下一位友台。Over"),
+            call=self._current_call,
+            call_phonetic=callsign_phonetic(self._current_call)))
+        self._end_current(flush=False)   # 不补播"是否正确"（对方已不在）
+        return True
 
     def _run_roster(self):
         roster = [str(x).upper() for x in (nc_cfg("roster", default=[]) or [])]
@@ -1402,12 +1436,41 @@ class NetControlSession:
                     "抱歉，刚才抄收可能有误，请您再重复一遍，Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
+                self._current_touch = time.time()   # 请重报后重新计时
                 return
-            if len(info) <= 12 and any(k in kw for k in confirm_kw) \
+            # 结构化字段提取提前到确认/收尾判断前：确认句若夹带字段
+            # （"正确，QTH是西安"）先落字段；"完全正确"等无字段自然跳过。
+            fields = extract_report_fields(info)
+            if fields:
+                self._apply_report_fields(self._current_call, info, signal)
+                return
+            # 收尾意图（"不想补充了/完成点名/点名辛苦了/再见/七三"）→ 直接确认
+            # 收尾，不再追问缺失字段（实测 22:48:21"不想补充了，我完成点名"
+            # 被当无关键词忽略 → 流程拖沓；22:16:29"主播点名辛苦，再见，七三"
+            # 同理）。排除纠正词：'不正确'含'正确'子串，先命中 correct 分支。
+            end_kw = ("完成点名", "结束点名", "点名结束", "点名完成",
+                      "不补充", "不想补充", "不用补充", "不补了",
+                      "就这样吧", "到此为止", "我完成了", "点名辛苦",
+                      "辛苦了", "再见", "七三", "73", "谢谢主控", "感谢主控")
+            if any(k in kw for k in end_kw) \
                     and not any(k in kw for k in correct_kw):
-                # 短确认语（"正确""收到""没问题"）→ 确认收尾，请下一位
-                # （排除纠正词：'不正确'含'正确'子串，先命中 correct 分支；
-                #   长度放宽到 12 以容纳'呼号正确，没问题'等完整确认）
+                logger.info(f"{self._current_call} 主动结束点名: {info}")
+                self._speak(self._fmt(nc_cfg("confirm_text", default=
+                    "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
+                    call=self._current_call,
+                    call_phonetic=callsign_phonetic(self._current_call)))
+                self._end_current(flush=False)
+                return
+            if len(info) <= 40 and any(k in kw for k in confirm_kw) \
+                    and not any(k in kw for k in correct_kw) \
+                    and not re.search(r"(是否正确|对不对|对吗|确认吗|没问题吧|"
+                                      r"没有抄收正确|未抄收正确|没抄收正确|抄收不正确)", kw):
+                # 确认语（"正确""收到""没问题"）→ 确认收尾，请下一位。
+                # 长度放宽到 40 以容纳长确认句（实测 22:16:29"主播超说完全
+                # 正确，主播点名辛苦"18字、22:49:36"数控操作非常正确"16字
+                # 均 >12 被吞 → 确认窗口永不收尾、点名卡死）；排除疑问句
+                # （"是否正确？"是 ask 不是 confirm）与否定质疑
+                # （"呼号您没有抄收正确"应走补报呼号，不是确认收尾）。
                 logger.info(f"{self._current_call} 确认收到: {info}")
                 # 确认后若核心结构化字段仍缺失 → 追问缺失项（每字段最多一次）
                 if self._ask_missing(self._current_call):
@@ -1418,12 +1481,6 @@ class NetControlSession:
                     call_phonetic=callsign_phonetic(self._current_call)))
                 self._end_current(flush=False)   # 友台已确认，不再重复问"是否正确"
                 return
-            # 结构化字段提取：确认的是结构化内容（QTH/设备/天线/功率/信号），
-            # 不再把整句话原样复诵（实测 19:47 "主控是否抄收"被复诵成废话）
-            fields = extract_report_fields(info)
-            if fields:
-                self._apply_report_fields(self._current_call, info, signal)
-                return
             # 无结构化字段的文本分类：
             if any(k in kw for k in ask_kw):
                 # 友台询问是否抄收/主控在吗 → 确认抄收并引导补报信息
@@ -1433,6 +1490,7 @@ class NetControlSession:
                     "请报告您的QTH、使用设备、天线、功率，Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
+                self._current_touch = time.time()   # 当前友台有效活动，刷新计时
                 return
             if "呼号" in kw:
                 # 友台在补报呼号（"我的呼号是BG9"之类未拼完整）→ 请其报完整呼号
@@ -1441,6 +1499,7 @@ class NetControlSession:
                     "{call_phonetic}，请再报一次您的完整呼号，Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
+                self._current_touch = time.time()   # 当前友台有效活动，刷新计时
                 return
             # 报名意图（"这里B九B L Z请求参加点名测试"实测 20:15:15：呼号被
             # ASR 漏字母未解出，不能静默吞掉）→ 引导重报完整呼号
@@ -1452,6 +1511,7 @@ class NetControlSession:
                     "{call_phonetic}，请再报一次您的完整呼号，Over"),
                     call=self._current_call,
                     call_phonetic=callsign_phonetic(self._current_call)))
+                self._current_touch = time.time()   # 当前友台有效活动，刷新计时
                 return
             # 无实义（"那主播""哦，这里是"等）→ 静默忽略，不归入不播报
             logger.info(f"{self._current_call} 无结构化信息且无关键词，忽略: {info}")
@@ -1536,6 +1596,7 @@ class NetControlSession:
         self._flush_csv()          # 实时落盘：结构化字段更新即写入
         # 合并确认：只累积字段、停稳 report_merge_gap_seconds 后统一确认一次
         self._pending_at = time.time()
+        self._current_touch = time.time()   # 补充信息=当前友台有效交互，刷新静默计时
         return True
 
     def _flush_pending_report(self, force=False):
@@ -1573,6 +1634,7 @@ class NetControlSession:
             self._speak(self._fmt(tmpl, call=self._current_call,
                 call_phonetic=callsign_phonetic(self._current_call),
                 info=info))
+        self._current_touch = time.time()   # 播完合并确认后重新计时：等友台确认"是否正确"
         # 注意：这里不再立即追问缺失字段（旧逻辑播完"是否正确？Over"后马上
         # 追一句"请补充信号、QTH、功率"，实测 22:06:16→22:06:34 主控连播两句、
         # 友台还没回答"是否正确"就被抢话）——友台先回答"是否正确/继续补充"，
@@ -1595,13 +1657,27 @@ class NetControlSession:
         self._speak(self._fmt(nc_cfg("missing_ask_text", default=
             "抄收，{call_phonetic}，信息已记录，请再补充您的{missing}，Over"),
             call=call, call_phonetic=callsign_phonetic(call), missing=labels))
+        self._current_touch = time.time()   # 追问后重新计时：等友台补报缺失字段
         return True
 
     def _handle_duplicate(self, call, signal, raw):
         """重复抄收：先看本段是否在补报缺失字段（实测 20:51:26 友台重复报
-        "抄你的信号五九"→ 信号59 应补录，而不是直接"已经抄收过"吞掉）。"""
+        "抄你的信号五九"→ 信号59 应补录，而不是直接"已经抄收过"吞掉）。
+        当前友台重复报自己呼号（22:24:38 实测"B I九C C"）且无新字段 →
+        视为确认收尾窗口（播感谢话术，不再说"已经抄收过"显得像指责），
+        让流程推进到排队中的下一位。"""
         if self._current_call == call and self._apply_report_fields(call, raw, signal):
             logger.info(f"{call} 重复抄收但补报字段已记录: {raw}")
+            return
+        if self._current_call == call and self._current_active:
+            logger.info(f"{call} 当前友台重复报自己呼号，视为确认收尾: {raw}")
+            self._dups += 1
+            self._retry_pending = False
+            self._retry_left = int(nc_cfg("max_retry", default=1))
+            self._speak(self._fmt(nc_cfg("confirm_text", default=
+                "抄收，{call_phonetic}，感谢确认，请下一位友台。Over"),
+                call=call, call_phonetic=callsign_phonetic(call)))
+            self._end_current(flush=False)
             return
         logger.info(f"重复抄收 {call}，跳过")
         self._dups += 1
@@ -1641,6 +1717,7 @@ class NetControlSession:
                             "请报告您的QTH、使用设备、天线、功率，Over"),
                             call=self._current_call,
                             call_phonetic=callsign_phonetic(self._current_call)))
+                        self._current_touch = time.time()   # 当前友台有效活动，刷新计时
                         return
                     return self._replace_checkin(call, signal, wav, raw, session, score)
             # 呼号不相似（另一个人，无论 session）→ 插队：静默记录+排队，不打断
@@ -1743,6 +1820,7 @@ class NetControlSession:
         self._current_session = session
         self._current_entry = entry
         self._current_active = True        # 抄收→追问→确认窗口：期间新呼号=插队，不打断
+        self._current_touch = time.time()  # 当前友台开始计时：静默超时收尾从此刻起算
         self._asked_fields.setdefault(call.upper(), set())  # 结构化追问独立计数
         ack = self._fmt(nc_cfg("ack_text", default=
             "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，"
@@ -1776,9 +1854,13 @@ class NetControlSession:
         call = (call or "").upper()
         if not call:
             return
-        if call in self._checked_calls \
-                or any(w["call"] == call for w in self._waiting):
-            logger.info(f"插队呼号 {call} 已在册/等待中，忽略")
+        # 判重叠加相似合并（callsign_similar 编辑距离≤1，与识别修正同口径）：
+        # 实测 22:46:15 先报 BI9BCC、22:46:33 再报 BA9BCC（ASR 把 I 听成 A）
+        # 是同一人，精确判重会让他重复入队占两个名额、点名记录多记一人。
+        # 与已抄收/已排队中任一呼号相似即视为同一人，忽略本次插队。
+        if any(callsign_similar(call, c) for c in self._checked_calls) \
+                or any(callsign_similar(call, w["call"]) for w in self._waiting):
+            logger.info(f"插队呼号 {call} 与在册/排队中呼号相似，忽略")
             return
         entry = [call, signal or "", "", "", ""]   # 记录到文件（全量落盘随 _flush_csv）
         self._checked_in.append(entry)

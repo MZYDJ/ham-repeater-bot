@@ -1033,7 +1033,8 @@ def test_checkedin_repeat_feedback():
     n0 = len(spoken)
     sess._asr_text = lambda p: "这里是BG9BFZ请求参加点名"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
-    check("已点过直接反馈", len(spoken) == n0 + 1 and "已经抄收过" in spoken[-1],
+    check("已点过直接反馈", len(spoken) == n0 + 1
+          and ("已经抄收过" in spoken[-1] or "感谢确认" in spoken[-1]),
           f"spoken={spoken}")
 
 
@@ -1180,13 +1181,119 @@ def test_duplicate_report_fields():
           sess._fields.get("BI9BZY", {}).get("signal") == "59"
           and not any("已经抄收过" in s for s in spoken[n0:]),
           f"fields={sess._fields} spoken={spoken[n0:]}")
-    # 纯重复（无新字段）→ 走"已经抄收过"
+    # 纯重复（无新字段）→ 当前友台重复报自己呼号：视为确认收尾推进流程，
+    # 播"感谢确认"而非"已经抄收过"（实测 22:24:38 友台重报自己呼号让流程
+    # 继续，旧话术像指责；本次修复改为友好确认收尾）
     n1 = len(spoken)
     sess._asr_text = lambda p: "这里是BI9BZY"
     sess._process_segment(b"\x00" * 32000, 1.0, None, session=1)
-    check("纯重复仍回已经抄收过",
-          any("已经抄收过" in s for s in spoken[n1:]),
+    check("纯重复视为确认收尾",
+          any("感谢确认" in s for s in spoken[n1:]),
           f"spoken={spoken[n1:]}")
+
+
+def test_long_confirm_accepted():
+    print("[长确认句（>12字）→ 确认收尾：22:16:29'主播超说完全正确，主播点名辛苦'、"
+          "22:49:36'数控操作非常正确'均被 len<=12 吞掉 → 点名卡死]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9BFZ，信号59"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    # 长确认句（18字，带告别语）→ 收尾（不是"忽略"）
+    sess._asr_text = lambda p: "主播超说完全正确，主播点名辛苦，再见，七三"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("长确认句收尾", len(spoken) > n0
+          and any("感谢确认" in s or "请下一位友台" in s for s in spoken[n0:]),
+          f"spoken={spoken[n0:]}")
+    check("长确认句已收尾", not sess._current_active, f"active={sess._current_active}")
+
+
+def test_finish_intent_ends():
+    print("[结束意图（不想补充了/完成点名）→ 直接收尾不再追问缺失字段："
+          "22:48:21'不想补充了，我完成点名'被忽略 → 流程拖沓]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9BFZ"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    n0 = len(spoken)
+    # 友台主动结束（信息未补全也不追问）
+    sess._asr_text = lambda p: "不想补充了，我完成点名，主控辛苦了，七三"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("结束意图收尾", len(spoken) > n0
+          and any("感谢确认" in s or "请下一位友台" in s for s in spoken[n0:]),
+          f"spoken={spoken[n0:]}")
+    check("结束意图不追问", not any("请再补充" in s for s in spoken[n0:]),
+          f"spoken={spoken[n0:]}")
+    check("结束意图已收尾", not sess._current_active, f"active={sess._current_active}")
+
+
+def test_current_idle_timeout_yields():
+    print("[当前友台静默超时 → 播'暂时无回应'收尾让位：22:40 BR9AB 播完"
+          "'是否正确？Over'后 7 分钟无回应、22:16 确认句被吞挂 8 分钟]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    sess._asr_text = lambda p: "这里是BG9AA"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    check("A 抄收进行中", sess._current_active, f"active={sess._current_active}")
+    # B 插队排队
+    sess._asr_text = lambda p: "这里是BG9BB"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("B 已排队", [w["call"] for w in sess._waiting] == ["BG9BB"],
+          f"waiting={sess._waiting}")
+    # 把 A 的静默计时拨旧（超过默认 90s）→ 触发超时收尾让位 B
+    sess._current_touch -= 91
+    n0 = len(spoken)
+    check("超时收尾让位", sess._check_current_idle()
+          and any("暂时无回应" in s for s in spoken[n0:]),
+          f"spoken={spoken[n0:]}")
+    check("让位后轮到 B", sess._current_call == "BG9BB"
+          and not sess._waiting and sess._current_active,
+          f"cur={sess._current_call} waiting={sess._waiting}")
+    # 未超时不触发
+    sess._asr_text = lambda p: "抄收正确"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    n1 = len(spoken)
+    check("未超时不收尾", not sess._check_current_idle()
+          and len(spoken) == n1, f"spoken={spoken[n1:]}")
+
+
+def test_similar_interloper_dedup():
+    print("[插队相似呼号合并：22:46:15 BI9BCC 插队后 22:46:33 BA9BCC 重复"
+          "（ASR 听写 I→A）→ 应判为同一人忽略，不重复入队]")
+    sess = net_control.NetControlSession(link=None)
+    sess._net_ctx = {"ctrl_call": "BI9BZW"}
+    spoken = []
+    sess._speak = lambda t: spoken.append(t)
+    sess._capture_pump = lambda: None
+    # 当前友台 A 进行中
+    sess._asr_text = lambda p: "这里是BG9AA"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=7)
+    # 插队 BI9BCC（session=8）
+    sess._asr_text = lambda p: "这里是BI9BCC，请求参加点名"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=8)
+    check("BI9BCC 已排队", [w["call"] for w in sess._waiting] == ["BI9BCC"],
+          f"waiting={sess._waiting}")
+    # 相似呼号 BA9BCC（编辑距离1）再来 → 忽略，不重复入队
+    sess._asr_text = lambda p: "这里是BA9BCC，请求参加点名"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=9)
+    check("相似插队忽略", len(sess._waiting) == 1
+          and len(sess._checked_in) == 2,
+          f"waiting={sess._waiting} checked={sess._checked_in}")
+    # 完全不同的呼号仍正常排队
+    sess._asr_text = lambda p: "这里是BG9CC"
+    sess._process_segment(b"\x00" * 32000, 1.0, None, session=10)
+    check("不同呼号正常排队", [w["call"] for w in sess._waiting] == ["BI9BCC", "BG9CC"],
+          f"waiting={sess._waiting}")
 
 
 def test_relay_same_session_interloper():
@@ -1385,7 +1492,9 @@ def main():
                test_power_highpower_and_device_gt12, test_duplicate_report_fields,
                test_relay_same_session_interloper, test_similar_callsign_cross_session_replace,
                test_spell_merge_retry, test_spell_merge_not_half,
-               test_correct_extract_and_replace, test_templates]:
+               test_correct_extract_and_replace, test_long_confirm_accepted,
+               test_finish_intent_ends, test_current_idle_timeout_yields,
+               test_similar_interloper_dedup, test_templates]:
         fn()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
