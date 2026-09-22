@@ -220,10 +220,10 @@
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "enable_itn": true,       // 数字归一化："五九"→"59"（信号报告需要）
       "language": "",           // 留空=自动识别；确定中文可填 zh
-      "sys_style": "none"       // system 词表：none=关闭（默认，最稳）；list=开启
-                                // （9/22 --asr-probe 实测：list 大写音标词生效、无回显、
-                                //  Zulu/Whiskey 识别正确；小写 alpha/bravo 曾诱发
-                                //  "词表回显"——代码已统一转大写并带回显校验自动降级）
+      "sys_style": "list"       // system 词表：list=开启（9/22 --asr-probe 实测推荐：
+                                //  list 大写音标词生效、无回显、Zulu/Whiskey 识别正确；
+                                //  V6 去掉 asr_options 时 208 变'二零八'，故保持 opts
+                                //  开启。none=关闭（旧默认，最稳但词表不生效）
     },
     // ---- LLM 信息提取（可选，默认关闭；主路径为词表确定性解码）----
     "llm": {
