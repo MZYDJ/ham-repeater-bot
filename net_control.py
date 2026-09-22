@@ -1384,6 +1384,9 @@ class NetControlSession:
         # 归入条件：无新呼号（有呼号低分也必须走重试/抄收，不能吞——
         # 实测 20:41 同 session 友台补报"这里是BJ九EFU"被当补充信息忽略）
         # 且 已有当前友台 且 段来源 session 与其一致（session 缺失时保守归入）。
+        # 确认收尾后（_current_active=False）段仍可进入本块响应纠正/询问/确认
+        # 等对话类意图（友台确认后反悔纠正，历史测试保护），但"信息补充写入"
+        # 由下方 fields 分支前的挡板拦截（见 21:03 确认后 21:14 污染日志）。
         if (call is None
                 and self._current_call is not None
                 and (session is None or self._current_session is None
@@ -1468,6 +1471,13 @@ class NetControlSession:
             # （"正确，QTH是西安"）先落字段；"完全正确"等无字段自然跳过。
             fields = extract_report_fields(info)
             if fields:
+                # 确认收尾后（_current_active=False）不再接受信息补充写入：
+                # 实测 21:03 确认收尾后 21:14"设备没有天线没有"仍被挂到
+                # BH9FHT 名下并写进 CSV——友台已收尾，后续补充/闲聊不得再
+                # 污染记录；纠正/询问等对话类意图在 fields 之前已分流，不受影响。
+                if not self._current_active:
+                    logger.info(f"{self._current_call} 已确认收尾，忽略补充信息: {info}")
+                    return
                 self._apply_report_fields(self._current_call, info, signal)
                 return
             # 收尾意图（"不想补充了/完成点名/点名辛苦了/再见/七三"）→ 直接确认
@@ -1911,7 +1921,12 @@ class NetControlSession:
     def _end_current(self, flush=True):
         """当前友台流程收尾：解除进行中状态；若有人在等候排队，自动轮到下一位。
         flush=True 时先补播未确认的信息合并确认（不丢不拖）；友台已主动确认
-        （"正确"）则 flush=False，不再重复问"是否正确"。"""
+        （"正确"）则 flush=False，不再重复问"是否正确"。
+        注意：收尾只置 _current_active=False，**不清空 _current_call**——
+        确认收尾后同 session 的纠正/询问等对话类意图仍需响应（历史测试保护）；
+        后续"信息补充写入"由 fields 落地前的 _current_active 挡板拦截，
+        防止闲聊污染点名记录（实测 21:03 确认后 21:14"设备没有天线没有"
+        仍挂 BH9FHT）。"""
         if flush:
             self._flush_pending_report(force=True)
         self._current_active = False
