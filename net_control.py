@@ -103,6 +103,10 @@ PHONETIC_ZH = {
     # ASR 中文音译变体实测（21:14 日志）："佛罗里达之路"=Foxtrot Zulu、
     # "弗雷"=Foxtrot（"反而我弗雷打住了"）、"高"不作为单字映射（防"高功率"污染）
     "佛罗里达": "F", "之路": "Z", "弗雷": "F",
+    # ASR 把呼号前缀 "B J" 听写成"北京"（Beijing 缩写 BJ，22:09 实测
+    # "北京Nine Bravo Florida Zulu"=BJ9BFZ）、"奈"=Nine（22:09"高尔夫奈"）、
+    # "住住"=Zulu（22:09"佛罗里达住住"）——缺映射会整段解不出呼号
+    "北京": "BJ", "奈": "9", "住住": "Z",
 }
 CN_DIGITS = {"零": "0", "一": "1", "二": "2", "两": "2", "三": "3", "四": "4",
              "五": "5", "六": "6", "七": "7", "八": "8", "九": "9",
@@ -1041,6 +1045,10 @@ class NetControlSession:
         self._failed = 0
         self._retry_pending = False
         self._retry_left = int(nc_cfg("max_retry", default=1))
+        # 额度用尽"未能抄收"播报的去重表：session → 最近一次播报时刻。
+        # 友台反复报呼号失败时，冷却期内（giveup_gap_seconds，默认 30s）只
+        # 播一次"未能抄收"，避免刷屏；冷却期外可再提醒（点名继续推进）。
+        self._giveup_said = {}
         # 拼读合并缓存：session → {"text", "ts"}。友台被请重复呼号后常用
         # 逐字母解释法拼读（"Bravo / Golf / Nine / ..."），VAD 按字母间停顿
         # 切成 0.5~1.5s 短段逐段 ASR（实测 21:15 场景），单段拼不出呼号 →
@@ -1539,8 +1547,22 @@ class NetControlSession:
             logger.warning(f"未抄收（{'/'.join(res['reasons'])}）文本: {raw}")
             self._failed += 1
             self._retry_pending = False
+            # 额度用尽后不能无限静默（实测 22:09 友台反复报呼号、点名整段卡死）：
+            # ① 该 session 冷却期内不再重复播报（防同一友台反复触发刷屏）
+            # ② 冷却期外播一句"未能抄收"明确收尾，并恢复额度——否则全局额度
+            #    用尽后连下一位友台也会被静默吞掉，点名无法继续
             if raw and raw.strip():
-                logger.info("重复请求额度已用尽，静默等待下一位友台")
+                now = time.time()
+                last = self._giveup_said.get(session)
+                gap = float(nc_cfg("giveup_gap_seconds", default=30))
+                if last is None or now - last >= gap:
+                    self._giveup_said[session] = now
+                    logger.info("重复请求额度已用尽，播报未能抄收并恢复额度")
+                    self._speak(self._fmt(nc_cfg("giveup_text", default=
+                        "抱歉，未能抄收您的呼号，请稍后再报，或请下一位友台，Over")))
+                    self._retry_left = int(nc_cfg("max_retry", default=1))
+                else:
+                    logger.info(f"重复请求额度已用尽且 {gap:.0f}s 冷却期内，静默忽略（防刷屏）")
             return
         self._retry_pending = True
         self._retry_left -= 1

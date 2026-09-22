@@ -130,11 +130,34 @@ def test_opening_fmt_and_timing():
     check("到点安静后已收尾", has_closing, str(tts.said))
 
 
+def test_retry_exhausted_recovers():
+    """额度用尽不再静默卡死（22:09 实测：友台反复报呼号点名整段卡死）：
+    ① 额度用尽后播报"未能抄收"明确收尾（不再无限静默）；
+    ② 恢复额度，下一位友台正常抄收（全局额度不被耗尽锁死）。"""
+    print("[额度用尽恢复：防静默卡死]")
+    tts = SpyTTS()
+    sess = NetControlSession(link=None, tts_func=tts)
+    sess._asr = FakeAsr([
+        "这个听不清",                    # 低置信度 → 请重复（额度 1→0）
+        "还是听不清",                    # 额度用尽 → 播"未能抄收" + 恢复额度
+        "Bravo Hotel Three X-ray X-ray 信号五九",   # 下一位友台正常抄收
+    ])
+    for s in [None, None, 3]:
+        # dur=3.0s（>2.5s 拼读片段上限）：长段不会进拼读合并缓存，直接走额度用尽分支
+        sess._process_segment(b"\x00" * 32000, 3.0, "", s)
+    check("额度用尽后播报未能抄收",
+          any("未能抄收" in t for t in tts.said), str(tts.said))
+    check("下一位友台仍可抄收",
+          any(c == "BH3XX" for c, *_ in sess._checked_in),
+          str([c for c, *_ in sess._checked_in]))
+
+
 def main():
     print("== 点名会话状态机测试 ==")
     test_open_flow()
     test_roster_timeout()
     test_opening_fmt_and_timing()
+    test_retry_exhausted_recovers()
     print(f"\n结果: PASS={PASS} FAIL={FAIL}")
     sys.exit(1 if FAIL else 0)
 
