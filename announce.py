@@ -140,6 +140,13 @@ def get_announce_text(now: datetime.datetime) -> str:
 def tts_cache_path(text: str) -> Path:
     """TTS 缓存文件路径（以播报文本 md5 为键）"""
     return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
+def _tts_min_seconds(text: str) -> float:
+    """按文本长度估算 TTS 音频最小时长（秒），拦截断流/超时产生的残缺音频。
+
+    中文 TTS 语速约 4-5 字/秒，正常音频时长远大于 len*0.12；而 Edge-TTS
+    断流/超时残留的残缺音频通常只有完整时长的一半以下（实测整点播报完整
+    ~20s，残缺仅 7~10s），用该下限可准确识别并触发重新合成。"""
+    return max(2.0, len(text) * 0.12)
 def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) -> str:
     """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试"""
     if max_retries is None:
@@ -147,12 +154,13 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
     if retry_delay is None:
         retry_delay = TTS_RETRY_DELAY
     cache_path = tts_cache_path(text)
+    min_secs = _tts_min_seconds(text)
     # 缓存命中时用 libmpg123 完整解码 dry-run 校验（识别头部损坏+尾部截断不完整），
-    # 空/损坏文件视为无效，删除后重新合成
+    # 空/损坏/残缺（时长不足）文件视为无效，删除后重新合成
     if cache_path.exists():
-        if direct_announce.dry_validate_mp3(cache_path):
+        if direct_announce.dry_validate_mp3(cache_path, min_seconds=min_secs):
             return str(cache_path)
-        logger.warning(f"TTS缓存文件损坏（dry-validate失败），将重新合成: {cache_path.name}")
+        logger.warning(f"TTS缓存文件损坏或残缺（dry-validate失败，需≥{min_secs:.0f}s），将重新合成: {cache_path.name}")
         cache_path.unlink()
     for attempt in range(1, max_retries + 1):
         logger.info(f"合成语音 (第{attempt}/{max_retries}次): {text}")
@@ -177,11 +185,11 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
                 # 清理可能写了一半的文件
                 if cache_path.exists() and cache_path.stat().st_size == 0:
                     cache_path.unlink()
-            elif cache_path.exists() and direct_announce.dry_validate_mp3(cache_path):
+            elif cache_path.exists() and direct_announce.dry_validate_mp3(cache_path, min_seconds=min_secs):
                 return str(cache_path)
             else:
                 reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
-                logger.warning(f"TTS合成失败或文件为空 (第{attempt}次): {reason}")
+                logger.warning(f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
         except Exception as e:
             logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
         if attempt < max_retries:
@@ -244,7 +252,10 @@ def tts_prefill_task():
             break
         text = get_announce_text(slot)
         cache_path = tts_cache_path(text)
-        if cache_path.exists() and cache_path.stat().st_size > 0:
+        # 已备好：文件存在且通过时长校验（>= 文本估算时长）；残缺文件视为未备好，
+        # 交由 get_tts_file 删除重合成（修复 Edge-TTS 断流只存开头几秒的残缺缓存）
+        if cache_path.exists() and direct_announce.dry_validate_mp3(
+                cache_path, min_seconds=_tts_min_seconds(text)):
             continue  # 已备好
         if get_tts_file(text):
             synthesized += 1
