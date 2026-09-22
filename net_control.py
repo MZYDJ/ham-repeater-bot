@@ -2127,7 +2127,11 @@ class NetControlSession:
             return ""
 
     def _context_words(self):
-        words = list(PHONETIC_ITU.keys()) + list(PHONETIC_ZH.keys())
+        # 英文音标词统一大写（实测 9/22 --asr-probe：大写 BRAVO/HOTEL 词表生效、
+        # Zulu/Whiskey 识别正确；小写 alpha/bravo 曾诱发"词表回显"或匹配失败）。
+        # 中文音译词（阿尔法/佛罗里达）与呼号保持原样。
+        words = [str(w).upper() for w in PHONETIC_ITU.keys()]
+        words += list(PHONETIC_ZH.keys())
         words += list(self._checked_calls)
         words += [str(x).upper() for x in (nc_cfg("roster", default=[]) or [])]
         words += [str(x) for x in (nc_cfg("extra_vocab", default=[]) or [])]
@@ -2638,8 +2642,10 @@ def main():
             ("V3 bare+opts   ", "bare", True),
             ("V4 none+opts   ", "none", True),
             ("V5 str+no-opts ", "str", False),
+            ("V6 list+no-opts", "list", False),
         ]
-        vocab = ["BRAVO", "HOTEL", "BH3XX", "BG9ABC", "泉盛", "咸阳市"]
+        vocab = ["BRAVO", "HOTEL", "INDIA", "NINE", "ZULU", "WHISKEY",
+                 "BH3XX", "BG9ABC", "泉盛", "咸阳市"]
         for label, style, with_opts in variants:
             body = client._build_body(wav_bytes, context_words=vocab,
                                       with_asr_opts=with_opts, sys_style=style)
@@ -2649,13 +2655,18 @@ def main():
                 try:
                     out = json.loads(detail)
                     content = (out.get("choices") or [{}])[0].get("message", {}).get("content", "")
-                    print(f"{label} → HTTP 200  识别: {content!r}")
+                    # 词表回显检测：返回内容含词表引导语特征 = 服务端把 system
+                    # 当输入转写（生产 _transcribe_locked 同款校验，这里明示）
+                    echoed = style != "none" and content and any(
+                        m in content for m in VOCAB_MARKERS)
+                    flag = "  ← 词表回显(无效)" if echoed else ""
+                    print(f"{label} → HTTP 200  识别: {content!r}{flag}")
                 except Exception as e:
                     print(f"{label} → HTTP 200  解析失败: {e}")
             else:
                 print(f"{label} → HTTP {status}  {detail[:240]}")
         print("\n预期：V1/V4 成功（list=生产默认；none=降级兜底），V2/V3/V5 400。"
-              "若 V1 对真实录音识别出呼号即证明词表生效（建议："
+              "若 V1 对真实录音识别出呼号且无'词表回显'标记即证明词表生效（建议："
               "python3 net_control.py --asr-probe /app/net_records/seg_xxx.wav）。")
         return
     ap.print_help()
