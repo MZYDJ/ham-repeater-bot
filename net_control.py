@@ -1359,6 +1359,23 @@ class NetControlSession:
         # 主控自身呼号：开场白/播报的回声、友台报主控呼号 → 不视为友台
         ctrl = (self._net_ctx or {}).get("ctrl_call", "")
         if call and ctrl and call.upper() == ctrl.upper():
+            # 但"呼叫主控 + 请求参加点名"句式（实测 21:17:31"BI9BZW 增加
+            # 两人"=友台呼叫主控后请求报名）不能整句吞掉——句中含报名意图
+            # 词时引导重报呼号；纯回波（"BI9BZW"无其他意图）才静默忽略。
+            info0 = clean_report_text(raw)
+            kw0 = (info0 or "").lower()
+            if any(k in kw0 for k in ("请求参加", "参加点名", "参加测试",
+                                      "点名测试", "请求加入", "想参加",
+                                      "参加一下", "报名", "增加", "加入")):
+                logger.info(f"友台呼叫主控 {call} 并请求参加，引导重报呼号: {info0}")
+                if self._current_call:
+                    self._speak(self._fmt(nc_cfg("repeat_text", default=
+                        "{call_phonetic}，请再报一次您的完整呼号，Over"),
+                        call=self._current_call,
+                        call_phonetic=callsign_phonetic(self._current_call)))
+                else:
+                    self._speak("请再报一次您的完整呼号，Over")
+                return
             logger.info(f"主控自身呼号 {call}，忽略（回波/自我识别）")
             return
         if call and is_duplicate(call, self._checked_calls):
@@ -1383,14 +1400,26 @@ class NetControlSession:
         # （17:26:51 实测段"我的QTH在咸阳市…设备即时通…五瓦功率发射"即此场景）。
         # 归入条件：无新呼号（有呼号低分也必须走重试/抄收，不能吞——
         # 实测 20:41 同 session 友台补报"这里是BJ九EFU"被当补充信息忽略）
-        # 且 已有当前友台 且 段来源 session 与其一致（session 缺失时保守归入）。
+        # 且 已有当前友台。session 一致性检查放宽：点名直连（UDP 抢麦+监听）
+        # 架构下抄收段与补充段可能来自不同 session（实测 21:20:07 抄收
+        # BG9AJU 后 21:20:46 补充段"天线没有设备很小"因 session 不同未归入，
+        # 落入"请求补报呼号"）——当前友台进行中（_current_active）且本段
+        # **提取到结构化字段**时跨 session 也归入；但"这里是…"开头是**新友台
+        # 报呼号句式**（"这里是，我的设备是…"=想报呼号但呼号没解出），即使
+        # 含字段也**不归入**，走引导重报（历史测试保护）；session 缺失时保守
+        # 归入。无呼号的闲聊段（"信号很好""天气怎么样"）extract 不到字段
+        # 即不归入，仍按新友台引导。
         # 确认收尾后（_current_active=False）段仍可进入本块响应纠正/询问/确认
         # 等对话类意图（友台确认后反悔纠正，历史测试保护），但"信息补充写入"
         # 由下方 fields 分支前的挡板拦截（见 21:03 确认后 21:14 污染日志）。
         if (call is None
                 and self._current_call is not None
                 and (session is None or self._current_session is None
-                     or session == self._current_session)):
+                     or session == self._current_session
+                     or (self._current_active
+                         and bool(extract_report_fields(raw))
+                         and not re.search(r"^这里(?:是|的)?",
+                                           clean_report_text(raw))))):
             info = clean_report_text(raw)
             if not info:
                 # 空段/纯语气词（0.5s 环境声、放麦尾音）→ 静默忽略：
