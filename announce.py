@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 import hashlib
 import logging
@@ -311,6 +312,16 @@ _native_session_temp = False  # 预建会话是否临时短链（播完 close；
 _native_link = None        # direct_announce.PersistentAnnouncer：常驻直连链路
 _last_announce_ok = time.time()   # 最近一次成功播报的 wall-clock 时刻（看门狗判定用）
 _announce_ok_seen = False   # 是否已有成功播报（首播前看门狗豁免，防重启后误报）
+# ---- 看门狗自重启状态（持久化到文件，重启后冷却仍生效，防重启风暴） ----
+_restart_ts_file = Path(LOG_DIR) / "watchdog_last_restart.ts"
+def _load_restart_ts() -> float:
+    try:
+        if _restart_ts_file.exists():
+            return float(_restart_ts_file.read_text(encoding="utf-8").strip())
+    except Exception:
+        pass
+    return 0.0
+_last_restart_ts = _load_restart_ts()   # 最近一次自重启时刻（epoch 秒）
 def _native_link_event(kind, detail):
     """常驻链路事件回调（企业微信告警链路复用 logger 级别）"""
     if kind == "removed":
@@ -529,24 +540,84 @@ def schedule_announce():
 def schedule_tts_prefill():
     task_queue.put("tts_prefill")
 def schedule_watchdog():
-    """播报看门狗：超过阈值（默认 90 分钟）无成功播报且非点名期 → ERROR 告警。
-    点名进行中播报本身跳过（net_active），阈值须大于点名最长时长（默认硬上限
-    35min）。目的：9/25 曾静默 14 小时无人知（调度器假死/链路假死），告警让
-    运维第一时间发现；如需自动重启可在 supervisor 层按 ERROR 日志处置。"""
+    """播报看门狗：检查"上一个应在播报时段内执行的准点"是否完成。
+    - 时段外（22:30 后 ~ 次日 07:00 前）无播报任务 → 不检查（夜间静默正常，
+      旧版按"距最近成功播报 gap"判断在夜间误报，已废弃）。
+    - 上一准点缺失且超过容忍窗口 → ERROR 告警（企业微信自动推送）→
+      等待通知发送完成后自行重启进程（冷却期 2h，防重启风暴）。"""
     try:
         if net_active():
             return
-        global _announce_ok_seen
-        if not _announce_ok_seen:
-            return    # 启动后首播尚未发生：豁免（重启到首播可能间隔 > 阈值）
-        thr = float(cfg_get("watchdog", "announce_idle_seconds", default=5400))
-        gap = time.time() - _last_announce_ok
-        if gap > thr:
-            logger.error(f"播报看门狗：已 {gap:.0f}s 无成功播报（阈值 {thr:.0f}s），"
-                         f"疑似调度器/链路假死。请检查链路状态与进程日志，"
-                         f"必要时重启容器恢复。")
+        now = datetime.datetime.now()
+        # 当前所在半小时格子的起点（XX:00 / XX:30），即"上一个应播准点"
+        cand = now.replace(second=0, microsecond=0)
+        if cand.minute < 30:
+            cand = cand.replace(minute=0)
+        else:
+            cand = cand.replace(minute=30)
+        # 只在播报时段 [START:00, END:30] 内的准点检查；时段外直接豁免。
+        # 注意 hour==END 时 cand ∈ {END:00, END:30}，两场都是合法播报（22:00/22:30）
+        in_window = (ANNOUNCE_START_HOUR <= cand.hour <= ANNOUNCE_END_HOUR)
+        if not in_window:
+            return
+        # 距准点不足容忍窗口不检查（播报可能刚在跑/重试中），默认 15 分钟
+        if (now - cand).total_seconds() < float(
+                cfg_get("watchdog", "slot_tolerance_seconds", default=900)):
+            return
+        # 准点发生在最近一次自重启之前 → 重启过程的预期跳过，不追责
+        if cand.timestamp() < _last_restart_ts:
+            return
+        global _last_announce_ok
+        if _last_announce_ok >= cand.timestamp():
+            return    # 上一准点已成功打点
+        gap = now.timestamp() - _last_announce_ok
+        logger.error(f"播报看门狗：准点 {cand:%H:%M} 播报未完成"
+                     f"（最近成功播报 {datetime.datetime.fromtimestamp(_last_announce_ok):%m-%d %H:%M}，"
+                     f"已间隔 {gap:.0f}s），疑似调度器/链路假死，准备通知并自重启")
+        _notify_then_restart(f"准点 {cand:%H:%M} 播报未完成（已间隔 {gap:.0f}s）")
     except Exception as e:
         logger.error(f"播报看门狗异常: {e}")
+
+def _notify_then_restart(reason: str):
+    """看门狗自重启：远程通知（同步等待发送完成）→ 短暂等待送达 → os.execv
+    自重启替换进程（容器 PID 不变，不依赖 docker 权限）。
+    冷却期（默认 2h）内只告警不重启；重启时间戳持久化到文件，重启后冷却仍生效。"""
+    global _last_restart_ts
+    now = time.time()
+    cooldown = float(cfg_get("watchdog", "restart_cooldown_seconds", default=7200))
+    if now - _last_restart_ts < cooldown:
+        logger.error(f"看门狗：距上次重启 {now - _last_restart_ts:.0f}s < 冷却 {cooldown:.0f}s，"
+                     f"本次仅告警不重启（持续异常请人工介入）")
+        return
+    # 1) 同步发送远程通知（阻塞等待发送完成，最长 5s）
+    if WECHAT_WEBHOOK_URL:
+        try:
+            payload = {"msgtype": "text", "text": {
+                "content": f"[播报服务 ERROR] 看门狗触发自重启：{reason}"}}
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                WECHAT_WEBHOOK_URL, data=data,
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                logger.info(f"看门狗通知已发送完成: {resp.read().decode('utf-8')[:60]}")
+        except Exception as e:
+            logger.error(f"看门狗通知发送失败（仍继续重启）: {e}")
+    else:
+        logger.warning("看门狗：未配置 notify.webhook_url，仅文件日志告警")
+    # 2) 等待通知送达后再重启
+    time.sleep(5)
+    # 3) 记录重启时刻（持久化）并自重启
+    _last_restart_ts = time.time()
+    try:
+        _restart_ts_file.write_text(str(_last_restart_ts), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"看门狗重启时间戳落盘失败（冷却期将丢失）: {e}")
+    logger.error("看门狗：执行自重启（os.execv 替换进程）")
+    try:
+        logging.shutdown()   # flush 全部日志后再替换进程
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        logger.error(f"自重启失败（请手动重启容器）: {e}")
 if __name__ == "__main__":
     try:
         # 交互模式：阻塞式，按回车播报，不进入调度
