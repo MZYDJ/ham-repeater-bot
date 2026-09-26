@@ -310,6 +310,7 @@ _native_prebuilt = None    # (mp3路径, packets)：预构建的音频包
 _native_session_temp = False  # 预建会话是否临时短链（播完 close；常驻的只 release）
 _native_link = None        # direct_announce.PersistentAnnouncer：常驻直连链路
 _last_announce_ok = time.time()   # 最近一次成功播报的 wall-clock 时刻（看门狗判定用）
+_announce_ok_seen = False   # 是否已有成功播报（首播前看门狗豁免，防重启后误报）
 def _native_link_event(kind, detail):
     """常驻链路事件回调（企业微信告警链路复用 logger 级别）"""
     if kind == "removed":
@@ -482,8 +483,9 @@ def _announce_native(tts_file: str):
         _native_link_resume()
     if ok:
         logger.info(f"直连播报完成，耗时 {time.time() - t0:.1f} 秒")
-        global _last_announce_ok
+        global _last_announce_ok, _announce_ok_seen
         _last_announce_ok = time.time()   # 看门狗打点：本次播报成功
+        _announce_ok_seen = True
     else:
         logger.error("直连播报返回失败")
 def announce_task():
@@ -508,8 +510,9 @@ def announce_task():
             _native_session = _native_prebuilt = None   # 先取走，防重入
             try:
                 _native_play(s, packets)
-                global _last_announce_ok
+                global _last_announce_ok, _announce_ok_seen
                 _last_announce_ok = time.time()   # 看门狗打点：预建会话播报成功
+                _announce_ok_seen = True
             finally:
                 if temp:                       # 临时短链：用完即弃
                     s.close()
@@ -533,6 +536,9 @@ def schedule_watchdog():
     try:
         if net_active():
             return
+        global _announce_ok_seen
+        if not _announce_ok_seen:
+            return    # 启动后首播尚未发生：豁免（重启到首播可能间隔 > 阈值）
         thr = float(cfg_get("watchdog", "announce_idle_seconds", default=5400))
         gap = time.time() - _last_announce_ok
         if gap > thr:
