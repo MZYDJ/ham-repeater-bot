@@ -496,7 +496,11 @@ class Client:
     def pump(self, seconds):
         msgs = []
         end = time.time() + seconds
-        self.sock.settimeout(0.3)
+        # 超时必须与调用预算匹配（play 每包调 pump(0.02)）：硬编码 0.3s 会在链路
+        # 无下行数据时让 recv 阻塞满 0.3s → 每包实际间隔变 300ms（9/26 卡顿根因，
+        # 69s/231包=298ms/包 与 0.3s 完全吻合）。取 min(0.3, 调用预算)，静默链路
+        # 下单次 pump 不超过预算太多，播报保持 120ms 节奏。
+        self.sock.settimeout(min(0.3, max(seconds, 0.02)))
         while time.time() < end:
             try:
                 d = self.sock.recv(8192)

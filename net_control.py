@@ -1107,6 +1107,8 @@ class NetControlSession:
         self._llm_calls = 0                 # 每轮点名 LLM 兜底调用计数（防超时拖死）
         self._llm_fails = 0                 # 连续失败计数（熔断：≥2 本轮停用）
         self._play_lock = threading.Lock()  # 发射串行化：嵌套播报排队，不并发抢麦
+        self._tx_thread = None              # 当前发射后台线程（play 可能阻塞数秒~数十秒；
+                                            # 链路假死时可能永不返回 → teardown 需强制收尾）
         self._decoder = None
         self._capture = None
         self._asked_fields = {}      # call → set(已追问过的缺失字段)：结构化追问每字段最多一次
@@ -2378,6 +2380,28 @@ class NetControlSession:
         # 等当前发射完成后再播，不丢句、不死锁（_wait_channel_idle 在发射
         # 线程内 drain=False，避免锁内再触发嵌套播报）。
         play_box = {}
+        _wd = {"fired": False, "tmr": None}
+
+        def _force_abort():
+            """发射 watchdog：play 整体超时（默认 90s）仍不返回 = 链路假死
+            （sendall 阻塞无超时，9/26 卡顿同源）→ 强制断开预建会话 socket，
+            使阻塞中的 sendall 抛 OSError → play 异常退出 → finally 释放
+            busy/锁。否则卡死的发射线程持锁不释放，累积几天后调度器线程池
+            耗尽、播报全停（9/25 停播 14h 的根因链之一）。"""
+            if _wd["fired"]:
+                return
+            _wd["fired"] = True
+            logger.error("点名播报发射超时（链路疑似假死），强制断开会话释放锁")
+            try:
+                if self.link is not None and self.link._sess is not None:
+                    self.link._sess.close()
+            except Exception:
+                pass
+            try:
+                if self.link is not None:
+                    self.link.release()
+            except Exception:
+                pass
 
         def _do_play():
             try:
@@ -2453,10 +2477,18 @@ class NetControlSession:
                             self.link.release()
                         self._last_tx_end = time.time()   # 发射结束（回波过滤窗口起点）
             finally:
+                _wd["fired"] = True
+                if _wd["tmr"] is not None:
+                    _wd["tmr"].cancel()
                 play_box["done"] = True
 
+        _wd["tmr"] = threading.Timer(
+            float(nc_cfg("play_watchdog_seconds", default=90)), _force_abort)
+        _wd["tmr"].daemon = True
+        _wd["tmr"].start()
         pt = threading.Thread(target=_do_play, daemon=True)
         pt.start()
+        self._tx_thread = pt
         self._drain_queue(depth=1)   # 发射期间继续识别（嵌套播报经 _play_lock 排队）
         self._pump_until(pt, 60)     # 发射期间持续收尾/识别
 
@@ -2592,6 +2624,19 @@ class NetControlSession:
     def _teardown(self):
         if self.link is not None and self.link._on_downlink is self._on_downlink:
             self.link._on_downlink = None           # 归还下行分发（不打扰播报）
+        # 发射线程仍存活（链路假死 play 卡死，watchdog 也未兜住）→ 强制断开
+        # 预建会话 socket 使其抛错退出，释放 busy/锁，避免泄漏累积拖垮调度
+        tx = getattr(self, "_tx_thread", None)
+        if tx is not None and tx.is_alive():
+            logger.warning("点名结束但发射线程仍存活，强制断开预建会话后等待退出")
+            try:
+                if self.link is not None and self.link._sess is not None:
+                    self.link._sess.close()
+                if self.link is not None:
+                    self.link.release()
+            except Exception:
+                pass
+            tx.join(timeout=5)
         if self._decoder is not None:
             try:
                 self._decoder.close()
