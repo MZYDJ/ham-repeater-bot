@@ -302,6 +302,8 @@ _native_session = None     # direct_announce.DirectAnnouncer：已登录+已抢�
 _native_prebuilt = None    # (mp3路径, packets)：预构建的音频包
 _native_session_temp = False  # 预建会话是否临时短链（播完 close；常驻的只 release）
 _native_link = None        # direct_announce.PersistentAnnouncer：常驻直连链路
+_last_announce_ok = time.time()   # 最近一次成功播报的 wall-clock 时刻（看门狗判定用）
+_announce_ok_seen = False   # 是否已有成功播报（首播前看门狗豁免，防重启后误报）
 def _native_link_event(kind, detail):
     """常驻链路事件回调（企业微信告警链路复用 logger 级别）"""
     if kind == "removed":
@@ -412,6 +414,9 @@ def _announce_native(tts_file: str):
             tts_file, username=TALK_USERNAME, password=TALK_PASSWORD)
     if ok:
         logger.info(f"直连播报完成，耗时 {time.time() - t0:.1f} 秒")
+        global _last_announce_ok, _announce_ok_seen
+        _last_announce_ok = time.time()   # 看门狗打点：本次播报成功
+        _announce_ok_seen = True
     else:
         logger.error("直连播报返回失败")
 def announce_task():
@@ -433,6 +438,9 @@ def announce_task():
             _native_session = _native_prebuilt = None   # 先取走，防重入
             try:
                 _native_play(s, packets)
+                global _last_announce_ok, _announce_ok_seen
+                _last_announce_ok = time.time()   # 看门狗打点：预建会话播报成功
+                _announce_ok_seen = True
             finally:
                 if temp:                       # 临时短链：用完即弃
                     s.close()
@@ -447,6 +455,22 @@ def schedule_announce():
     task_queue.put("announce")
 def schedule_tts_prefill():
     task_queue.put("tts_prefill")
+def schedule_watchdog():
+    """播报看门狗：超过阈值（默认 90 分钟）无成功播报 → ERROR 告警。
+    目的：链路假死/调度器假死时静默无人知（9/25 曾静默 14 小时），
+    告警让运维第一时间发现；如需自动重启可在 supervisor 层按 ERROR 处置。"""
+    try:
+        global _announce_ok_seen
+        if not _announce_ok_seen:
+            return    # 启动后首播尚未发生：豁免（重启到首播可能间隔 > 阈值）
+        thr = float(cfg_get("watchdog", "announce_idle_seconds", default=5400))
+        gap = time.time() - _last_announce_ok
+        if gap > thr:
+            logger.error(f"播报看门狗：已 {gap:.0f}s 无成功播报（阈值 {thr:.0f}s），"
+                         f"疑似调度器/链路假死。请检查链路状态与进程日志，"
+                         f"必要时重启容器恢复。")
+    except Exception as e:
+        logger.error(f"播报看门狗异常: {e}")
 if __name__ == "__main__":
     try:
         # 交互模式：阻塞式，按回车播报，不进入调度
@@ -522,6 +546,8 @@ if __name__ == "__main__":
                 minute="5",
                 second=0
             )
+            # 播报看门狗：每半小时检查最近一次成功播报，超阈值告警（防静默无人知）
+            scheduler.add_job(schedule_watchdog, "cron", minute="15,45", second=0)
             scheduler.start()
             # 启动即补充一次蓄水池（首次部署/缓存清空后尽快备好音频）
             task_queue.put("tts_prefill")
