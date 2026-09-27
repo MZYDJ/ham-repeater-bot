@@ -322,6 +322,11 @@ def _load_restart_ts() -> float:
         pass
     return 0.0
 _last_restart_ts = _load_restart_ts()   # 最近一次自重启时刻（epoch 秒）
+# 待确认恢复标记：文件存在 = 上次是看门狗自重启且尚无成功播报确认恢复。
+# 重启后新进程据此知道"应该发恢复通知"（人工 docker restart 无此文件，不误发）
+_recovery_pending_file = Path(LOG_DIR) / "watchdog_recovery_pending.ts"
+_recovery_pending = _recovery_pending_file.exists()
+_last_cooldown_notify_ts = 0.0   # 冷却期内降频推送的最近时刻（内存态，进程内有效）
 def _native_link_event(kind, detail):
     """常驻链路事件回调（企业微信告警链路复用 logger 级别）"""
     if kind == "removed":
@@ -494,11 +499,24 @@ def _announce_native(tts_file: str):
         _native_link_resume()
     if ok:
         logger.info(f"直连播报完成，耗时 {time.time() - t0:.1f} 秒")
-        global _last_announce_ok, _announce_ok_seen
-        _last_announce_ok = time.time()   # 看门狗打点：本次播报成功
-        _announce_ok_seen = True
+        _mark_announce_ok()
     else:
         logger.error("直连播报返回失败")
+def _mark_announce_ok():
+    """看门狗打点 + 恢复通知：任意出口播报成功时更新时间戳；
+    若处于"自重启后待确认恢复"状态，推送"业务已恢复"并清除标记——
+    用户无需登录服务器，凭推送即可确认业务恢复。"""
+    global _last_announce_ok, _announce_ok_seen, _recovery_pending
+    _last_announce_ok = time.time()   # 看门狗打点：本次播报成功
+    _announce_ok_seen = True
+    if _recovery_pending:
+        _recovery_pending = False
+        try:
+            _recovery_pending_file.unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"恢复标记文件清除失败: {e}")
+        _send_wechat(f"[播报服务 OK] 看门狗自重启后业务已恢复"
+                     f"（{datetime.datetime.now():%m-%d %H:%M} 播报成功）")
 def announce_task():
     """播报核心逻辑，仅主线程执行"""
     now = datetime.datetime.now()
@@ -521,9 +539,7 @@ def announce_task():
             _native_session = _native_prebuilt = None   # 先取走，防重入
             try:
                 _native_play(s, packets)
-                global _last_announce_ok, _announce_ok_seen
-                _last_announce_ok = time.time()   # 看门狗打点：预建会话播报成功
-                _announce_ok_seen = True
+                _mark_announce_ok()
             finally:
                 if temp:                       # 临时短链：用完即弃
                     s.close()
@@ -578,40 +594,59 @@ def schedule_watchdog():
     except Exception as e:
         logger.error(f"播报看门狗异常: {e}")
 
+def _send_wechat(content: str) -> bool:
+    """同步发送企业微信通知（阻塞等待发送完成，最长 5s），返回是否成功。
+    与 WebhookHandler 的区别：本函数保证发出后才继续（重启前必须确认送达），
+    且不受 notify.webhook_log_level 过滤（恢复通知/冷却状态推送用）。"""
+    if not WECHAT_WEBHOOK_URL:
+        logger.warning(f"看门狗：未配置 notify.webhook_url，仅文件日志记录: {content}")
+        return False
+    try:
+        payload = {"msgtype": "text", "text": {"content": content}}
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            WECHAT_WEBHOOK_URL, data=data,
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            logger.info(f"看门狗通知已发送完成: {resp.read().decode('utf-8')[:60]}")
+        return True
+    except Exception as e:
+        logger.error(f"看门狗通知发送失败: {e}")
+        return False
+
 def _notify_then_restart(reason: str):
     """看门狗自重启：远程通知（同步等待发送完成）→ 短暂等待送达 → os.execv
     自重启替换进程（容器 PID 不变，不依赖 docker 权限）。
-    冷却期（默认 2h）内只告警不重启；重启时间戳持久化到文件，重启后冷却仍生效。"""
-    global _last_restart_ts
+    - 冷却期（默认 2h）内不重启，按降频间隔（默认 30min）推送"仍异常"状态，
+      避免静默失联（用户不知业务是否恢复），也不刷屏；
+    - 重启前写"冷却时间戳 + 待确认恢复"两个标记文件（均持久化）；
+      重启后首个准点播报成功时由 _mark_announce_ok 自动推送"业务已恢复"。"""
+    global _last_restart_ts, _last_cooldown_notify_ts, _recovery_pending
     now = time.time()
     cooldown = float(cfg_get("watchdog", "restart_cooldown_seconds", default=7200))
     if now - _last_restart_ts < cooldown:
-        logger.error(f"看门狗：距上次重启 {now - _last_restart_ts:.0f}s < 冷却 {cooldown:.0f}s，"
-                     f"本次仅告警不重启（持续异常请人工介入）")
+        interval = float(cfg_get("watchdog", "cooldown_notify_interval_seconds", default=1800))
+        if now - _last_cooldown_notify_ts >= interval:
+            _last_cooldown_notify_ts = now
+            remain = int(cooldown - (now - _last_restart_ts))
+            logger.info(f"看门狗：业务仍异常，冷却中（约 {remain // 60} 分钟后重试自重启）")
+            _send_wechat(f"[播报服务] 业务仍异常，冷却中：{reason}"
+                         f"（约 {remain // 60} 分钟后将再次尝试自重启）")
+        else:
+            logger.info("看门狗：冷却期内业务仍异常，未到降频推送间隔")
         return
     # 1) 同步发送远程通知（阻塞等待发送完成，最长 5s）
-    if WECHAT_WEBHOOK_URL:
-        try:
-            payload = {"msgtype": "text", "text": {
-                "content": f"[播报服务 ERROR] 看门狗触发自重启：{reason}"}}
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(
-                WECHAT_WEBHOOK_URL, data=data,
-                headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                logger.info(f"看门狗通知已发送完成: {resp.read().decode('utf-8')[:60]}")
-        except Exception as e:
-            logger.error(f"看门狗通知发送失败（仍继续重启）: {e}")
-    else:
-        logger.warning("看门狗：未配置 notify.webhook_url，仅文件日志告警")
+    _send_wechat(f"[播报服务 ERROR] 看门狗触发自重启：{reason}")
     # 2) 等待通知送达后再重启
     time.sleep(5)
-    # 3) 记录重启时刻（持久化）并自重启
+    # 3) 记录重启时刻与"待确认恢复"标记（均持久化，重启后冷却/恢复通知仍生效）
     _last_restart_ts = time.time()
     try:
         _restart_ts_file.write_text(str(_last_restart_ts), encoding="utf-8")
+        _recovery_pending_file.write_text("1", encoding="utf-8")
+        _recovery_pending = True
     except Exception as e:
-        logger.warning(f"看门狗重启时间戳落盘失败（冷却期将丢失）: {e}")
+        logger.warning(f"看门狗重启标记落盘失败（冷却/恢复通知将失效）: {e}")
     logger.error("看门狗：执行自重启（os.execv 替换进程）")
     try:
         logging.shutdown()   # flush 全部日志后再替换进程
