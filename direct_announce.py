@@ -492,7 +492,16 @@ class Client:
             self.sock = ctx.wrap_socket(self.sock, server_hostname=host)
         self.buf = b""
     def send(self, msg_type, payload):
-        self.sock.sendall(frame(msg_type, payload))
+        """发送一帧。sendall 无超时会在链路半死（对端停读、发送缓冲满）时永久阻塞
+        ——9/24 13:29 预热预建链阶段主线程卡死 19h 的根因（take_mic/login/play 的
+        send 全走这里）。发送前设 10s 超时，超时抛 OSError 由调用方走兜底（抢麦失败/
+        临时短链失败/播报异常告警），发送后恢复原超时设置（pump/drain 各自管理）。"""
+        prev = self.sock.gettimeout()
+        self.sock.settimeout(10)
+        try:
+            self.sock.sendall(frame(msg_type, payload))
+        finally:
+            self.sock.settimeout(prev)
     def pump(self, seconds):
         msgs = []
         end = time.time() + seconds
