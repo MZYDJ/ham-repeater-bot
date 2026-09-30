@@ -153,6 +153,22 @@ def _tts_min_seconds(text: str) -> float:
     断流/超时残留的残缺音频通常只有完整时长的一半以下（实测整点播报完整
     ~20s，残缺仅 7~10s），用该下限可准确识别并触发重新合成。"""
     return max(2.0, len(text) * 0.12)
+def _mark_tts_fail():
+    """TTS 合成失败打点（看门狗分级：窗口内有失败 → 判定外部 TTS 异常，只告警不重启）。
+    标记滚动刷新：程序假死时无新失败，窗口过期后看门狗自动恢复"告警+重启"判定。"""
+    global _last_tts_fail_ts
+    _last_tts_fail_ts = time.time()
+def _mark_net_skip(now: datetime.datetime):
+    """点名进行中跳过的播报准点打点（与看门狗 cand 同口径：XX:00/XX:30 格起点）。
+    点名结束后 net_active 已 False，看门狗凭此豁免"点名期间被跳过的准点"（每晚
+    22:10 点名跨 22:30 的必踩场景）。"""
+    global _last_net_skip_ts
+    cand = now.replace(second=0, microsecond=0)
+    if cand.minute < 30:
+        cand = cand.replace(minute=0)
+    else:
+        cand = cand.replace(minute=30)
+    _last_net_skip_ts = cand.timestamp()
 def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) -> str:
     """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试。
     注：定时播报/蓄水池/预热走本函数（Edge-TTS）；点名走 net_control.synth_text
@@ -190,6 +206,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
             t.join(timeout=TTS_TIMEOUT_JOIN)  # 最多等30秒（兜底安全网）
             if t.is_alive():
                 logger.warning(f"TTS合成超时 (第{attempt}次)")
+                _mark_tts_fail()
                 # 清理可能写了一半的文件
                 if cache_path.exists() and cache_path.stat().st_size == 0:
                     cache_path.unlink()
@@ -198,8 +215,10 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
             else:
                 reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
                 logger.warning(f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
+                _mark_tts_fail()
         except Exception as e:
             logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
+            _mark_tts_fail()
         if attempt < max_retries:
             logger.info(f"等待 {retry_delay} 秒后重试...")
             time.sleep(retry_delay)
@@ -327,6 +346,10 @@ _last_restart_ts = _load_restart_ts()   # 最近一次自重启时刻（epoch �
 _recovery_pending_file = Path(LOG_DIR) / "watchdog_recovery_pending.ts"
 _recovery_pending = _recovery_pending_file.exists()
 _last_cooldown_notify_ts = 0.0   # 冷却期内降频推送的最近时刻（内存态，进程内有效）
+# ---- 看门狗分级状态（内存态）：区分"外部 TTS 异常"与"程序假死" ----
+_last_tts_fail_ts = 0.0    # 最近一次 TTS 合成失败时刻（窗口内有失败 → 只告警不重启）
+_last_net_skip_ts = 0.0    # 最近一次"点名中跳过播报"对应的准点时刻（格起点，跨准点豁免）
+_last_tts_notify_ts = 0.0  # TTS 异常告警的最近推送时刻（降频节流防刷屏）
 def _native_link_event(kind, detail):
     """常驻链路事件回调（企业微信告警链路复用 logger 级别）"""
     if kind == "removed":
@@ -522,6 +545,7 @@ def announce_task():
     now = datetime.datetime.now()
     if net_active():
         logger.info("点名进行中，跳过本次定时播报")
+        _mark_net_skip(now)      # 记录本应播报的准点（点名跨准点豁免依据）
         return
     announce_text = get_announce_text(now)
     logger.info(f"触发定时播报: {announce_text}")
@@ -586,6 +610,20 @@ def schedule_watchdog():
         global _last_announce_ok
         if _last_announce_ok >= cand.timestamp():
             return    # 上一准点已成功打点
+        # [点名跨准点豁免] 该准点在点名期间被跳过（点名刚结束时 net_active 已 False，
+        # 但被跳过的准点不应追责）——每晚 22:10 点名跨 22:30 的必踩场景
+        if _last_net_skip_ts >= cand.timestamp():
+            logger.info(f"看门狗：准点 {cand:%H:%M} 在点名期间跳过，豁免")
+            return
+        # [TTS 外部异常分级] 最近窗口内有 TTS 合成失败 → 外部依赖异常，重启无效
+        # （TTS 服务端问题重启也不治疗），只告警不重启；标记滚动刷新，程序假死时
+        # 无新失败，窗口过期后自动恢复"告警+重启"的正常判定
+        tts_win = float(cfg_get("watchdog", "tts_fail_window_seconds", default=1800))
+        if time.time() - _last_tts_fail_ts < tts_win:
+            gap = now.timestamp() - _last_announce_ok
+            _notify_tts_degraded(
+                f"准点 {cand:%H:%M} 播报未完成（已间隔 {gap:.0f}s）", int(tts_win // 60))
+            return
         gap = now.timestamp() - _last_announce_ok
         logger.error(f"播报看门狗：准点 {cand:%H:%M} 播报未完成"
                      f"（最近成功播报 {datetime.datetime.fromtimestamp(_last_announce_ok):%m-%d %H:%M}，"
@@ -613,6 +651,23 @@ def _send_wechat(content: str) -> bool:
     except Exception as e:
         logger.error(f"看门狗通知发送失败: {e}")
         return False
+
+def _notify_tts_degraded(reason: str, window_min: int):
+    """TTS 外部异常分级处置：只告警不重启（重启无法治疗外部 TTS 服务端异常）。
+    按冷却降频间隔（默认 30min）节流防刷屏；TTS 恢复后打点过期，
+    看门狗自动回到"告警+重启"的正常判定。"""
+    global _last_tts_notify_ts
+    now = time.time()
+    interval = float(cfg_get("watchdog", "cooldown_notify_interval_seconds", default=1800))
+    if now - _last_tts_notify_ts < interval:
+        logger.info(f"看门狗：TTS 异常告警未到降频间隔（{interval:.0f}s）")
+        return
+    _last_tts_notify_ts = now
+    logger.error(f"播报看门狗：{reason}，最近 {window_min} 分钟内有 TTS 合成失败"
+                 f"（疑似外部 TTS 服务异常），本轮只告警不重启，将持续监控")
+    _send_wechat(f"[播报服务 WARN] 准点播报缺失但程序存活：{reason}"
+                 f"；最近 {window_min} 分钟内 TTS 合成失败（疑似外部 TTS 服务异常），"
+                 f"本轮不重启，恢复后下个准点自动补播")
 
 def _notify_then_restart(reason: str):
     """看门狗自重启：远程通知（同步等待发送完成）→ 短暂等待送达 → os.execv
@@ -691,8 +746,10 @@ if __name__ == "__main__":
                 logger.info(f"测试完成，共播报 {test_repeat} 次，进入正常调度模式")
                 prepare_next_tts()
             else:
-                # 启动时执行一次预热（TTS 预合成 + 常驻链路启动）
-                prewarm_task()
+                # 启动预热移出启动关键路径：入队由主线程消费，调度器立即注册启动。
+                # 原同步调用会被 TTS 失败重试阻塞（9/30：拖 2.5min），导致调度器
+                # 延迟启动 → 启动后首场准点连触发都没有（17:30 缺失直接机制）。
+                task_queue.put("prewarm")
             # 后台调度器
             scheduler = BackgroundScheduler(timezone="Asia/Shanghai", daemon=True)
             # 预热任务一：XX:30 播报前一分钟（XX:29）预热，覆盖时段内每个半点
