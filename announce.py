@@ -154,10 +154,17 @@ def _tts_min_seconds(text: str) -> float:
     ~20s，残缺仅 7~10s），用该下限可准确识别并触发重新合成。"""
     return max(2.0, len(text) * 0.12)
 def _mark_tts_fail():
-    """TTS 合成失败打点（看门狗分级：窗口内有失败 → 判定外部 TTS 异常，只告警不重启）。
-    标记滚动刷新：程序假死时无新失败，窗口过期后看门狗自动恢复"告警+重启"判定。"""
+    """播报现场 TTS 合成失败打点（看门狗分级：窗口内有现场失败 → 判定外部 TTS 异常，
+    只告警不重启）。仅 announce_task 现场调用——预热/蓄水池失败是后台补备性质
+    （现场还有机会、下轮还会补），失败不代表播报会失败，不参与豁免判定，
+    否则蓄水池每小时偶发失败会持续刷新窗口，掩盖真正的调度/链路假死。"""
     global _last_tts_fail_ts
     _last_tts_fail_ts = time.time()
+def _mark_tts_ok():
+    """现场播报合成成功 = TTS 已恢复：清除失败标记。
+    防"现场失败 → TTS 恢复 → 准点又缺失（其他原因）"时旧标记仍在窗口内、掩盖后续真假死。"""
+    global _last_tts_fail_ts
+    _last_tts_fail_ts = 0.0
 def _mark_net_skip(now: datetime.datetime):
     """点名进行中跳过的播报准点打点（与看门狗 cand 同口径：XX:00/XX:30 格起点）。
     点名结束后 net_active 已 False，看门狗凭此豁免"点名期间被跳过的准点"（每晚
@@ -206,7 +213,6 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
             t.join(timeout=TTS_TIMEOUT_JOIN)  # 最多等30秒（兜底安全网）
             if t.is_alive():
                 logger.warning(f"TTS合成超时 (第{attempt}次)")
-                _mark_tts_fail()
                 # 清理可能写了一半的文件
                 if cache_path.exists() and cache_path.stat().st_size == 0:
                     cache_path.unlink()
@@ -215,10 +221,8 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
             else:
                 reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
                 logger.warning(f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
-                _mark_tts_fail()
         except Exception as e:
             logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
-            _mark_tts_fail()
         if attempt < max_retries:
             logger.info(f"等待 {retry_delay} 秒后重试...")
             time.sleep(retry_delay)
@@ -347,7 +351,7 @@ _recovery_pending_file = Path(LOG_DIR) / "watchdog_recovery_pending.ts"
 _recovery_pending = _recovery_pending_file.exists()
 _last_cooldown_notify_ts = 0.0   # 冷却期内降频推送的最近时刻（内存态，进程内有效）
 # ---- 看门狗分级状态（内存态）：区分"外部 TTS 异常"与"程序假死" ----
-_last_tts_fail_ts = 0.0    # 最近一次 TTS 合成失败时刻（窗口内有失败 → 只告警不重启）
+_last_tts_fail_ts = 0.0    # 最近一次【播报现场】TTS 合成失败时刻（窗口内有失败 → 只告警不重启）
 _last_net_skip_ts = 0.0    # 最近一次"点名中跳过播报"对应的准点时刻（格起点，跨准点豁免）
 _last_tts_notify_ts = 0.0  # TTS 异常告警的最近推送时刻（降频节流防刷屏）
 def _native_link_event(kind, detail):
@@ -556,8 +560,10 @@ def announce_task():
         # 不被 TTS 抖动拖 75s（预热3次+现场3次=最长延迟 2.5min）。
         tts_file = get_tts_file(announce_text, max_retries=1)
         if not tts_file:
+            _mark_tts_fail()      # 现场失败=播报确实被 TTS 挡住：看门狗"只告警不重启"的唯一依据
             logger.error("TTS音频文件无效，跳过本次播报")
             return
+        _mark_tts_ok()            # 现场合成成功=TTS 已恢复：清除失败标记，防旧标记掩盖后续真假死
         # 预建会话+预构建音频均就绪（预热任务准点前0.5s已发起抢麦，此刻刚完成）
         # —— play() 内部再留 0.5s 建链间隔后发包，官方时序完整保留
         if _native_session and _native_prebuilt and _native_prebuilt[0] == tts_file:
