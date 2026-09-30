@@ -551,7 +551,10 @@ def announce_task():
     logger.info(f"触发定时播报: {announce_text}")
     try:
         global _native_session, _native_prebuilt, _native_session_temp
-        tts_file = get_tts_file(announce_text)
+        # 播报现场仅 1 次合成机会（预热 XX:29/XX:59 已做过 3 次重试）：
+        # 失败立即跳场，重试交给蓄水池后台每小时补——播报要么准点要么快速跳场，
+        # 不被 TTS 抖动拖 75s（预热3次+现场3次=最长延迟 2.5min）。
+        tts_file = get_tts_file(announce_text, max_retries=1)
         if not tts_file:
             logger.error("TTS音频文件无效，跳过本次播报")
             return
@@ -710,46 +713,39 @@ def _notify_then_restart(reason: str):
         logger.error(f"自重启失败（请手动重启容器）: {e}")
 if __name__ == "__main__":
     try:
-        # 交互模式：阻塞式，按回车播报，不进入调度
-        if len(sys.argv) > 1 and sys.argv[1] in ("--interactive", "-i"):
-            logger.info("=== 交互测试模式：按回车播报一次 ===")
-            while True:
-                input()
-                announce_task()
-        else:
-            # 测试模式判定：命令行 -t 显式指定优先级最高；其次读取配置 test.enabled
-            # 行为：连续播报 N 次（每次间隔2秒）→ 进入正常调度循环
-            test_mode = False
-            test_repeat = 1
-            if len(sys.argv) > 1 and sys.argv[1] in ("--test", "-t"):
-                test_mode = True
-                if len(sys.argv) > 2:
-                    try:
-                        test_repeat = int(sys.argv[2])
-                        if test_repeat < 1:
-                            raise ValueError
-                    except ValueError:
-                        logger.error(f"无效的次数参数: {sys.argv[2]}，应为正整数")
-                        sys.exit(1)
-            elif TEST_ENABLED:
-                test_mode = True
-                test_repeat = max(1, int(TEST_COUNT))
-                logger.info(f"配置驱动测试模式（test.enabled=true），播报 {test_repeat} 次后进入调度")
+        # 测试模式判定：命令行 -t 显式指定优先级最高；其次读取配置 test.enabled
+        # 行为：连续真实播报 N 次（每次间隔2秒）→ 进入正常调度循环
+        test_mode = False
+        test_repeat = 1
+        if len(sys.argv) > 1 and sys.argv[1] in ("--test", "-t"):
+            test_mode = True
+            if len(sys.argv) > 2:
+                try:
+                    test_repeat = int(sys.argv[2])
+                    if test_repeat < 1:
+                        raise ValueError
+                except ValueError:
+                    logger.error(f"无效的次数参数: {sys.argv[2]}，应为正整数")
+                    sys.exit(1)
+        elif TEST_ENABLED:
+            test_mode = True
+            test_repeat = max(1, int(TEST_COUNT))
+            logger.info(f"配置驱动测试模式（test.enabled=true），播报 {test_repeat} 次后进入调度")
 
-            if test_mode:
-                logger.info(f"=== 测试模式：连续播报 {test_repeat} 次 ===")
-                for i in range(1, test_repeat + 1):
-                    logger.info(f"--- 第 {i}/{test_repeat} 次播报 ---")
-                    announce_task()
-                    if i < test_repeat:
-                        time.sleep(2)
-                logger.info(f"测试完成，共播报 {test_repeat} 次，进入正常调度模式")
-                prepare_next_tts()
-            else:
-                # 启动预热移出启动关键路径：入队由主线程消费，调度器立即注册启动。
-                # 原同步调用会被 TTS 失败重试阻塞（9/30：拖 2.5min），导致调度器
-                # 延迟启动 → 启动后首场准点连触发都没有（17:30 缺失直接机制）。
-                task_queue.put("prewarm")
+        if test_mode:
+            logger.info(f"=== 测试模式：连续播报 {test_repeat} 次（真实发射）===")
+            for i in range(1, test_repeat + 1):
+                logger.info(f"--- 第 {i}/{test_repeat} 次播报 ---")
+                announce_task()
+                if i < test_repeat:
+                    time.sleep(2)
+            logger.info(f"测试完成，共播报 {test_repeat} 次，进入正常调度模式")
+            prepare_next_tts()
+        else:
+            # 启动预热移出启动关键路径：入队由主线程消费，调度器立即注册启动。
+            # 原同步调用会被 TTS 失败重试阻塞（9/30：拖 2.5min），导致调度器
+            # 延迟启动 → 启动后首场准点连触发都没有（17:30 缺失直接机制）。
+            task_queue.put("prewarm")
             # 后台调度器
             scheduler = BackgroundScheduler(timezone="Asia/Shanghai", daemon=True)
             # 预热任务一：XX:30 播报前一分钟（XX:29）预热，覆盖时段内每个半点
@@ -758,7 +754,9 @@ if __name__ == "__main__":
                 "cron",
                 hour=f"{ANNOUNCE_START_HOUR}-{ANNOUNCE_END_HOUR}",
                 minute="29",
-                second=0
+                second=0,
+                misfire_grace_time=300,
+                coalesce=True
             )
             # 预热任务二：XX:00 播报前一分钟（前一小时 XX:59）预热，覆盖时段内每个整点。
             # (START-1):59 保证每天首次播报前 TTS/音频/常驻链路都是新鲜就绪的；
@@ -768,14 +766,18 @@ if __name__ == "__main__":
                 "cron",
                 hour=f"{ANNOUNCE_START_HOUR - 1}-{ANNOUNCE_END_HOUR - 1}",
                 minute="59",
-                second=0
+                second=0,
+                misfire_grace_time=300,
+                coalesce=True
             )
             scheduler.add_job(
                 schedule_announce,
                 "cron",
                 hour=f"{ANNOUNCE_START_HOUR}-{ANNOUNCE_END_HOUR}",
                 minute="0,30",
-                second=0
+                second=0,
+                misfire_grace_time=300,
+                coalesce=True
             )
             # TTS 蓄水池：每小时补充预合成未来时段缺失的音频，
             # 让准点播报不依赖播报时刻的 edge-tts 网络状态
@@ -783,17 +785,19 @@ if __name__ == "__main__":
                 schedule_tts_prefill,
                 "cron",
                 minute="5",
-                second=0
+                second=0,
+                misfire_grace_time=300,
+                coalesce=True
             )
             # 点名主播：按 net_control 配置的时段/星期触发（enabled=false 时跳过）
             if NET_ENABLED:
                 _net_kw = dict(hour=NET_HOUR, minute=NET_MINUTE, second=0)
                 if NET_WEEKDAY:
                     _net_kw["day_of_week"] = ",".join(str(int(d)) for d in NET_WEEKDAY)
-                scheduler.add_job(schedule_net_control, "cron", **_net_kw)
+                scheduler.add_job(schedule_net_control, "cron", misfire_grace_time=300, coalesce=True, **_net_kw)
                 logger.info(f"点名主播已启用：{'星期' + '/'.join(map(str, NET_WEEKDAY)) if NET_WEEKDAY else '每天'} {NET_HOUR:02d}:{NET_MINUTE:02d} 开始")
             # 播报看门狗：每半小时检查最近一次成功播报，超阈值告警（防 9/25 式静默）
-            scheduler.add_job(schedule_watchdog, "cron", minute="15,45", second=0)
+            scheduler.add_job(schedule_watchdog, "cron", minute="15,45", second=0, misfire_grace_time=300, coalesce=True)
             scheduler.start()
             # 启动即补充一次蓄水池（首次部署/缓存清空后尽快备好音频）
             task_queue.put("tts_prefill")
