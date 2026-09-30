@@ -588,55 +588,81 @@ def schedule_announce():
     task_queue.put("announce")
 def schedule_tts_prefill():
     task_queue.put("tts_prefill")
-def schedule_watchdog():
+def _watchdog_decision(now, last_announce_ok, last_net_skip_ts, last_tts_fail_ts,
+                       last_restart_ts, net_active, start_hour, end_hour,
+                       slot_tolerance_seconds, tts_fail_window_seconds):
+    """播报看门狗判定纯函数（无 IO、无全局副作用）：状态快照 → 决策。
+
+    返回 (action, reason, cand, gap, tts_win)：
+    - action: "skip"（豁免，reason 空 = 静默不打扰）
+              | "notify_only"（TTS 异常只告警不重启）
+              | "restart"（告警+自重启）
+    - reason: 判定路径（决策日志，审计用）
+    - cand:   本应执行的准点（XX:00 / XX:30 格起点）
+    - gap:    距最近成功播报秒数（告警文案用）
+    - tts_win: TTS 失败窗口秒数（降级告警文案用）
+
+    判定顺序（与原 schedule_watchdog 完全一致，重构不改语义）：
+    点名中 → 时段外 → 容忍窗口 → 重启前准点 → 已成功 → 点名跳过 → TTS 窗口 → 重启。
+    提取为纯函数后状态组合可穷举单测，逻辑 bug 由回归测试兜底，不靠人眼。
+    """
+    if net_active:
+        return "skip", "", None, 0.0, 0
+    cand = now.replace(second=0, microsecond=0)
+    if cand.minute < 30:
+        cand = cand.replace(minute=0)
+    else:
+        cand = cand.replace(minute=30)
+    if not (start_hour <= cand.hour <= end_hour):
+        return "skip", "", None, 0.0, 0
+    if (now - cand).total_seconds() < slot_tolerance_seconds:
+        return "skip", "", None, 0.0, 0
+    if cand.timestamp() < last_restart_ts:
+        return "skip", "", None, 0.0, 0
+    if last_announce_ok >= cand.timestamp():
+        return "skip", "", None, 0.0, 0
+    gap = now.timestamp() - last_announce_ok
+    if last_net_skip_ts >= cand.timestamp():
+        return "skip", f"准点 {cand:%H:%M} 在点名期间跳过，豁免", cand, gap, 0
+    if now.timestamp() - last_tts_fail_ts < tts_fail_window_seconds:
+        return "notify_only", (
+            f"准点 {cand:%H:%M} 播报未完成（已间隔 {gap:.0f}s），"
+            f"最近 {int(tts_fail_window_seconds // 60)} 分钟内有播报现场 TTS 失败"), cand, gap, tts_fail_window_seconds
+    return "restart", (
+        f"准点 {cand:%H:%M} 播报未完成"
+        f"（最近成功播报 {datetime.datetime.fromtimestamp(last_announce_ok):%m-%d %H:%M}，"
+        f"已间隔 {gap:.0f}s）"), cand, gap, 0
+def schedule_watchdog(now: datetime.datetime = None):
     """播报看门狗：检查"上一个应在播报时段内执行的准点"是否完成。
-    - 时段外（22:30 后 ~ 次日 07:00 前）无播报任务 → 不检查（夜间静默正常，
-      旧版按"距最近成功播报 gap"判断在夜间误报，已废弃）。
-    - 上一准点缺失且超过容忍窗口 → ERROR 告警（企业微信自动推送）→
-      等待通知发送完成后自行重启进程（冷却期 2h，防重启风暴）。"""
+    - 判定逻辑全部在 _watchdog_decision 纯函数（可穷举单测），本函数只收集状态、执行决策。
+    - 时段外（22:30 后 ~ 次日 07:00 前）无播报任务 → 不检查（夜间静默正常）。
+    - notify_only：现场 TTS 失败（外部依赖异常，重启无效）→ 只告警不重启。
+    - restart：疑似调度器/链路假死 → ERROR 告警 → 通知发送完成后自行重启（冷却 2h）。
+    - now 参数仅供测试注入（Python 3.12 起 datetime.now 属性不可 mock.patch）。"""
     try:
-        if net_active():
+        now = now or datetime.datetime.now()
+        action, reason, cand, gap, tts_win = _watchdog_decision(
+            now=now,
+            last_announce_ok=_last_announce_ok,
+            last_net_skip_ts=_last_net_skip_ts,
+            last_tts_fail_ts=_last_tts_fail_ts,
+            last_restart_ts=_last_restart_ts,
+            net_active=net_active(),
+            start_hour=ANNOUNCE_START_HOUR,
+            end_hour=ANNOUNCE_END_HOUR,
+            slot_tolerance_seconds=float(cfg_get("watchdog", "slot_tolerance_seconds", default=900)),
+            tts_fail_window_seconds=float(cfg_get("watchdog", "tts_fail_window_seconds", default=1800)),
+        )
+        if action == "skip":
+            if reason:          # 非空 reason = 有信息量的豁免（点名跳过），打 INFO；静默豁免不打
+                logger.info(f"看门狗：{reason}")
             return
-        now = datetime.datetime.now()
-        # 当前所在半小时格子的起点（XX:00 / XX:30），即"上一个应播准点"
-        cand = now.replace(second=0, microsecond=0)
-        if cand.minute < 30:
-            cand = cand.replace(minute=0)
-        else:
-            cand = cand.replace(minute=30)
-        # 只在播报时段 [START:00, END:30] 内的准点检查；时段外直接豁免。
-        # 注意 hour==END 时 cand ∈ {END:00, END:30}，两场都是合法播报（22:00/22:30）
-        in_window = (ANNOUNCE_START_HOUR <= cand.hour <= ANNOUNCE_END_HOUR)
-        if not in_window:
+        if action == "notify_only":
+            # _notify_tts_degraded 内部负责 ERROR 日志 + 30min 降频节流 + 微信推送
+            _notify_tts_degraded(f"准点 {cand:%H:%M} 播报未完成（已间隔 {gap:.0f}s）",
+                                 int(tts_win // 60))
             return
-        # 距准点不足容忍窗口不检查（播报可能刚在跑/重试中），默认 15 分钟
-        if (now - cand).total_seconds() < float(
-                cfg_get("watchdog", "slot_tolerance_seconds", default=900)):
-            return
-        # 准点发生在最近一次自重启之前 → 重启过程的预期跳过，不追责
-        if cand.timestamp() < _last_restart_ts:
-            return
-        global _last_announce_ok
-        if _last_announce_ok >= cand.timestamp():
-            return    # 上一准点已成功打点
-        # [点名跨准点豁免] 该准点在点名期间被跳过（点名刚结束时 net_active 已 False，
-        # 但被跳过的准点不应追责）——每晚 22:10 点名跨 22:30 的必踩场景
-        if _last_net_skip_ts >= cand.timestamp():
-            logger.info(f"看门狗：准点 {cand:%H:%M} 在点名期间跳过，豁免")
-            return
-        # [TTS 外部异常分级] 最近窗口内有 TTS 合成失败 → 外部依赖异常，重启无效
-        # （TTS 服务端问题重启也不治疗），只告警不重启；标记滚动刷新，程序假死时
-        # 无新失败，窗口过期后自动恢复"告警+重启"的正常判定
-        tts_win = float(cfg_get("watchdog", "tts_fail_window_seconds", default=1800))
-        if time.time() - _last_tts_fail_ts < tts_win:
-            gap = now.timestamp() - _last_announce_ok
-            _notify_tts_degraded(
-                f"准点 {cand:%H:%M} 播报未完成（已间隔 {gap:.0f}s）", int(tts_win // 60))
-            return
-        gap = now.timestamp() - _last_announce_ok
-        logger.error(f"播报看门狗：准点 {cand:%H:%M} 播报未完成"
-                     f"（最近成功播报 {datetime.datetime.fromtimestamp(_last_announce_ok):%m-%d %H:%M}，"
-                     f"已间隔 {gap:.0f}s），疑似调度器/链路假死，准备通知并自重启")
+        logger.error(f"播报看门狗：{reason}，疑似调度器/链路假死，准备通知并自重启")
         _notify_then_restart(f"准点 {cand:%H:%M} 播报未完成（已间隔 {gap:.0f}s）")
     except Exception as e:
         logger.error(f"播报看门狗异常: {e}")
