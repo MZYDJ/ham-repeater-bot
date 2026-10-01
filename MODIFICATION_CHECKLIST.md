@@ -49,12 +49,30 @@
 ### 1.3 操作流程
 1. 开发/修复默认只在 **feat** 完成并全量测试。
 2. 按 1.2 判定改动类别：点名相关 → **不同步**，结束；播报核心修复 → 进入 3。
-3. 同步 main 采用 **cherry-pick 单个 commit**（`git cherry-pick <sha>`）或逐文件手动应用，
-   **禁止** `git checkout feat/net-control -- .` 全量覆盖（历史教训：点名代码被整体倒进 main）。
-4. 同步后强制复核：`git diff main feat/net-control --stat`——差异**只应**存在于点名相关文件
+3. **混合 commit 一律禁止整体 cherry-pick**（历史教训：`9197bed` 一个 commit 同时改
+   announce/direct_announce/net_control，整体同步会把点名部分倒进 main）。混合 commit
+   只摘取其**播报相关的文件级改动**（必要时手工拆分后逐文件应用）。
+4. 同步前先评估冲突面：`git diff <main> <feat> -- <涉及文件>`——main 定格线很老
+   （7d3432b 无 tests/config.example），feat 演进大，**cherry-pick 几乎必然冲突**
+   （实测首个播报 commit 即 announce.py 自动合并失败）。处理路径二选一：
+   - 冲突小 → cherry-pick 后手工解冲突；
+   - 冲突大 → **手工移植**（按 1.2 判定逐文件摘播报改动），或**明确"不同步"**——
+     "不同步"是合法决策，不为了同步而同步。
+5. 同步后强制复核：`git diff main feat/net-control --stat`——差异**只应**存在于点名相关文件
    （net_control.py / capture_downlink.py / tests/test_session.py / announce.py 点名段 /
    start.sh cosyvoice 段 / config.example net_control 段 / README 点名段）。
-5. main 同步后跑 main 自己的测试子集（见 §5 测试矩阵"main 分支"列）。
+6. main 无独立测试套件（定格线 7d3432b 不含 tests/ 目录）——同步播报修复时必须**将对应
+   测试一并带入**，否则 main 无回归保护；带入后跑 main 侧测试子集（不含点名用例）。
+
+### 1.4 分支级操作纪律（恢复/定格/force push）
+分支恢复、定格、force push 均为**不可逆**动作，动工前必须：
+- [ ] **方案前置确认**：先向用户列出候选方案（如 A 重建 / B 定格 / C 不同步）及各自代价，
+      用户明确拍板后再动手，**禁止按自己理解直接开工**（教训：先跑方案 A 半程被纠正，浪费工作量）
+- [ ] `git status` 确认工作区/暂存区干净（或先 stash/提交，避免丢失未提交工作）
+- [ ] 明确目标 commit 与当前 HEAD 的差异预期（`git log --oneline -5`）
+- [ ] force push 属不可逆操作，必须**用户明确授权**，push 后立即
+      `git ls-remote` 核对远端 ref（main/feat HEAD 与预期一致）
+- [ ] 完成后在交付说明中写明：恢复到的 commit、是否 force push、验证结果
 
 ---
 
@@ -152,7 +170,8 @@
 - [ ] 服务器 `/app/config.json` 无显式旧值覆盖新默认（尤其 timing.native_mic_lead 曾为 0.5）
 - [ ] BUILD_TIME 已更新（zip 包内带新时间戳文件；重建镜像则 Dockerfile 自动生成）
 - [ ] `.gitignore` 含 `.logs/`、`BUILD_TIME`、`config.json`（防运行时文件误提交）
-- [ ] main 定格线检查（按 §1）：本次改动是否点名驱动？是 → 确认**未** push main；播报核心修复 → 已 cherry-pick 且 `git diff main feat` 差异仅限点名文件
+- [ ] main 定格线检查（按 §1）：本次改动是否点名驱动？是 → 确认**未** push main；播报核心修复 → 已按 §1.3 处理（混合 commit 已拆分、冲突已评估）且 `git diff main feat` 差异仅限点名文件
+- [ ] **混合 commit 拆分检查**：本次涉及同步的 commit 若同时含点名改动（如 announce+net_control 同 commit），已确认**未整体 cherry-pick**，播报部分为逐文件摘取
 - [ ] zip 内不含 `.git/`、`.logs/`、`__pycache__/` 等运行时目录
 
 ---
@@ -161,15 +180,15 @@
 
 | 套件 | 命令 | 覆盖范围 | 何时必须跑 |
 |---|---|---|---|
-| test_announce | `python3 tests/test_announce.py` | 文案/时间纯函数、TTS 缓存/合成/蓄水池、调度入队、native 链路与预热六分支、announce_task、DA 纯函数、WebhookHandler、config.example 合法性 | 任何代码/配置/README 改动（feat 全量；main 只跑播报相关用例） |
+| test_announce | `python3 tests/test_announce.py` | 文案/时间纯函数、TTS 缓存/合成/蓄水池、调度入队、native 链路与预热六分支、announce_task、DA 纯函数、WebhookHandler、config.example 合法性 | 任何代码/配置/README 改动（feat 全量） |
 | test_watchdog | `python3 tests/test_watchdog.py` | 看门狗 `_watchdog_decision` 纯函数全分支、冷却、恢复通知 | 看门狗/点名/调度相关改动 |
 | run_tests | `timeout 110 python3 tests/run_tests.py` | 集成级：调度、播报、net_control 场景、配置默认值回退 | 任何改动（全量回归） |
 | test_session | `timeout 60 python3 tests/test_session.py` | 点名会话状态机流程 | 点名（net_control）改动 |
 | py_compile | `python3 -m py_compile <改动的py>` | 语法 | 每次 |
 
-全绿基准：**feat 376 项**（86 + 56 + 222 + 12）。**main 为纯播报定格线（7d3432b），无点名测试**——
-main 自己的测试基准以该 commit 当时的 test_watchdog/run_tests 子集为准（不含 test_session、
-不含点名分支用例）；main 同步播报修复后按 §1.3 复核。新增用例后总数应同步上升。
+全绿基准：**feat 376 项**（86 + 56 + 222 + 12）。**main 为纯播报定格线（7d3432b），该 commit 不含
+tests/ 目录、无独立测试套件**——main 同步播报修复时按 §1.3-6 将对应测试一并带入（剔除点名用例），
+以带入的播报用例集为准。新增用例后 feat 总数应同步上升。
 
 ---
 
