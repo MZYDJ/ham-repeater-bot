@@ -752,6 +752,22 @@ def _notify_then_restart(reason: str):
         logger.error(f"自重启失败（请手动重启容器）: {e}")
 if __name__ == "__main__":
     try:
+        # 启动硬前置校验（fail-fast：start.sh 已检查，此处防绕过 start.sh 直接运行 python3 announce.py）
+        # 缺失时后续执行无意义：无账号无法登录、无模板播报为空、点名启用但 TTS 依赖缺失则点名必败
+        if not TALK_USERNAME or not TALK_PASSWORD:
+            logger.error("talk.username / talk.password 未配置——直连链路无法登录，播报无法进行，服务退出")
+            sys.exit(1)
+        if not ANNOUNCE_TEMPLATE:
+            logger.error("announce.template 未配置——播报文案为空，播报无意义，服务退出")
+            sys.exit(1)
+        if cfg_get("net_control", "enabled", default=False) and cfg_get("tts", "engine", default="cosyvoice") == "cosyvoice":
+            asr_key = cfg_get("net_control", "asr", "api_key", default="") or cfg_get("asr", "api_key", default="")
+            if not asr_key:
+                logger.error("点名启用且 tts.engine=cosyvoice，但 asr.api_key 缺失——点名 TTS 必然失败，服务退出")
+                sys.exit(1)
+            if not cfg_get("tts", "cosyvoice_voice", default=""):
+                logger.error("点名启用且 tts.engine=cosyvoice，但 tts.cosyvoice_voice 缺失——点名 TTS 必然失败，服务退出")
+                sys.exit(1)
         # 测试模式判定：命令行 -t 显式指定优先级最高；其次读取配置 test.enabled
         # 行为：连续真实播报 N 次（每次间隔2秒）→ 进入正常调度循环
         test_mode = False
