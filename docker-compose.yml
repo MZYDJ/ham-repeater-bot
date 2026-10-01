@@ -3,8 +3,7 @@ services:
     container_name: announce
     build:
       context: .
-      args:
-        BUILD_TIME: "2026-09-02"
+      # 版本标记已在 Dockerfile 内构建时自动生成（/opt/build_time），无需此处注入
     image: announce:latest
 
     restart: unless-stopped

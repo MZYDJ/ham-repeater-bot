@@ -33,9 +33,14 @@ RUN pip install --break-system-packages --no-cache-dir \
     APScheduler==3.11.3 \
     "dashscope>=1.18.0"
 
-# ========== 6. 构建版本标记 ==========
-ARG BUILD_TIME=unknown
-ENV BUILD_TIME=${BUILD_TIME}
+# ========== 6. 构建版本标记（构建时自动生成当天日期，无需手动同步） ==========
+# 说明：镜像构建时间随构建内容同处本文件，改 Dockerfile 重建镜像即自动更新，
+# 不再依赖 docker-compose build.args 手动注入（旧设计：改 Dockerfile 装包后
+# 常忘记同步 compose 里的 BUILD_TIME，导致版本标记陈旧）。
+# start.sh 读取优先级：/app/BUILD_TIME（zip 覆盖部署，发布时现场生成）
+#                   > /opt/build_time（镜像构建时生成）
+#                   > 环境变量 BUILD_TIME（旧镜像兼容兜底）
+RUN date -u +'%Y-%m-%d %H:%M' > /opt/build_time
 
 # ========== 7. 工作目录 ==========
 WORKDIR /app

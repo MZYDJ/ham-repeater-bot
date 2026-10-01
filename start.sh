@@ -9,7 +9,10 @@ echo "[ENV] Python: $(python3 --version 2>&1)"
 echo "[ENV] edge-tts: $(python3 -c 'import edge_tts; print(edge_tts.__version__)' 2>&1 || echo '未安装')"
 echo "[ENV] APScheduler: $(python3 -c 'import apscheduler; print(apscheduler.__version__)' 2>&1 || echo '未安装')"
 echo "[ENV] dashscope: $(python3 -c 'import dashscope; print(dashscope.__version__)' 2>&1 || echo '未安装！CosyVoice 点名/播报 TTS 需此依赖，请重建镜像或 pip install dashscope>=1.18')"
-echo "[ENV] BUILD_TIME: ${BUILD_TIME:-unknown}"
+echo "[ENV] BUILD_TIME: $(cat /app/BUILD_TIME 2>/dev/null || cat /opt/build_time 2>/dev/null || echo ${BUILD_TIME:-unknown})"
+# 说明：zip 覆盖部署（不重建镜像）时读随 zip 发布的 /app/BUILD_TIME（发布动作现场生成）；
+# 重建镜像场景读 Dockerfile 构建时生成的 /opt/build_time（自动取构建当天）；旧镜像兼容
+# 兜底读环境变量 BUILD_TIME。优先级：/app/BUILD_TIME > /opt/build_time > 环境变量 > unknown
 # 直连链路音频编解码库自检（缺失则起服务也必然播报失败，fail-fast）
 echo "[ENV] libopus: $(python3 -c 'import ctypes.util; print("OK" if ctypes.util.find_library("opus") else "缺失!")' 2>&1)"
 echo "[ENV] libmpg123: $(python3 -c 'import ctypes.util; print("OK" if ctypes.util.find_library("mpg123") else "缺失!")' 2>&1)"
@@ -51,6 +54,20 @@ if engine == "cosyvoice":
 else:
     if not has("tts", "voice"):
         print("[WARN] tts.engine=edge 但 tts.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
+# 示例配置完整性自检（部署入口保护：config.example.json 是新部署的复制模板，
+# 若被改坏/缺必填 key，用户 cp 即用会在启动或播报时才报错，此处启动即提示）
+try:
+    with open("/app/config.example.json", encoding="utf-8") as f:
+        ex = json.load(f)
+    if not (ex.get("talk", {}).get("username") and ex.get("talk", {}).get("password")):
+        print("[WARN] config.example.json 缺少必填项 talk.username / talk.password！")
+    if not (ex.get("announce", {}).get("template")):
+        print("[WARN] config.example.json 缺少必填项 announce.template！")
+    if "net_control" not in ex or "enabled" not in ex.get("net_control", {}):
+        print("[WARN] config.example.json 缺少 net_control.enabled 项！")
+    print("[ENV] config.example.json: OK")
+except Exception as e:
+    print(f"[WARN] /app/config.example.json 缺失或非法 JSON（{e}）！它是新部署的复制模板，建议从代码仓库恢复。")
 print("==============================")
 PYEOF
 
