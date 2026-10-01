@@ -482,6 +482,20 @@ def test_misc():
         h.emit(rec)
     check("emit 异常→handleError", he.called)
 
+    # config.example.json：必须始终是合法 JSON 且含必填项（部署入口 cp 即用，
+    # 若被改坏/误删必填 key，新用户部署直接失败）
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        ex = json.loads((repo / "config.example.json").read_text(encoding="utf-8"))
+        ok = True
+    except Exception as e:
+        ex, ok = {}, False
+        print(f"  [config.example.json 解析失败] {e}")
+    check("config.example.json 合法 JSON", ok)
+    check("示例含 talk 账号", "talk" in ex and "username" in ex.get("talk", {}))
+    check("示例含播报模板", "announce" in ex and ex.get("announce", {}).get("template"))
+    check("示例含点名开关", "net_control" in ex and "enabled" in ex.get("net_control", {}))
+
 # ============ 第九部分：direct_announce 纯函数 ============
 def test_da_pure():
     print("\n=== direct_announce 纯函数（dry_validate/trim_silence/parse_udp/build_audio）===")

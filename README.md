@@ -103,13 +103,15 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 ```
 > 注意：测试模式与常驻链路同账号并发会互踢（服务器顶掉旧会话），触发一条告警后自动重连，属正常现象。
 ## 配置说明
-`config.json` 完整结构（所有字段均带默认值，缺省项自动回退）：
+`config.example.json` 为**最小可用示例**（只含必填项与最常用项）；以下为 `config.json` 完整字段表（所有字段均带代码内置默认值，缺省项自动回退）。**同步原则：不关心的项从你的 `config.json` 中删掉、跟随程序默认值**——程序升级优化默认值时示例文件与配置无需改动；显式写出的项会覆盖默认值。
 | 配置段 | 字段 | 说明 |
 |--------|------|------|
 | `talk` | `host` / `port` | 滔滔链路服务器地址与端口（默认 totalkd.allptt.com:59638） |
 | `talk` | `username` / `password` | 滔滔链路账号（必填） |
 | `talk.client_profile` | `release` / `os_name` / `os_version` / `model` | 客户端画像（对齐真实手机 App，UserState 广播用） |
+| `tts` | `engine` | 点名 TTS 引擎（cosyvoice / edge，默认 cosyvoice） |
 | `tts` | `voice` | Edge-TTS 语音角色（默认 zh-CN-XiaoxiaoNeural） |
+| `tts` | `cosyvoice_sdk` / `cosyvoice_model` / `cosyvoice_voice` | CosyVoice 引擎（DashScope SDK 模式 / 模型 / 音色名） |
 | `tts` | `timeout_inner` / `timeout_join` | TTS 协程/线程超时（秒） |
 | `tts` | `max_retries` / `retry_delay` | 合成重试次数与间隔 |
 | `tts` | `cache_expire_days` | TTS 缓存过期天数（默认 2） |
@@ -117,16 +119,37 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `announce` | `template` | 播报模板（支持 {year}/{month}/{day}/{weekday}/{hour}/{minute_text} 占位符） |
 | `announce` | `start_hour` / `end_hour` | 每日播报时段（每半小时一次） |
 | `timing` | `native_prep_lead` | 准点前建链提前量（默认 2.5s） |
-| `timing` | `native_mic_lead` | 准点前抢麦提前量（默认 0.5s） |
+| `timing` | `native_mic_lead` | 准点前【发起】抢麦提前量（默认 1.0s，见下方"直连时序"） |
 | `timing` | `lead_delay` | UserTalking→首包建链间隔（默认 0.5s） |
 | `timing` | `packet_period` | 语音包发送间隔（默认 0.12s，即 120ms） |
 | `timing` | `tail_flush` | 发包后尾巴冲刷时长（默认 0.3s，调小可缩短结尾空白） |
 | `audio` | `opus_bitrate` | Opus 编码码率（默认 12000bps CBR） |
 | `audio` | `trim_silence` / `trim_threshold` / `trim_min_ms` | 头尾静音裁切开关与参数 |
-| `paths` | `cache_dir` / `log_dir` | TTS 缓存与日志目录 |
+| `paths` | `cache_dir` / `log_dir` | TTS 缓存与日志目录（默认 /app/tts_cache、/app/logs） |
 | `logging` | `max_bytes` / `backup_count` | 日志轮转大小与备份数 |
 | `notify` | `webhook_url` | 企业微信机器人 Webhook（留空禁用） |
 | `notify` | `webhook_log_level` | 推送级别（INFO/WARNING/ERROR） |
+| `net_control` | `enabled` / `weekday` / `hour` / `minute` | 点名开关（默认关闭）/ 星期（0=周一）/ 开始时间 |
+| `net_control.net` | `net_name` / `repeater_call` / `ctrl_call` / `ctrl_phonetic` | 台网名称 / 中继呼号 / 主控呼号 / 主控解释法 |
+| `net_control.net` | `main_qth` / `main_device` / `main_antenna` / `main_power` | 主控 QTH / 设备 / 天线 / 功率（开场白占位符） |
+| `net_control` | `opening_text` / `closing_text` / `idle_call_text` | 点名开场 / 结束 / 空闲催台文案模板（占位符见下方"点名文案"） |
+| `net_control` | `ack_text` / `info_ack_text` / `ask_ack_text` | 应答引导 / 信息确认 / 初次上报引导模板 |
+| `net_control` | `repeat_text` / `repeat_report_text` / `dup_text` / `no_reply_text` | 重复呼号 / 重报信息 / 重复上台 / 无应答模板 |
+| `net_control` | `summary_text` / `confirm_text` / `correct_text` | 总结 / 确认 / 纠错模板 |
+| `net_control` | `listen_after_open_seconds` / `max_net_seconds` / `quiet_end_seconds` / `grace_seconds` | 开场监听 / 最长台网 / 静默收尾 / 点名宽限（秒） |
+| `net_control` | `idle_call_seconds` / `current_idle_timeout` / `report_merge_gap_seconds` | 空闲催台间隔 / 当前台超时 / 信息合并间隔 |
+| `net_control` | `tx_wait_timeout` / `vad_threshold` / `silence_end_ms` / `min_segment_ms` / `max_segment_ms` | 发射等待 / VAD 阈值 / 静音切段 / 最小段 / 最大段 |
+| `net_control` | `ptt_bound_mode` / `ptt_release_delay_ms` / `use_talking_gate` / `asr_min_seconds` | PTT 边界 / 放麦延迟 / 讲话闸门 / ASR 最小时长 |
+| `net_control` | `callsign_regex` / `confidence_threshold` / `max_retry` / `extra_vocab` | 呼号正则 / 置信度 / ASR 重试 / 附加词表 |
+| `net_control` | `save_audio` / `audio_dir` | 存盘（点名录音目录，默认 /app/net_records） |
+| `net_control` | `roster_mode` / `roster` / `roster_call_text` / `roster_call_timeout` / `roster_max_seconds` | 点名册模式（逐个呼叫） |
+| `net_control.asr` | `api_key` / `model` / `base_url` / `enable_itn` / `language` / `sys_style` | 语音识别（DashScope 兼容模式） |
+| `net_control.llm` | `enabled` / `api_key` / `model` / `base_url` | 大模型纠错（默认关闭） |
+| `watchdog` | `slot_tolerance_seconds` | 准点缺失容忍窗口（默认 900s） |
+| `watchdog` | `restart_cooldown_seconds` | 自重启冷却期（默认 7200s，期内只降频推送不重启） |
+| `watchdog` | `cooldown_notify_interval_seconds` | 冷却期/告警降频推送间隔（默认 1800s） |
+| `watchdog` | `tts_fail_window_seconds` | TTS 现场失败豁免窗口（默认 1800s，窗口内只告警不重启） |
+| `test` | `enabled` / `count` | 配置驱动测试模式（等价命令行 -t，默认关闭） |
 ### 配置加载优先级
 1. 环境变量 `HAM_BOT_CONFIG` 指定配置文件路径
 2. 未设置时默认读取脚本同目录 `config.json`
@@ -147,11 +170,11 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
 ```jsonc
 "timing": {
   "native_prep_lead": 2.5,   // 准点前该秒数建链+登录（实测建链 ~1s）
-  "native_mic_lead": 0.5,    // 准点前该秒数才发起抢麦（不提前占麦）
+  "native_mic_lead": 1.0,    // 准点前该秒数【发起】抢麦
   "tail_flush": 0.3          // 发包后尾巴冲刷（调小可缩短播报结尾空白）
 }
 ```
-抢麦提前量 0.5s 是刻意设计：提前抢麦会让频道内其他用户看到"说话中"状态长时间静默。抢麦服务器响应约 1.1s，实际首包落在准点后 ~1.1s，其中 UserTalking 与首包保持 0.5s 官方间隔（中继台链路设备靠该间隔建立转发）。
+`native_mic_lead` 是"抢麦**发起**提前量"：take_mic 内部是 send(ApplyMic)→等服务器回执→上报 UserTalking 的串行网络往返（实测约 0.5~1.1s），"抢麦成功"日志（完成时刻）≈ 发起 + 往返。取 1.0s → 完成 ≈ 整点后 0.1s，贴近整点；若取 0.5s 则完成必落在整点后 ~0.6s，日志显得"每次都迟到抢麦"。不取 >1.5s：提前占麦会让频道内其他用户长时间看到"说话中"静默。UserTalking 发出后保持 0.5s 官方建链间隔（`lead_delay`，中继台链路设备靠该间隔建立转发）再发首包。
 ### TTS 合成与缓存校验
 ```jsonc
 "tts": {
@@ -221,9 +244,9 @@ python3 tests/run_tests.py && python3 tests/test_session.py                 # �
 | `{report}` | 信号报告 | 59 |
 | `{n}` / `{calls}` | 抄收人数/呼号列表 | 9 / BH3XX、BG9ABC |
 
-TTS 优化要点：呼号一律用解释法英文单词（`{call_phonetic}`），中文语音读单词比读字母串稳定；时间写"北京时间{time}"；频率/亚音/功率写中文单位（兆赫/赫兹/瓦）；保留 CQ、Over、73 国际惯例词。铜川变体开场白示例见 `config.example.commented.json`。
+TTS 优化要点：呼号一律用解释法英文单词（`{call_phonetic}`），中文语音读单词比读字母串稳定；时间写"北京时间{time}"；频率/亚音/功率写中文单位（兆赫/赫兹/瓦）；保留 CQ、Over、73 国际惯例词。点名文案模板（opening/closing/ack 等）的完整字段、默认值与占位符见上文"配置说明"表 `net_control` 各段。
 
-完整配置字段见 `config.example.commented.json` 的 `net_control` 段（全部带默认值，缺省即兜底）。
+> **配置同步原则**：`config.example.json` 为**最小可用示例**（只含必填项与最常用项），缺省字段一律回退到代码内置默认值（见上文配置说明表）。程序升级优化默认值时，示例文件通常无需改动；若你在服务器 `config.json` 中显式写入了某项，它会覆盖代码默认值——不关心的项请从 `config.json` 删掉、跟随程序默认。
 
 ## 数据目录
 `docker-compose.yml` 将项目目录挂载到容器 `/app`，运行时会在 `paths.cache_dir` 与 `paths.log_dir` 指定目录下自动创建子目录：

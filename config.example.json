@@ -14,52 +14,15 @@
     },
     "tts": {
         "engine": "cosyvoice",
-        "voice": "zh-CN-XiaoxiaoNeural",
         "cosyvoice_sdk": true,
         "cosyvoice_model": "cosyvoice-v3.5-flash",
         "cosyvoice_voice": "",
-        "cosyvoice_base": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-        "cosyvoice_format": "mp3",
-        "cosyvoice_sample_rate": 24000,
-        "cosyvoice_volume": 50,
-        "cosyvoice_rate": 1.0,
-        "cosyvoice_pitch": 1.0,
-        "timeout_inner": 28,
-        "timeout_join": 30,
-        "max_retries": 3,
-        "retry_delay": 5.0,
-        "cache_expire_days": 2,
-        "prefill_hours": 48
+        "voice": "zh-CN-XiaoxiaoNeural"
     },
     "announce": {
         "template": "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是示例市业余无线电中继台B阿九AB，本中继下行频率 4三9.625 兆赫，上行频率 4三2.575 兆赫，叉频 负 7.05 兆赫。单上行接入亚音为模拟 88.5 赫兹。请规范用频，保持信道畅通。完毕",
         "start_hour": 7,
         "end_hour": 22
-    },
-    "test": {
-        "enabled": false,
-        "count": 1
-    },
-    "timing": {
-        "native_prep_lead": 2.5,
-        "native_mic_lead": 1.0,
-        "lead_delay": 0.5,
-        "packet_period": 0.12,
-        "tail_flush": 0.3
-    },
-    "audio": {
-        "opus_bitrate": 12000,
-        "trim_silence": true,
-        "trim_threshold": 200,
-        "trim_min_ms": 50
-    },
-    "paths": {
-        "cache_dir": "/app/tts_cache",
-        "log_dir": "/app/logs"
-    },
-    "logging": {
-        "max_bytes": 262144,
-        "backup_count": 40
     },
     "notify": {
         "webhook_url": "",
@@ -67,9 +30,7 @@
     },
     "net_control": {
         "enabled": false,
-        "weekday": [
-            0
-        ],
+        "weekday": [0],
         "hour": 20,
         "minute": 0,
         "net": {
@@ -80,72 +41,9 @@
             "main_qth": "咸阳市渭城区塔尔坡",
             "main_device": "泉盛K6",
             "main_antenna": "原机天线",
-            "main_power": "5瓦",
-            "frequency": "",
-            "offset": "",
-            "tone": ""
+            "main_power": "5瓦"
         },
         "opening_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是每周{weekday}晚{net_name}，我是今晚主控{ctrl_call}，今天是{date}，现在是北京时间{time}，我的QTH位于{main_qth}，所用设备{main_device}，{main_antenna}，{main_power}功率发射，现在开始台网点名，请抄收到信号的友台依次上台报告你的呼号、QTH、使用设备、天线、功率以及抄收到主控台的信号报告，这里是{ctrl_phonetic} {ctrl_call}，Over",
-        "listen_after_open_seconds": 60,
-        "max_net_seconds": 1800,
-        "quiet_end_seconds": 10,
-        "grace_seconds": 300,
-        "idle_call_seconds": 300,
-        "idle_call_text": "CQ CQ CQ，这里是{repeater_call}业余无线电中继台，现在是{net_name}，我是主控{ctrl_call}，点名继续开放，请抄收到信号的友台依次上台报告呼号、QTH、使用设备、天线、功率，这里是{ctrl_phonetic} {ctrl_call}，Over",
-        "current_idle_timeout": 90,
-        "current_idle_text": "{call_phonetic} 暂时无回应，先请下一位友台。Over",
-        "report_merge_gap_seconds": 4,
-        "ack_text": "{call_phonetic}，这里是{ctrl_call}，抄收你的信号{report}，请报告您的QTH、使用设备、天线、功率以及抄收主控的信号报告。Over",
-        "repeat_report_text": "抄收您的位置与设备信息，请再报一次您的呼号，Over",
-        "info_ack_text": "抄收，{call_phonetic}，您的信息已记录：{fields}。是否正确？Over",
-        "repeat_text": "{call_phonetic}，请重复一遍您的呼号。",
-        "dup_text": "{call_phonetic} 已经抄收过，请下一位友台。",
-        "no_reply_text": "无人应答，继续下一位。",
-        "summary_text": "本次点名共抄收{n}位友台：{calls}。",
-        "closing_text": "CQ CQ CQ，现在是北京时间{time}，{net_name}到此结束，我是本次主控{ctrl_call}，本次参与台网点名的共有{n}位友台，非常感谢各位友台积极参与，接下来各位友台可以自由通联，73！",
-        "ask_ack_text": "抄收，{call_phonetic}，您的呼号已记录，请报告您的QTH、使用设备、天线、功率，Over",
-        "tx_wait_timeout": 30,
-        "vad_threshold": 800,
-        "silence_end_ms": 3000,
-        "min_segment_ms": 400,
-        "max_segment_ms": 30000,
-        "seg_grace_seconds": 3,
-        "ptt_bound_mode": true,
-        "ptt_release_delay_ms": 3000,
-        "use_talking_gate": true,
-        "asr_min_seconds": 1.0,
-        "callsign_regex": "^B[A-Z]\\d[A-Z]{1,3}$",
-        "confidence_threshold": 60,
-        "max_retry": 1,
-        "extra_vocab": [],
-        "save_audio": true,
-        "audio_dir": "/app/net_records",
-        "roster_mode": false,
-        "roster": [],
-        "roster_call_text": "请{call_phonetic}回答。Over",
-        "roster_call_timeout": 12,
-        "roster_max_seconds": 1800,
-        "asr": {
-            "api_key": "",
-            "model": "qwen3-asr-flash",
-            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            "enable_itn": true,
-            "language": "",
-            "sys_style": "list"
-        },
-        "llm": {
-            "enabled": false,
-            "api_key": "",
-            "model": "glm-4.5-flash",
-            "base_url": "https://open.bigmodel.cn/api/paas/v4"
-        },
-        "confirm_text": "抄收，{call_phonetic}，感谢确认，请下一位友台。Over",
-        "correct_text": "抱歉，刚才抄收可能有误，请您再重复一遍，Over"
-    },
-    "watchdog": {
-        "slot_tolerance_seconds": 900,
-        "restart_cooldown_seconds": 7200,
-        "cooldown_notify_interval_seconds": 1800,
-        "tts_fail_window_seconds": 1800
+        "closing_text": "CQ CQ CQ，现在是北京时间{time}，{net_name}到此结束，我是本次主控{ctrl_call}，本次参与台网点名的共有{n}位友台，非常感谢各位友台积极参与，接下来各位友台可以自由通联，73！"
     }
 }
