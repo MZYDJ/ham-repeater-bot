@@ -576,6 +576,26 @@ def _mark_announce_ok():
             logger.warning(f"恢复标记文件清除失败: {e}")
         _send_wechat(f"[播报服务 OK] 看门狗自重启后业务已恢复"
                      f"（{datetime.datetime.now():%m-%d %H:%M} 播报成功）")
+def _release_prebuilt_session(s, temp):
+    """释放预建会话（TTS 失败/现场兜底/异常路径共用）：常驻链先发放麦信令
+    （UserTalking false + ApplyMic false——busy 独占中 keeper 让位，主线程可安全
+    send）再归还守护线程；临时短链直接 close（断连=服务器侧自动放麦）+ 恢复常驻。
+    防"说话中"会话残留到下一场预热（盲点 A）。命中路径播完已由 play 放麦，
+    走各自 finally 的 close/release，不调用本函数。"""
+    if s is None:
+        return
+    try:
+        if temp:
+            s.close()                    # 断连=服务器侧自动放麦
+            _native_link_resume()
+        else:
+            if s.c is not None:
+                s.c.send(15, direct_announce.build_user_talking(s.session, False))
+                s.c.send(14, direct_announce.build_apply_mic(False))
+            if _native_link:
+                _native_link.release()
+    except Exception as e:
+        logger.warning(f"释放预建会话异常: {e}")
 def announce_task():
     """播报核心逻辑，仅主线程执行"""
     now = datetime.datetime.now()
@@ -585,8 +605,13 @@ def announce_task():
         return
     announce_text = get_announce_text(now)
     logger.info(f"触发定时播报: {announce_text}")
+    global _native_session, _native_prebuilt, _native_session_temp, _native_talk_ts
+    # 预建会话先取走（任何出口统一释放）：防 TTS 失败/现场兜底/异常路径把
+    # "说话中"会话残留到下一场预热（盲点 A）。命中路径 play 播完已自行放麦。
+    s_pre, temp_pre = _native_session, _native_session_temp
+    talk_ts = _native_talk_ts
+    _native_session, _native_talk_ts = None, 0.0
     try:
-        global _native_session, _native_prebuilt, _native_session_temp, _native_talk_ts
         # 播报现场仅 1 次合成机会（预热 XX:29/XX:59 已做过 3 次重试）：
         # 失败立即跳场，重试交给蓄水池后台每小时补——播报要么准点要么快速跳场，
         # 不被 TTS 抖动拖 75s（预热3次+现场3次=最长延迟 2.5min）。
@@ -602,25 +627,27 @@ def announce_task():
         _mark_tts_ok()            # 现场合成成功=TTS 已恢复：清除失败标记，防旧标记掩盖后续真假死
         # 预建会话+预构建音频均就绪（预热任务已在准点前抢麦完成，此刻 UserTalking 已上报）
         # —— play 锚定 UserTalking（完成时刻+LEAD_DELAY 才发首包），官方时序恒定 0.5s
-        if _native_session and _native_prebuilt and _native_prebuilt[0] == tts_file:
-            s, packets = _native_session, _native_prebuilt[1]
-            temp = _native_session_temp
-            talking_ts = _native_talk_ts
-            _native_session = _native_prebuilt = None   # 先取走，防重入
-            _native_talk_ts = 0.0
+        if s_pre and _native_prebuilt and _native_prebuilt[0] == tts_file:
+            packets = _native_prebuilt[1]
+            _native_prebuilt = None   # 先取走，防重入
             try:
-                _native_play(s, packets, talking_ts)
+                _native_play(s_pre, packets, talk_ts)
                 _mark_announce_ok()
             finally:
-                if temp:                       # 临时短链：用完即弃
-                    s.close()
-                    _native_link_resume()      # 常驻恢复保活（临时链已断开，不再互踢）
-                elif _native_link:             # 常驻链路：还给守护线程继续保活
+                if temp_pre:                 # 临时短链：用完即弃
+                    s_pre.close()
+                    _native_link_resume()    # 常驻恢复保活（临时链已断开，不再互踢）
+                elif _native_link:           # 常驻链路：还给守护线程继续保活
                     _native_link.release()
+            s_pre = None                     # 已消费（play 播完已放麦），外层 finally 不再处理
             return
         _announce_native(tts_file)   # 容错兜底：现场完整流程（含 LEAD_DELAY）
     except Exception as e:
         logger.error(f"播报流程异常: {str(e)}", exc_info=True)
+    finally:
+        # TTS 失败 / 兜底 / 异常路径：释放预建会话（放麦+归还/断开），防"说话中"残留
+        if s_pre is not None:
+            _release_prebuilt_session(s_pre, temp_pre)
 # ========== 调度任务分发函数 ==========
 def schedule_announce():
     task_queue.put("announce")

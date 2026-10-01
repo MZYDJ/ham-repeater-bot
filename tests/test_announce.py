@@ -439,6 +439,36 @@ def test_announce_task():
         A.announce_task()
     check("announce_task TTS失败→打点跳场", A._last_tts_fail_ts > 0)
 
+    # 盲点A：TTS 失败且存在预建会话 → 释放会话（放麦信令+常驻 release），
+    # 防"说话中"残留到下一场预热
+    _reset_announce_state()
+    link = mock.MagicMock()
+    A._native_link = link
+    s = mock.MagicMock()
+    s.c = mock.MagicMock()
+    s.session = 12345
+    A._native_session = s
+    A._native_session_temp = False
+    with mock.patch.object(A, "net_active", return_value=False), \
+            mock.patch.object(A, "get_tts_file", return_value=""):
+        A.announce_task()
+    check("盲点A TTS失败→放麦信令发出", s.c.send.call_count >= 2, s.c.send.call_count)
+    check("盲点A TTS失败→常驻链归还", link.release.called)
+    check("盲点A TTS失败→全局会话清空", A._native_session is None)
+
+    # 盲点A 临时短链路径：TTS 失败 → close + 恢复常驻
+    _reset_announce_state()
+    link = mock.MagicMock()
+    A._native_link = link
+    s = mock.MagicMock()
+    A._native_session = s
+    A._native_session_temp = True
+    with mock.patch.object(A, "net_active", return_value=False), \
+            mock.patch.object(A, "get_tts_file", return_value=""), \
+            mock.patch.object(A, "_native_link_resume") as resume_:
+        A.announce_task()
+    check("盲点A 临时链→close+恢复常驻", s.close.called and resume_.called)
+
     # 预建命中 → _native_play + _mark_announce_ok + 常驻 release
     _reset_announce_state()
     link = mock.MagicMock()
