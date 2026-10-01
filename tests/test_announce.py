@@ -495,6 +495,10 @@ def test_misc():
     check("示例含 talk 账号", "talk" in ex and "username" in ex.get("talk", {}))
     check("示例含播报模板", "announce" in ex and ex.get("announce", {}).get("template"))
     check("示例含点名开关", "net_control" in ex and "enabled" in ex.get("net_control", {}))
+    # 点名启用时 ASR/TTS 共用 asr.api_key：示例须含 net_control.asr 段占位
+    # （缺段=模板与 README 不一致，复制示例启用点名会被 start.sh fail-fast 拦截）
+    check("示例含 asr 段", "net_control" in ex and "asr" in ex.get("net_control", {})
+          and "api_key" in ex.get("net_control", {}).get("asr", {}))
 
 # ============ 第九部分：direct_announce 纯函数 ============
 def test_da_pure():

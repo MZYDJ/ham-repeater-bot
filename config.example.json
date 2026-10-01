@@ -33,6 +33,9 @@
         "weekday": [0],
         "hour": 20,
         "minute": 0,
+        "asr": {
+            "api_key": ""
+        },
         "net": {
             "net_name": "应急通讯演练台网点名",
             "repeater_call": "BR9AB",
