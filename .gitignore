@@ -24,3 +24,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# 本地运行日志（误提交清理）
+.logs/
