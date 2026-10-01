@@ -42,7 +42,7 @@
     },
     "timing": {
         "native_prep_lead": 2.5,
-        "native_mic_lead": 0.5,
+        "native_mic_lead": 1.0,
         "lead_delay": 0.5,
         "packet_period": 0.12,
         "tail_flush": 0.3

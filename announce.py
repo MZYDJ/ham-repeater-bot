@@ -46,7 +46,12 @@ LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
 TTS_PREFILL_HOURS = cfg_get("tts", "prefill_hours", default=48)
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
-NATIVE_MIC_LEAD = cfg_get("timing", "native_mic_lead", default=0.5)
+# 准点前多少秒【发起】抢麦。take_mic 是 send(ApplyMic)→wait_for 回执→上报
+# UserTalking 的串行网络往返（实测约 1.1s），"抢麦成功"完成时刻 ≈ 发起时刻+1.1s。
+# 取 1.0s：发起在准点前 1s，完成 ≈ 整点后 0.1s（贴近整点）；若取 0.5s 则完成
+# 必然落在整点后 ~0.6s，日志看起来像"每次都迟到抢麦"。不取 >1.5s：避免频道
+# 长时间显示"说话中"静默（中继台官方节奏 UserTalking 后 LEAD_DELAY 才起播）。
+NATIVE_MIC_LEAD = cfg_get("timing", "native_mic_lead", default=1.0)
 # 测试模式配置（配置文件驱动，等价于命令行 -t；命令行 -t 显式指定时优先级更高）
 TEST_ENABLED = cfg_get("test", "enabled", default=False)
 TEST_COUNT = cfg_get("test", "count", default=1)
@@ -491,7 +496,9 @@ def _native_prewarm():
     try:
         mic_wait = (nxt - datetime.datetime.now()).total_seconds() - NATIVE_MIC_LEAD
         if mic_wait > 0:
-            time.sleep(mic_wait)                       # 睡到准点前0.5s才抢麦
+            # 睡到准点前 NATIVE_MIC_LEAD（默认1.0s）才【发起】抢麦；take_mic 内部
+            # 还有 ~1.1s 网络往返，故完成时刻 ≈ 整点后 ~0.1s，日志不再显得"迟到"
+            time.sleep(mic_wait)
         with contextlib.redirect_stdout(_StdoutToLogger()):
             s.take_mic()                               # 抢麦+UserTalking（响应~1.1s）
         logger.info(f"已抢麦，待 {nxt:%H:%M} 准点发包（play 再留 0.5s 建链间隔）")

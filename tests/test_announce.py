@@ -119,6 +119,10 @@ def test_text_time_pure():
     nxt = A._next_announce_time(T(2026, 9, 30, 10, 31))
     check("_next_announce_time 10:31→11:00", nxt.hour == 11 and nxt.minute == 0)
 
+    # 抢麦提前量设计值：默认 1.0s（发起提前1s，take_mic往返~1.1s，完成≈整点后0.1s；
+    # 若回到 0.5 则完成必落整点后 ~0.6s，日志显得"每次都迟到抢麦"）
+    check("NATIVE_MIC_LEAD 默认1.0s", A.NATIVE_MIC_LEAD == 1.0, A.NATIVE_MIC_LEAD)
+
 # ============ 第二部分：TTS 缓存/合成 ============
 def test_tts_cache():
     print("\n=== TTS 缓存路径/时长估算 ===")
