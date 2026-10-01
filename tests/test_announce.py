@@ -177,11 +177,15 @@ def test_get_tts_file():
 def test_prefill_and_prewarm_sched():
     print("\n=== 蓄水池 tts_prefill_task / prepare_next_tts / schedule_× ===")
     _reset_announce_state()
+    # 蓄水池"距下一准点<5min 暂停"检查依赖 _next_announce_time：统一 mock 为
+    # 远未来（保证不误触发暂停），仅"暂停"断言单独 mock 为近时刻。
+    _far_next = datetime.datetime.now() + datetime.timedelta(days=1)
     # tts_prefill_task：队列非空 → 本轮提前结束（不合成）
     A.task_queue.put("announce")
     called = []
     with mock.patch("announce.get_upcoming_announce_times",
                     return_value=[T(2026, 9, 30, 11, 0)]), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
             mock.patch("announce.get_tts_file", side_effect=lambda *a, **k: called.append(1) or "x"):
         A.tts_prefill_task()
     A.task_queue.get()
@@ -194,6 +198,7 @@ def test_prefill_and_prewarm_sched():
     cache.write_bytes(b"ok")
     synth = []
     with mock.patch("announce.get_upcoming_announce_times", return_value=[slot]), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
             mock.patch("announce.direct_announce.dry_validate_mp3",
                        side_effect=lambda p, min_seconds=0: str(p) == str(cache)), \
             mock.patch("announce.get_tts_file", side_effect=lambda *a, **k: synth.append(1) or "x"):
@@ -201,6 +206,7 @@ def test_prefill_and_prewarm_sched():
     check("蓄水池已备好跳过", not synth)
     # 缺口：dry_validate 全 False → 合成 1 次；再 mock 合成失败 → 记录缺口
     with mock.patch("announce.get_upcoming_announce_times", return_value=[slot]), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
             mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
             mock.patch("announce.get_tts_file", return_value=""):
         A.tts_prefill_task()
@@ -211,14 +217,26 @@ def test_prefill_and_prewarm_sched():
     with mock.patch("announce.net_active", return_value=True), \
             mock.patch("announce.get_upcoming_announce_times",
                        return_value=[T(2026, 9, 30, 11, 0)]), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
             mock.patch("announce.get_tts_file", side_effect=lambda *a, **k: called.append(1) or "x"):
         A.tts_prefill_task()
     check("蓄水池点名进行中→跳过本轮", not called)
+
+    # 距下一准点 <5min → 本轮暂停（防启动距准点近时横跨准点、延迟播报）
+    called = []
+    _near_next = datetime.datetime.now() + datetime.timedelta(minutes=2)
+    with mock.patch("announce.get_upcoming_announce_times",
+                    return_value=[T(2026, 9, 30, 11, 0)]), \
+            mock.patch("announce._next_announce_time", return_value=_near_next), \
+            mock.patch("announce.get_tts_file", side_effect=lambda *a, **k: called.append(1) or "x"):
+        A.tts_prefill_task()
+    check("蓄水池距准点<5min→暂停本轮", not called)
 
     # 每轮合成上限：30 个缺失 slot → 只合成 MAX_PREFILL_PER_ROUND 个
     slots30 = [T(2026, 9, 30, h, m) for h in range(8, 23) for m in (0, 30)][:30]
     n = []
     with mock.patch("announce.get_upcoming_announce_times", return_value=slots30), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
             mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
             mock.patch("announce.get_tts_file",
                        side_effect=lambda *a, **k: n.append(1) or "x"):

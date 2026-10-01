@@ -302,6 +302,12 @@ def tts_prefill_task():
         if synthesized >= MAX_PREFILL_PER_ROUND:
             logger.info(f"TTS蓄水池：本轮已达单轮上限 {MAX_PREFILL_PER_ROUND} 个，剩余时段下次继续补充")
             break
+        # 距下一准点 <5min 不再启动新 slot：防启动距准点近时蓄水池横跨准点、
+        # 把播报拖到准点后（TTS 异常时单 slot 最长 ~66s，10 个可横跨 11min）
+        _now = datetime.datetime.now()
+        if _next_announce_time(_now) - _now < datetime.timedelta(minutes=5):
+            logger.info(f"TTS蓄水池：距下一准点不足 5 分钟，暂停本轮（已合成 {synthesized} 个），剩余时段下次补充")
+            break
         text = get_announce_text(slot)
         cache_path = tts_cache_path(text)
         # 已备好：文件存在且通过时长校验（>= 文本估算时长）；残缺文件视为未备好，
