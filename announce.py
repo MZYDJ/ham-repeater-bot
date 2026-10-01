@@ -45,6 +45,7 @@ LOG_MAX_BYTES = cfg_get("logging", "max_bytes", default=0.25 * 1024 * 1024)
 LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
 TTS_PREFILL_HOURS = cfg_get("tts", "prefill_hours", default=48)
+MAX_PREFILL_PER_ROUND = 10   # 蓄水池每轮合成上限：防单轮批量合成长时间占 CPU（缺口靠每小时补充）
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
 # 准点前多少秒【发起】抢麦。take_mic 是 send(ApplyMic)→wait_for 回执→上报
 # UserTalking 的串行网络往返（实测约 1.1s），"抢麦成功"完成时刻 ≈ 发起时刻+1.1s。
@@ -282,14 +283,24 @@ def tts_prefill_task():
     突发性（常持续数分钟到数小时），把合成提前到更早的时间窗口并
     每小时补充一次，准点播报就不再依赖播报时刻的网络状态；
     只有连续超过一天的网络中断才可能影响播报。
+    点名进行中跳过本轮（与预热/播报一致）：点名线程正在做 TTS 合成+发包，
+    主线程再批量合成会形成双合成流并发，徒增 CPU/网络占用。
+    每轮合成数量设上限（MAX_PREFILL_PER_ROUND）：缺口靠每小时 XX:05
+    持续补充，防止"网络恢复后一口气补 20+ 个"单轮占 CPU 数分钟。
     """
     now = datetime.datetime.now()
+    if net_active():                         # 点名进行中：跳过本轮（与预热/播报一致）
+        logger.info("TTS蓄水池：点名进行中，跳过本轮（避免与点名线程并发合成）")
+        return
     slots = get_upcoming_announce_times(now)
     synthesized, still_missing = 0, []
     for slot in slots:
         # 预热/播报任务入队时立即让位，绝不阻塞准点流程
         if not task_queue.empty():
             logger.info("TTS蓄水池：检测到待执行任务，本轮提前结束，剩余时段下次继续补充")
+            break
+        if synthesized >= MAX_PREFILL_PER_ROUND:
+            logger.info(f"TTS蓄水池：本轮已达单轮上限 {MAX_PREFILL_PER_ROUND} 个，剩余时段下次继续补充")
             break
         text = get_announce_text(slot)
         cache_path = tts_cache_path(text)

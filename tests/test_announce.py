@@ -206,6 +206,25 @@ def test_prefill_and_prewarm_sched():
         A.tts_prefill_task()
     check("蓄水池失败记录缺口（不抛）", True)
 
+    # 点名进行中 → 跳过本轮（与预热/播报一致，避免双合成流并发）
+    called = []
+    with mock.patch("announce.net_active", return_value=True), \
+            mock.patch("announce.get_upcoming_announce_times",
+                       return_value=[T(2026, 9, 30, 11, 0)]), \
+            mock.patch("announce.get_tts_file", side_effect=lambda *a, **k: called.append(1) or "x"):
+        A.tts_prefill_task()
+    check("蓄水池点名进行中→跳过本轮", not called)
+
+    # 每轮合成上限：30 个缺失 slot → 只合成 MAX_PREFILL_PER_ROUND 个
+    slots30 = [T(2026, 9, 30, h, m) for h in range(8, 23) for m in (0, 30)][:30]
+    n = []
+    with mock.patch("announce.get_upcoming_announce_times", return_value=slots30), \
+            mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
+            mock.patch("announce.get_tts_file",
+                       side_effect=lambda *a, **k: n.append(1) or "x"):
+        A.tts_prefill_task()
+    check("蓄水池单轮上限", len(n) == A.MAX_PREFILL_PER_ROUND, f"实际合成 {len(n)} 个")
+
     # prepare_next_tts：无 slots 直接返回；有 slots 合成 + 清理过期缓存
     with mock.patch("announce.get_upcoming_announce_times", return_value=[]), \
             mock.patch("announce.get_tts_file", return_value="") as g:
