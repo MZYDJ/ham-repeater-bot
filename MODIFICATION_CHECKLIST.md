@@ -108,7 +108,7 @@
 | P5 | 交付通道选择 | **push 成功 → 主交付 = GitHub 链接/commit hash，不出 zip**；用户服务器 `git pull` 同步（docker-compose 挂载宿主目录，pull 即覆盖 /app）。**仅当 GitHub push 失败（不可达/鉴权失败）→ 兜底打包 zip**：`zip -r <包>.zip $(git ls-files)` + `BUILD_TIME` 时间戳文件入根 | 用户拿不到新代码 |
 | P6 | present_files 交付 | push 成功：交付 commit hash + GitHub 链接（zip 可省）；push 失败：交付 zip 链接（https://aka.doubaocdn.com/...） | 用户拿不到新代码 |
 | P7 | 服务器更新重启 | push 通道：用户 `cd <宿主部署目录> && git pull && docker restart announce`；zip 通道：覆盖 `/app` 后重启 | 旧代码继续运行 |
-| P8 | 线上日志验证 | `docker logs announce --since "30s"` 检查：`[ENV] BUILD_TIME: /app=... \| /opt=... \| env=...`（应为本次时间戳）、`[ENV] config.example.json: OK`、Scheduler started、首个准点播报完成 | 没验证=没交付完 |
+| P8 | 线上日志验证 | `docker logs announce --since "30s"` 检查：`[ENV] BUILD_TIME: /app=... \| /opt=... \| env=...`（应为本次时间戳）、自检无 `[ERROR]`（fail-fast 未触发）、Scheduler started、首个准点播报完成 | 没验证=没交付完 |
 
 ---
 

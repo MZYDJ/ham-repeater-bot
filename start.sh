@@ -49,6 +49,7 @@ import json, os, sys
 p = os.environ.get("HAM_BOT_CONFIG", "/app/config.json")
 def fail(msg):
     print(f"[ERROR] {msg}")
+    print("[HINT] 若此配置由 config.example.json 复制而来，请一并检查模板是否完整（git pull 可恢复最新示例）。")
     sys.exit(1)
 try:
     with open(p, encoding="utf-8") as f:
@@ -87,20 +88,8 @@ if net_enabled and engine == "cosyvoice":
 else:
     if not has("tts", "voice"):
         print("[WARN] tts.engine=edge 但 tts.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
-# 示例配置完整性自检（部署入口保护：config.example.json 是新部署的复制模板，
-# 若被改坏/缺必填 key，用户 cp 即用会在启动或播报时才报错，此处启动即提示）
-try:
-    with open("/app/config.example.json", encoding="utf-8") as f:
-        ex = json.load(f)
-    if not (ex.get("talk", {}).get("username") and ex.get("talk", {}).get("password")):
-        print("[WARN] config.example.json 缺少必填项 talk.username / talk.password！")
-    if not (ex.get("announce", {}).get("template")):
-        print("[WARN] config.example.json 缺少必填项 announce.template！")
-    if "net_control" not in ex or "enabled" not in ex.get("net_control", {}):
-        print("[WARN] config.example.json 缺少 net_control.enabled 项！")
-    print("[ENV] config.example.json: OK")
-except Exception as e:
-    print(f"[WARN] /app/config.example.json 缺失或非法 JSON（{e}）！它是新部署的复制模板，建议从代码仓库恢复。")
+# 正式配置 config.json 已在上方 fail-fast（读取/账号/模板/点名条件全覆盖），
+# 不再单独检查示例文件 config.example.json（模板完整性由仓库测试 test_announce 兜底）
 print("==============================")
 PYEOF
 
