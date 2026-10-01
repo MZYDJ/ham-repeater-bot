@@ -620,19 +620,26 @@ class DirectAnnouncer:
             raise RuntimeError("抢麦失败: %s" % (d or "6秒无响应"))
         c.send(15, build_user_talking(self.session, True))
         print("抢麦成功，已上报 UserTalking(talking=true)")
-    def play(self, packets, verbose=True, abort_check=None):
+    def play(self, packets, verbose=True, abort_check=None, talking_ts=None):
         """UserTalking 之后先等 LEAD_DELAY（官方时序 0.5s，中继台靠该间隔建链），
         再匀速发包(120ms/包)→尾巴冲刷→上报停止说话→放麦→收回执。成功返回 True。
         必须在 take_mic() 之后调用。
+        talking_ts：抢麦完成（UserTalking 上报）时刻。传入时建链间隔**从该时刻起算**
+        （锚定 UserTalking：UserTalking→首包恒为 LEAD_DELAY）；None=从本次调用起算
+        （一步式场景 take_mic 后立即调用，等价于锚定 UserTalking）。
+        预建链场景 play 在准点才被调用，若不传 talking_ts 会叠加"等准点"时间，
+        把 UserTalking→首包 从 0.5s 拉长到 0.5s+(准点−抢麦完成)（往返快时实测 0.87s）。
         abort_check：每批发包前调用的回调（返回 True 表示信道被他人占用/抢台，
         立即停止发包并放麦让位，返回 False）。用于点名播报时检测他人讲话。
         发包循环内周期性 pump 下行：①保持他人抢台检测（abort_check 依赖
         下行 UserTalking 信令）；②busy 期间 socket 由本线程独占读取（keeper
         让位），非目标消息经 on_msg 转发给点名接收侧。"""
         c = self.c
+        wait = (talking_ts + LEAD_DELAY - time.time()) if talking_ts is not None else LEAD_DELAY
         if verbose:
-            print("延迟 %.0fms 后开始发包" % (LEAD_DELAY * 1000))
-        time.sleep(LEAD_DELAY)
+            print("延迟 %.0fms 后开始发包" % (max(0.0, wait) * 1000))
+        if wait > 0:
+            time.sleep(wait)
         start = time.time()
         n_sent = 0
         for i, pkt in enumerate(packets):     # 匀速 120ms/包（官方实时编码节奏，v6）

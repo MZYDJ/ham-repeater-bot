@@ -337,6 +337,7 @@ class _StdoutToLogger:
 _native_session = None     # direct_announce.DirectAnnouncer：已登录+已抢麦的会话
 _native_prebuilt = None    # (mp3路径, packets)：预构建的音频包
 _native_session_temp = False  # 预建会话是否临时短链（播完 close；常驻的只 release）
+_native_talk_ts = 0.0      # 抢麦完成（UserTalking 上报）时刻；play 据此锚定建链间隔（锚定 UserTalking 而非准点）
 _native_link = None        # direct_announce.PersistentAnnouncer：常驻直连链路
 _last_announce_ok = time.time()   # 最近一次成功播报的 wall-clock 时刻（看门狗判定用）
 _announce_ok_seen = False   # 是否已有成功播报（首播前看门狗豁免，防重启后误报）
@@ -441,7 +442,7 @@ def _native_prewarm():
        NATIVE_MIC_LEAD 才发起抢麦（不提前占麦）。常驻不可用时退化为临时短链
        （准点前 NATIVE_PREP_LEAD 建链），再不行留给准点现场流程兜底。
     启动场景（距准点尚远）只做 1。"""
-    global _native_session, _native_prebuilt, _native_session_temp
+    global _native_session, _native_prebuilt, _native_session_temp, _native_talk_ts
     if net_active():                         # 点名进行中：跳过整轮预热（含 TTS 预构建）
         logger.info("点名进行中，跳过预热")
         return
@@ -501,7 +502,8 @@ def _native_prewarm():
             time.sleep(mic_wait)
         with contextlib.redirect_stdout(_StdoutToLogger()):
             s.take_mic()                               # 抢麦+UserTalking（响应~1.1s）
-        logger.info(f"已抢麦，待 {nxt:%H:%M} 准点发包（play 再留 0.5s 建链间隔）")
+        _native_talk_ts = time.time()    # 记录 UserTalking 完成时刻：play 据此锚定建链间隔
+        logger.info(f"抢麦完成（UserTalking 已上报），play 按官方时序 0.5s 建链间隔后发包（锚定 UserTalking）")
     except Exception as e:
         logger.warning(f"抢麦失败（准点现场流程兜底）: {e}")
         if _native_session_temp:
@@ -510,11 +512,12 @@ def _native_prewarm():
         elif _native_link:
             _native_link.release()
         _native_session = None
-def _native_play(session, packets):
-    """消费预建会话发包（此刻即准点整）。异常抛给 announce_task 外层统一告警。"""
+def _native_play(session, packets, talking_ts=None):
+    """消费预建会话发包。play 锚定 UserTalking（抢麦完成时刻+LEAD_DELAY 才发首包，
+    官方时序恒定 0.5s，不因"等准点"拉长）。异常抛给 announce_task 外层统一告警。"""
     t0 = time.time()
     with contextlib.redirect_stdout(_StdoutToLogger()):
-        ok = session.play(packets)
+        ok = session.play(packets, talking_ts=talking_ts)
     if ok:
         logger.info(f"直连播报完成（预建链），耗时 {time.time() - t0:.1f} 秒")
     else:
@@ -561,7 +564,7 @@ def announce_task():
     announce_text = get_announce_text(now)
     logger.info(f"触发定时播报: {announce_text}")
     try:
-        global _native_session, _native_prebuilt, _native_session_temp
+        global _native_session, _native_prebuilt, _native_session_temp, _native_talk_ts
         # 播报现场仅 1 次合成机会（预热 XX:29/XX:59 已做过 3 次重试）：
         # 失败立即跳场，重试交给蓄水池后台每小时补——播报要么准点要么快速跳场，
         # 不被 TTS 抖动拖 75s（预热3次+现场3次=最长延迟 2.5min）。
@@ -571,14 +574,16 @@ def announce_task():
             logger.error("TTS音频文件无效，跳过本次播报")
             return
         _mark_tts_ok()            # 现场合成成功=TTS 已恢复：清除失败标记，防旧标记掩盖后续真假死
-        # 预建会话+预构建音频均就绪（预热任务准点前0.5s已发起抢麦，此刻刚完成）
-        # —— play() 内部再留 0.5s 建链间隔后发包，官方时序完整保留
+        # 预建会话+预构建音频均就绪（预热任务已在准点前抢麦完成，此刻 UserTalking 已上报）
+        # —— play 锚定 UserTalking（完成时刻+LEAD_DELAY 才发首包），官方时序恒定 0.5s
         if _native_session and _native_prebuilt and _native_prebuilt[0] == tts_file:
             s, packets = _native_session, _native_prebuilt[1]
             temp = _native_session_temp
+            talking_ts = _native_talk_ts
             _native_session = _native_prebuilt = None   # 先取走，防重入
+            _native_talk_ts = 0.0
             try:
-                _native_play(s, packets)
+                _native_play(s, packets, talking_ts)
                 _mark_announce_ok()
             finally:
                 if temp:                       # 临时短链：用完即弃
