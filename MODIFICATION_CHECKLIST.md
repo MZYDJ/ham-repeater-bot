@@ -26,10 +26,10 @@
 | P2 | 语法编译 | `python3 -m py_compile announce.py direct_announce.py net_control.py`（及改动的 py 文件） | 语法错误 |
 | P3 | 版本标记 | ①**重建镜像场景**：Dockerfile 已自动生成 `/opt/build_time`，无需手动；②**zip 覆盖场景**：打包前现场生成时间戳文件 `BUILD_TIME`（内容=`date '+%Y-%m-%d %H:%M'`，放入 zip 根，即容器 `/app/BUILD_TIME`） | 线上 BUILD_TIME 陈旧，无法判断跑的是哪版 |
 | P4 | 双分支提交+推送 | `feat/net-control`（点名版主线）+ `main`（纯播报版）各 commit + push（PAT 走 Bash+git，GitHub MCP 仅读不写） | 双分支不同步 |
-| P5 | zip 重打包 | `zip -r <包名>.zip announce.py direct_announce.py net_control.py config.example.json README.md tests/ start.sh Dockerfile docker-compose.yml MODIFICATION_CHECKLIST.md BUILD_TIME`（含全部仓库文件） | 服务器缺文件 |
-| P6 | present_files 交付 | 交付 zip 链接（https://aka.doubaocdn.com/...） | 用户拿不到新代码 |
-| P7 | 服务器覆盖重启 | 用户将 zip 内容覆盖 `/app`，重启容器 `docker restart announce` | 旧代码继续运行 |
-| P8 | 线上日志验证 | `docker logs announce --since "30s"` 检查：`[ENV] BUILD_TIME`（应为本次时间戳）、`[ENV] config.example.json: OK`、Scheduler started、首个准点播报完成 | 没验证=没交付完 |
+| P5 | 交付通道选择 | **push 成功 → 主交付 = GitHub 链接/commit hash，不出 zip**；用户服务器 `git pull` 同步（docker-compose 挂载宿主目录，pull 即覆盖 /app）。**仅当 GitHub push 失败（不可达/鉴权失败）→ 兜底打包 zip**：`zip -r <包>.zip $(git ls-files)` + `BUILD_TIME` 时间戳文件入根 | 用户拿不到新代码 |
+| P6 | present_files 交付 | push 成功：交付 commit hash + GitHub 链接（zip 可省）；push 失败：交付 zip 链接（https://aka.doubaocdn.com/...） | 用户拿不到新代码 |
+| P7 | 服务器更新重启 | push 通道：用户 `cd <宿主部署目录> && git pull && docker restart announce`；zip 通道：覆盖 `/app` 后重启 | 旧代码继续运行 |
+| P8 | 线上日志验证 | `docker logs announce --since "30s"` 检查：`[ENV] BUILD_TIME: /app=... \| /opt=... \| env=...`（应为本次时间戳）、`[ENV] config.example.json: OK`、Scheduler started、首个准点播报完成 | 没验证=没交付完 |
 
 ---
 
@@ -132,6 +132,7 @@
 
 ```bash
 docker logs announce --since "30s" | grep -E "BUILD_TIME|config.example|Scheduler started|自动播报服务启动成功"
+docker logs announce --since "30s" | grep "BUILD_TIME: /app="   # 三来源：/app=发布时间 | /opt=镜像构建 | env=旧镜像
 docker logs announce -f            # 盯到首个准点播报完成（XX:00 / XX:30）
 grep -c native_mic_lead /app/config.json   # 应输出 0（旧显式值已删）或 1.0
 ```

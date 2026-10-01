@@ -140,7 +140,14 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `net_control` | `summary_text` / `confirm_text` / `correct_text` | 总结 / 确认 / 纠错模板 |
 | `net_control` | `listen_after_open_seconds` / `max_net_seconds` / `quiet_end_seconds` / `grace_seconds` | 开场监听 / 最长台网 / 静默收尾 / 点名宽限（秒） |
 | `net_control` | `idle_call_seconds` / `current_idle_timeout` / `report_merge_gap_seconds` | 空闲催台间隔 / 当前台超时 / 信息合并间隔 |
-| `net_control` | `tx_wait_timeout` / `vad_threshold` / `silence_end_ms` / `min_segment_ms` / `max_segment_ms` | 发射等待 / VAD 阈值 / 静音切段 / 最小段 / 最大段 |
+| `net_control` | `current_idle_text` / `giveup_text` / `giveup_gap_seconds` | 当前台超时催台 / 多次无响应放弃文案 / 放弃判定间隔（默认 30s） |
+| `net_control` | `missing_ask_text` / `correct_confirm_text` | 缺信息追问 / 纠错确认文案模板 |
+| `net_control` | `tx_wait_timeout` / `vad_threshold` / `vad_idle_seconds` / `talking_stale_seconds` | 发射等待 / VAD 阈值 / VAD 空闲判定（默认 2s）/ 讲话状态过期（默认 4s） |
+| `net_control` | `min_segment_ms` / `max_segment_ms` / `silence_end_ms` / `seg_grace_seconds` / `echo_holdoff_seconds` / `echo_segment_max_seconds` | 最小/最大段 / 静音切段（默认 3000ms）/ 段间宽限（默认 3s）/ 回声抑制保持（默认 1.5s）/ 回声段上限（默认 1.5s） |
+| `net_control` | `spell_gap_seconds` / `spell_min_score` | 呼号拼读间隔（默认 4s）/ 拼读最低分（默认 80） |
+| `net_control` | `max_checked_in` | 台网最大抄收人数（默认 200） |
+| `net_control` | `play_watchdog_seconds` | 发射线程看门狗（默认 90s，超时强制断开卡死会话） |
+| `net_control` | `tts_cache_dir` | 点名 TTS 缓存目录（默认同 tts 缓存 /app/tts_cache） |
 | `net_control` | `ptt_bound_mode` / `ptt_release_delay_ms` / `use_talking_gate` / `asr_min_seconds` | PTT 边界 / 放麦延迟 / 讲话闸门 / ASR 最小时长 |
 | `net_control` | `callsign_regex` / `confidence_threshold` / `max_retry` / `extra_vocab` | 呼号正则 / 置信度 / ASR 重试 / 附加词表 |
 | `net_control` | `save_audio` / `audio_dir` | 存盘（点名录音目录，默认 /app/net_records） |

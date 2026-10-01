@@ -9,10 +9,14 @@ echo "[ENV] Python: $(python3 --version 2>&1)"
 echo "[ENV] edge-tts: $(python3 -c 'import edge_tts; print(edge_tts.__version__)' 2>&1 || echo '未安装')"
 echo "[ENV] APScheduler: $(python3 -c 'import apscheduler; print(apscheduler.__version__)' 2>&1 || echo '未安装')"
 echo "[ENV] dashscope: $(python3 -c 'import dashscope; print(dashscope.__version__)' 2>&1 || echo '未安装！CosyVoice 点名/播报 TTS 需此依赖，请重建镜像或 pip install dashscope>=1.18')"
-echo "[ENV] BUILD_TIME: $(cat /app/BUILD_TIME 2>/dev/null || cat /opt/build_time 2>/dev/null || echo ${BUILD_TIME:-unknown})"
-# 说明：zip 覆盖部署（不重建镜像）时读随 zip 发布的 /app/BUILD_TIME（发布动作现场生成）；
-# 重建镜像场景读 Dockerfile 构建时生成的 /opt/build_time（自动取构建当天）；旧镜像兼容
-# 兜底读环境变量 BUILD_TIME。优先级：/app/BUILD_TIME > /opt/build_time > 环境变量 > unknown
+# 构建/发布时间标记（三个来源全部列出，便于诊断线上跑的是哪版）：
+#   /app/BUILD_TIME   zip 覆盖部署时由发布动作写入（发布时间）
+#   /opt/build_time   Dockerfile 构建时自动生成（镜像构建时间）
+#   环境变量 BUILD_TIME  旧镜像兼容（docker-compose build.args 历史注入）
+BT_FILE="$(cat /app/BUILD_TIME 2>/dev/null || echo -)"
+BT_IMG="$(cat /opt/build_time 2>/dev/null || echo -)"
+BT_ENV="${BUILD_TIME:--}"
+echo "[ENV] BUILD_TIME: /app=${BT_FILE} | /opt=${BT_IMG} | env=${BT_ENV}"
 # 直连链路音频编解码库自检（缺失则起服务也必然播报失败，fail-fast）
 echo "[ENV] libopus: $(python3 -c 'import ctypes.util; print("OK" if ctypes.util.find_library("opus") else "缺失!")' 2>&1)"
 echo "[ENV] libmpg123: $(python3 -c 'import ctypes.util; print("OK" if ctypes.util.find_library("mpg123") else "缺失!")' 2>&1)"
