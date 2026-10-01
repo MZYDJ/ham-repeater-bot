@@ -181,10 +181,15 @@ def _mark_net_skip(now: datetime.datetime):
     else:
         cand = cand.replace(minute=30)
     _last_net_skip_ts = cand.timestamp()
-def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) -> str:
+def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
+                 skip_validate: bool = False) -> str:
     """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试。
     注：定时播报/蓄水池/预热走本函数（Edge-TTS）；点名走 net_control.synth_text
-    （tts.engine 可配 CosyVoice/Edge）。两者引擎相互独立、互不影响。"""
+    （tts.engine 可配 CosyVoice/Edge）。两者引擎相互独立、互不影响。
+    skip_validate=True：缓存存在时跳过 dry_validate 直接返回（调用方须保证该文件
+    已完整验证过——announce_task 预建链分支使用：命中预建链=预热已合成+预构建成功
+    （mp3 已完整解码编码过），现场重复校验是 ~0.4s 冗余开销，且会把 play 调用
+    拖到 talking_ts+LEAD_DELAY 之后，导致 wait≤0、UserTalking→首包无法回到 0.5s）。"""
     if max_retries is None:
         max_retries = TTS_MAX_RETRIES
     if retry_delay is None:
@@ -194,7 +199,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
     # 缓存命中时用 libmpg123 完整解码 dry-run 校验（识别头部损坏+尾部截断不完整），
     # 空/损坏/残缺（时长不足）文件视为无效，删除后重新合成
     if cache_path.exists():
-        if direct_announce.dry_validate_mp3(cache_path, min_seconds=min_secs):
+        if skip_validate or direct_announce.dry_validate_mp3(cache_path, min_seconds=min_secs):
             return str(cache_path)
         logger.warning(f"TTS缓存文件损坏或残缺（dry-validate失败，需≥{min_secs:.0f}s），将重新合成: {cache_path.name}")
         cache_path.unlink()
@@ -568,7 +573,11 @@ def announce_task():
         # 播报现场仅 1 次合成机会（预热 XX:29/XX:59 已做过 3 次重试）：
         # 失败立即跳场，重试交给蓄水池后台每小时补——播报要么准点要么快速跳场，
         # 不被 TTS 抖动拖 75s（预热3次+现场3次=最长延迟 2.5min）。
-        tts_file = get_tts_file(announce_text, max_retries=1)
+        tts_file = get_tts_file(announce_text, max_retries=1, skip_validate=True)
+        # 预建链分支会命中同一文件（预热已合成+预构建成功=已完整验证过），
+        # skip_validate 省掉 ~0.4s 现场 dry-run，保证 play 调用早于 talking_ts+LEAD_DELAY
+        # （否则 wait≤0 立即发包，UserTalking→首包 无法回到官方 0.5s）。
+        # 若缓存缺失/合成失败，skip_validate 自动回退正常合成+校验流程。
         if not tts_file:
             _mark_tts_fail()      # 现场失败=播报确实被 TTS 挡住：看门狗"只告警不重启"的唯一依据
             logger.error("TTS音频文件无效，跳过本次播报")

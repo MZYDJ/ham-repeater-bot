@@ -159,6 +159,20 @@ def test_get_tts_file():
         r = A.get_tts_file("t", max_retries=3, retry_delay=0)
     check("合成重试3次最终失败→空", r == "", r)
 
+    # skip_validate=True：缓存存在时跳过 dry_validate 直接返回（预建链现场专用，
+    # 省 ~0.4s 解码校验，保证 play 调用早于 talking_ts+LEAD_DELAY）
+    cache.write_bytes(b"fake-mp3")
+    with mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False) as dv:
+        r = A.get_tts_file(text, max_retries=1, retry_delay=0, skip_validate=True)
+    check("skip_validate 跳过校验直接返回", r == str(cache) and not dv.called, r)
+
+    # skip_validate=True 但缓存缺失 → 回退正常合成（合成失败→空，不静默返回假路径）
+    cache.unlink(missing_ok=True)
+    with mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
+            mock.patch("announce.time.sleep", return_value=None):
+        r = A.get_tts_file(text, max_retries=1, retry_delay=0, skip_validate=True)
+    check("skip_validate 缓存缺失→正常合成流程", r == "", r)
+
 # ============ 第三部分：蓄水池/预热 ============
 def test_prefill_and_prewarm_sched():
     print("\n=== 蓄水池 tts_prefill_task / prepare_next_tts / schedule_× ===")
