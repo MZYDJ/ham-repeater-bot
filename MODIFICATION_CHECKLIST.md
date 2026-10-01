@@ -51,18 +51,39 @@
 2. 按 1.2 判定改动类别：点名相关 → **不同步**，结束；播报核心修复 → 进入 3。
 3. **混合 commit 一律禁止整体 cherry-pick**（历史教训：`9197bed` 一个 commit 同时改
    announce/direct_announce/net_control，整体同步会把点名部分倒进 main）。混合 commit
-   只摘取其**播报相关的文件级改动**（必要时手工拆分后逐文件应用）。
-4. 同步前先评估冲突面：`git diff <main> <feat> -- <涉及文件>`——main 定格线很老
-   （7d3432b 无 tests/config.example），feat 演进大，**cherry-pick 几乎必然冲突**
-   （实测首个播报 commit 即 announce.py 自动合并失败）。处理路径二选一：
+   按以下命令序列只摘**播报相关文件级改动**：
+   ```bash
+   git cherry-pick -n <sha>            # 应用全部改动到暂存区（不提交）
+   git checkout main -- <点名文件>     # 还原点名专属文件（如 net_control.py）
+   git diff --cached --stat            # 核对剩余暂存内容全部播报相关
+   git commit -m "fix: <播报部分>（来自 <sha> 混合 commit 拆分）"
+   ```
+   共享文件（announce.py / direct_announce.py / start.sh）按 §1.2 逐文件判定：播报部分保留、
+   点名段还原。
+4. 同步前先评估冲突面（**注意：`git diff main feat` 是全量累积差异——72 个 commit、announce.py
+   单文件 586 行，不能用来评估单个修复的冲突**）。正确做法：
+   ```bash
+   git show <sha> --stat               # ① 看该改动本身改了什么
+   git cherry-pick -n <sha>            # ② 试应用，实际冲突一目了然（冲突即停）
+   git cherry-pick --abort             # ③ 试完回滚，再决定怎么走
+   ```
+   main 定格线很老（7d3432b 无 tests/config.example），feat 演进大，**cherry-pick 几乎必然
+   冲突**（实测首个播报 commit 即 announce.py 自动合并失败）。处理路径二选一：
    - 冲突小 → cherry-pick 后手工解冲突；
    - 冲突大 → **手工移植**（按 1.2 判定逐文件摘播报改动），或**明确"不同步"**——
      "不同步"是合法决策，不为了同步而同步。
-5. 同步后强制复核：`git diff main feat/net-control --stat`——差异**只应**存在于点名相关文件
-   （net_control.py / capture_downlink.py / tests/test_session.py / announce.py 点名段 /
-   start.sh cosyvoice 段 / config.example net_control 段 / README 点名段）。
+5. 同步后强制复核（**单向检查：main 侧必须无点名内容**；"差异仅限点名文件"是双向对称表述，
+   在 main 定格未同步播报修复时永远不成立，弃用）：
+   ```bash
+   git ls-tree main --name-only | grep -E "net_control|capture"   # 应无输出（无点名文件）
+   git show main:announce.py | grep -cE "net_control|点名"        # 应为 0（无点名集成）
+   ```
 6. main 无独立测试套件（定格线 7d3432b 不含 tests/ 目录）——同步播报修复时必须**将对应
    测试一并带入**，否则 main 无回归保护；带入后跑 main 侧测试子集（不含点名用例）。
+
+> ⚠️ 共享文件备注：`start.sh` 的 `engine` 默认值为 `cosyvoice`（点名 TTS 默认落在共享文件里）。
+> 同步 start.sh 播报相关部分时，cosyvoice 自检段（engine/asr_key/cosyvoice_voice 检查）属点名
+> 驱动，按 §1.2 不同步；main 定格线的 start.sh 无此段，不受影响。
 
 ### 1.4 分支级操作纪律（恢复/定格/force push）
 分支恢复、定格、force push 均为**不可逆**动作，动工前必须：
@@ -170,8 +191,8 @@
 - [ ] 服务器 `/app/config.json` 无显式旧值覆盖新默认（尤其 timing.native_mic_lead 曾为 0.5）
 - [ ] BUILD_TIME 已更新（zip 包内带新时间戳文件；重建镜像则 Dockerfile 自动生成）
 - [ ] `.gitignore` 含 `.logs/`、`BUILD_TIME`、`config.json`（防运行时文件误提交）
-- [ ] main 定格线检查（按 §1）：本次改动是否点名驱动？是 → 确认**未** push main；播报核心修复 → 已按 §1.3 处理（混合 commit 已拆分、冲突已评估）且 `git diff main feat` 差异仅限点名文件
-- [ ] **混合 commit 拆分检查**：本次涉及同步的 commit 若同时含点名改动（如 announce+net_control 同 commit），已确认**未整体 cherry-pick**，播报部分为逐文件摘取
+- [ ] main 定格线检查（按 §1）：本次改动是否点名驱动？是 → 确认**未** push main；播报核心修复 → 已按 §1.3 处理（混合 commit 已拆分、冲突已试应用评估）且**单向复核通过**（`git ls-tree main` 无 net_control/capture，`announce.py` 点名引用为 0）
+- [ ] **混合 commit 拆分检查**：本次涉及同步的 commit 若同时含点名改动（如 announce+net_control 同 commit），已确认**未整体 cherry-pick**，播报部分为逐文件摘取（命令序列见 §1.3-3）
 - [ ] zip 内不含 `.git/`、`.logs/`、`__pycache__/` 等运行时目录
 
 ---
