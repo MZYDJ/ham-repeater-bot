@@ -49,6 +49,8 @@ _CFG_TEMPLATE = {
     "paths": {"cache_dir": str(Path(_tmp_root) / "cache"),
               "log_dir": str(Path(_tmp_root) / "logs")},
     "notify": {"webhook_url": ""},
+    # Existing Edge-TTS tests explicitly select their intended engine.
+    "tts": {"engine": "edge"},
     "announce": {"template": "现在是{year}年{month}月{day}日{weekday}，{hour}点{minute_text}。测试播报",
                  "start_hour": 7, "end_hour": 22},
     "watchdog": {"slot_tolerance_seconds": 900, "tts_fail_window_seconds": 1800},
@@ -130,6 +132,58 @@ def test_tts_cache():
     check("tts_cache_path md5 文件名", p.name.endswith(".mp3") and len(p.stem) == 32, str(p))
     check("_tts_min_seconds 按长度估算", A._tts_min_seconds("x" * 100) >= 2.0)
     check("_tts_min_seconds 最短2s", A._tts_min_seconds("短") == 2.0)
+
+def test_cosyvoice_announcement_path():
+    print("\n=== 定时播报复用 CosyVoice ===")
+    original_cfg_get = A.cfg_get
+
+    def _cosyvoice_cfg(*path, default=None):
+        if path == ("tts", "engine"):
+            return "cosyvoice"
+        return original_cfg_get(*path, default=default)
+
+    import hashlib
+    text = "CosyVoice 定时播报测试"
+    cache = Path(A.CACHE_DIR) / ("nc_" + hashlib.md5(text.encode("utf-8")).hexdigest() + ".mp3")
+    cache.unlink(missing_ok=True)
+    calls = []
+
+    def _fake_synth(text_arg, voice=None, cache_dir=None, **kwargs):
+        calls.append((text_arg, voice, cache_dir, kwargs))
+        target = Path(cache_dir) / ("nc_" + hashlib.md5(text_arg.encode("utf-8")).hexdigest() + ".mp3")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"fake-mp3")
+        return str(target)
+
+    fake_nc = types.SimpleNamespace(synth_text=_fake_synth)
+    with mock.patch("announce.cfg_get", side_effect=_cosyvoice_cfg), \
+            mock.patch.dict(sys.modules, {"net_control": fake_nc}), \
+            mock.patch("announce.direct_announce.dry_validate_mp3", return_value=True):
+        p = A.tts_cache_path(text)
+        result = A.get_tts_file(text, max_retries=1, retry_delay=0)
+    check("CosyVoice 使用共享 nc_ 缓存", p.name.startswith("nc_") and result == str(p), str(p))
+    check("调用点名系统 synth_text", len(calls) == 1 and calls[0][0] == text
+          and calls[0][2] == A.CACHE_DIR, str(calls))
+    check("CosyVoice 传递单次内部重试", calls and calls[0][3].get("max_retries") == 1
+          and calls[0][3].get("retry_delay") == 0, str(calls))
+    cache.unlink(missing_ok=True)
+
+    # Short/invalid audio must be deleted and retried, not reused as a valid cache hit.
+    calls.clear()
+    def _fake_short_synth(text_arg, voice=None, cache_dir=None, **kwargs):
+        calls.append(text_arg)
+        target = Path(cache_dir) / ("nc_" + hashlib.md5(text_arg.encode("utf-8")).hexdigest() + ".mp3")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"short")
+        return str(target)
+    fake_nc.synth_text = _fake_short_synth
+    with mock.patch("announce.cfg_get", side_effect=_cosyvoice_cfg), \
+            mock.patch.dict(sys.modules, {"net_control": fake_nc}), \
+            mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
+            mock.patch("announce.time.sleep", return_value=None):
+        result = A.get_tts_file(text, max_retries=2, retry_delay=0)
+    check("短音频删除并重试后失败返回空", result == "" and len(calls) == 2 and not cache.exists(),
+          f"result={result}, calls={len(calls)}, exists={cache.exists()}")
 
 def test_get_tts_file():
     print("\n=== get_tts_file（缓存命中/损坏重合成/最终失败）===")
@@ -644,6 +698,7 @@ def test_da_pure():
 if __name__ == "__main__":
     test_text_time_pure()
     test_tts_cache()
+    test_cosyvoice_announcement_path()
     test_get_tts_file()
     test_prefill_and_prewarm_sched()
     test_native_link()
