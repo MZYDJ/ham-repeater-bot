@@ -17,7 +17,7 @@ if ! python3 -c 'import apscheduler' 2>/dev/null; then
 fi
 echo "[ENV] edge-tts: $(python3 -c 'import edge_tts; print(edge_tts.__version__)' 2>&1)"
 echo "[ENV] APScheduler: $(python3 -c 'import apscheduler; print(apscheduler.__version__)' 2>&1)"
-echo "[ENV] dashscope: $(python3 -c 'import dashscope; print(dashscope.__version__)' 2>&1 || echo '未安装！仅当点名启用且 tts.engine=cosyvoice 时必需（start.sh 会条件性 fail-fast）')"
+echo "[ENV] dashscope: $(python3 -c 'import dashscope; print(dashscope.__version__)' 2>&1 || echo '未安装（CosyVoice 将自动回退 HTTP 接口）')"
 # 构建/发布时间标记（三个来源全部列出，便于诊断线上跑的是哪版）：
 #   /app/BUILD_TIME   zip 覆盖部署时由发布动作写入（发布时间）
 #   /opt/build_time   Dockerfile 构建时自动生成（镜像构建时间）
@@ -69,22 +69,18 @@ if not has("talk", "username") or not has("talk", "password"):
 # 必填②：播报模板（空模板=播报内容为空）
 if not has("announce", "template"):
     fail("announce.template 未配置——播报文案为空，播报无意义。")
-# 条件必填：点名启用且走 CosyVoice 引擎时，其依赖缺失=点名必然失败
+# 定时播报与点名共用 TTS：CosyVoice 为默认引擎，因此无论点名是否启用都必须检查密钥和音色。
+# DashScope SDK 缺失时 net_control.synth_text 会回退 HTTP，不将 SDK 当作硬依赖。
 engine = (cfg.get("tts") or {}).get("engine", "cosyvoice")
-net_enabled = has("net_control", "enabled")
-if net_enabled and engine == "cosyvoice":
+if engine == "cosyvoice":
     asr_key = (cfg.get("net_control", {}).get("asr", {}).get("api_key")
                or (cfg.get("asr") or {}).get("api_key"))
     if not asr_key:
-        fail("net_control.enabled=true 且 tts.engine=cosyvoice，但 asr.api_key 缺失——点名 TTS 必然失败。")
+        fail("tts.engine=cosyvoice，但 net_control.asr.api_key（或顶层 asr.api_key）缺失——定时播报/点名 TTS 无法合成。")
     if not has("tts", "cosyvoice_voice"):
-        fail("net_control.enabled=true 且 tts.engine=cosyvoice，但 tts.cosyvoice_voice 缺失——点名 TTS 必然失败。")
+        fail("tts.engine=cosyvoice，但 tts.cosyvoice_voice 缺失——定时播报/点名 TTS 无法合成。")
     if not has("tts", "cosyvoice_model"):
         print("[INFO] tts.cosyvoice_model 未配置，将使用默认 cosyvoice-v3.5-flash。")
-    try:
-        import dashscope
-    except ImportError:
-        fail("net_control.enabled=true 且 tts.engine=cosyvoice，但 dashscope 未安装——点名 TTS 必然失败，请重建镜像或 pip install dashscope>=1.18。")
 else:
     if not has("tts", "voice"):
         print("[WARN] tts.engine=edge 但 tts.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
