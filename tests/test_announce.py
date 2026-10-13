@@ -142,6 +142,10 @@ def test_cosyvoice_announcement_path():
             return "cosyvoice"
         if path == ("tts", "engine"):
             return "edge"  # 点名引擎不同，定时播报必须尊重独立配置
+        if path == ("announce", "voice"):
+            return "zh-CN-XiaoxiaoNeural"
+        if path == ("announce", "cosyvoice_rate"):
+            return 1.2
         return original_cfg_get(*path, default=default)
 
     import hashlib
@@ -167,9 +171,10 @@ def test_cosyvoice_announcement_path():
     check("定时播报 CosyVoice 使用独立 announce_ 缓存",
           p.name.startswith("announce_") and result == str(p), str(p))
     check("调用点名系统 synth_text", len(calls) == 1 and calls[0][0] == text
-          and calls[0][2] == A.CACHE_DIR, str(calls))
+          and calls[0][1] == "zh-CN-XiaoxiaoNeural" and calls[0][2] == A.CACHE_DIR, str(calls))
     check("显式传入独立引擎/缓存前缀", calls and calls[0][3].get("engine") == "cosyvoice"
           and calls[0][3].get("cache_prefix") == "announce_", str(calls))
+    check("定时播报独立语速覆盖", calls and calls[0][3].get("cosyvoice_rate") == 1.2, str(calls))
     check("CosyVoice 传递单次内部重试", calls and calls[0][3].get("max_retries") == 1
           and calls[0][3].get("retry_delay") == 0, str(calls))
     cache.unlink(missing_ok=True)
