@@ -31,7 +31,7 @@ TALK_USERNAME = cfg_get("talk", "username", default="")
 TALK_PASSWORD = cfg_get("talk", "password", default="")
 
 # TTS 配置
-TTS_VOICE = cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
+TTS_VOICE = cfg_get("announce", "voice", default="zh-CN-XiaoxiaoNeural")
 TTS_TIMEOUT_INNER = cfg_get("tts", "timeout_inner", default=28)   # 内层协程超时（秒）
 TTS_TIMEOUT_JOIN = cfg_get("tts", "timeout_join", default=30)     # 外层线程 join 超时（秒）
 TTS_MAX_RETRIES = cfg_get("tts", "max_retries", default=3)
@@ -48,7 +48,7 @@ LOG_DIR = cfg_get("paths", "log_dir", default=r"/app/logs")
 LOG_MAX_BYTES = cfg_get("logging", "max_bytes", default=0.25 * 1024 * 1024)
 LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
-TTS_PREFILL_HOURS = cfg_get("tts", "prefill_hours", default=48)
+TTS_PREFILL_HOURS = cfg_get("announce", "prefill_hours", default=48)
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
 NATIVE_MIC_LEAD = cfg_get("timing", "native_mic_lead", default=0.5)
 
