@@ -162,6 +162,14 @@
 
 ## 3. 修改类型 → 检查点矩阵
 
+### TTS 引擎配置隔离（定时播报与点名）
+- [ ] `tts.engine` 仅控制点名系统；定时播报独立读取 `announce.tts_engine`，缺省必须为 `edge`。
+- [ ] 定时播报切换引擎时，不得改变点名引擎；两套系统缓存前缀隔离（点名 `nc_`，定时播报 CosyVoice `announce_`）。
+- [ ] `start.sh` 分别校验两个引擎的取值；只有任一系统启用 CosyVoice 时才要求百炼密钥与音色。
+- [ ] `tests/test_announce.py` 覆盖两个引擎配置互相冲突时定时播报仍遵循 `announce.tts_engine`。
+
+
+
 > 分支归属：A/B/C/E/F/G/H/I 中**影响播报执行链**的部分 → 按 §1 同步 main（cherry-pick）；
 > **D（点名）→ 仅 feat，任何情况下不同步 main**；点名驱动落在共享文件里的改动也按 §1.2 不同步。
 
