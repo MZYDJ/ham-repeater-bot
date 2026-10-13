@@ -9,7 +9,7 @@
 - **常驻链路**：后台线程 Ping 保活 + 下行流量泵，服务器视角与长在线的真实用户一致
 - **准点对齐**：播报前一分钟预热（TTS 预合成 + 音频包预构建 + 预建链），准点前 0.5s 才抢麦（不提前占用信道），首包紧贴整点发出
 - **三级兜底**：常驻链路 → 临时短链 → 准点现场完整流程，任一环节故障自动降级，播报不中断
-- **TTS 蓄水池**：每小时预合成未来 48 小时所有播报时段的音频，默认复用点名系统的 CosyVoice；准点播报不依赖播报时刻的 TTS 服务网络状态
+- **TTS 蓄水池**：每小时预合成未来 48 小时所有播报时段的音频；定时播报默认微软 Edge-TTS，可独立切换 CosyVoice，不会跟随点名引擎配置
 - **音频质量保障**：TTS 缓存经 libmpg123 完整解码 dry-run 校验（拦截头部损坏/尾部截断），播报前头尾静音自动裁切
 - **企业微信告警**：日志达到指定级别时自动推送到企业微信群机器人（配置中留空即禁用）
 - **轻量运行**：仅依赖 libopus0/libmpg123-0 两个系统库（ctypes 直调），无 pip 重型依赖
@@ -49,14 +49,15 @@ vi config.json                       # 编辑你的参数
     "password": "你的滔滔链路密码"    // 必填
   },
   "tts": {
-    "engine": "cosyvoice",
+    "engine": "cosyvoice", // 仅控制点名系统
     "cosyvoice_model": "cosyvoice-v3.5-flash",
-    "cosyvoice_voice": "你的百炼音色ID" // 必填：百炼控制台中可用的音色 ID
+    "cosyvoice_voice": "你的百炼音色ID" // 点名或播报选择 CosyVoice 时必填
   },
   "net_control": {
     "asr": { "api_key": "你的DashScope API Key" } // CosyVoice 密钥；点名关闭时也需要
   },
   "announce": {
+    "tts_engine": "edge", // 仅控制定时播报：edge（默认）或 cosyvoice
     "template": "CQ CQ CQ，现在是{year}年{month}月{day}日……",  // 播报内容（中继台呼号/频率/亚音）
     "start_hour": 7,  // 每日首次播报时刻
     "end_hour": 22    // 每日最后一次播报所在小时
@@ -66,7 +67,7 @@ vi config.json                       # 编辑你的参数
   }
 }
 ```
-如果只想使用 Edge-TTS，将 `tts.engine` 设为 `edge`，并可配置 `tts.voice`；此时不需要 CosyVoice 的 API Key 和音色 ID。
+`tts.engine` 只控制点名系统，`announce.tts_engine` 只控制定时播报。定时播报默认 `edge`，保持原有微软 Edge-TTS 行为；如需切换播报引擎，只修改 `announce.tts_engine` 为 `cosyvoice`，不会改变点名引擎。任一系统使用 CosyVoice 时需要配置百炼 API Key 和 `tts.cosyvoice_voice`。
 ### 3. 启动服务
 #### 方式一：命令行启动（Linux / macOS）
 ```bash
@@ -125,7 +126,8 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `talk` | `host` / `port` | 滔滔链路服务器地址与端口（默认 totalkd.allptt.com:59638） |
 | `talk` | `username` / `password` | 滔滔链路账号（必填） |
 | `talk.client_profile` | `release` / `os_name` / `os_version` / `model` | 客户端画像（对齐真实手机 App，UserState 广播用） |
-| `tts` | `engine` | 播报与点名共用的 TTS 引擎（cosyvoice / edge，默认 cosyvoice） |
+| `tts` | `engine` | 点名系统的 TTS 引擎（cosyvoice / edge，默认 cosyvoice；不控制定时播报） |
+| `announce` | `tts_engine` | 定时播报 TTS 引擎（edge / cosyvoice，默认 edge；不控制点名） |
 | `tts` | `voice` | Edge-TTS 语音角色（默认 zh-CN-XiaoxiaoNeural） |
 | `tts` | `cosyvoice_sdk` / `cosyvoice_model` / `cosyvoice_voice` | CosyVoice 引擎（DashScope SDK 模式 / 模型 / 音色名） |
 | `tts` | `timeout_inner` / `timeout_join` | TTS 协程/线程超时（秒） |
