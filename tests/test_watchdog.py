@@ -43,6 +43,8 @@ if "edge_tts" not in sys.modules:
 _CFG_TEMPLATE = {
     "paths": {"cache_dir": ".cache", "log_dir": ".logs"},
     "notify": {"webhook_url": ""},
+    # I1 explicitly mocks Edge-TTS failure; pin the engine to Edge instead of relying on production default.
+    "tts": {"engine": "edge"},
     "watchdog": {"slot_tolerance_seconds": 900, "tts_fail_window_seconds": 1800},
 }
 _tmp_cfg = tempfile.mktemp(suffix=".json")
