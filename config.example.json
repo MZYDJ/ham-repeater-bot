@@ -16,11 +16,13 @@
         "engine": "cosyvoice",
         "cosyvoice_sdk": true,
         "cosyvoice_model": "cosyvoice-v3.5-flash",
-        "cosyvoice_voice": "",
-        "voice": "zh-CN-XiaoxiaoNeural"
+        "cosyvoice_voice": ""
     },
     "announce": {
         "tts_engine": "edge",
+        "voice": "zh-CN-XiaoxiaoNeural",
+        "cosyvoice_rate": 1.2,
+        "prefill_hours": 48,
         "template": "CQ CQ CQ，现在是{year}年{month}月{day}日，{weekday}，{hour}点{minute_text}。这里是示例市业余无线电中继台B阿九AB，本中继下行频率 4三9.625 兆赫，上行频率 4三2.575 兆赫，叉频 负 7.05 兆赫。单上行接入亚音为模拟 88.5 赫兹。请规范用频，保持信道畅通。完毕",
         "start_hour": 7,
         "end_hour": 22
