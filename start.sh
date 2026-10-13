@@ -88,6 +88,8 @@ if "cosyvoice" in (point_engine, announce_engine):
     if not has("tts", "cosyvoice_model"):
         print("[INFO] tts.cosyvoice_model 未配置，将使用默认 cosyvoice-v3.5-flash。")
 if point_engine == "edge" or announce_engine == "edge":
+    if point_engine == "edge" and not has("tts", "voice"):
+        print("[WARN] 点名系统 Edge-TTS 已启用但 tts.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
     if announce_engine == "edge" and not has("announce", "voice"):
         print("[WARN] 定时播报 Edge-TTS 已启用但 announce.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
 # 正式配置 config.json 已在上方 fail-fast（读取/账号/模板/点名条件全覆盖），
