@@ -16,7 +16,8 @@
         "engine": "cosyvoice",
         "cosyvoice_sdk": true,
         "cosyvoice_model": "cosyvoice-v3.5-flash",
-        "cosyvoice_voice": ""
+        "cosyvoice_voice": "",
+        "voice": "zh-CN-XiaoxiaoNeural"
     },
     "announce": {
         "tts_engine": "edge",
