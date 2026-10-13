@@ -878,7 +878,7 @@ def _cosyvoice_audio_format(fmt, sample_rate):
     return AudioFormat.MP3_24000HZ_MONO_256KBPS
 
 
-def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
+def _cosyvoice_synth_sdk(text, cache_path, timeout=28, rate_override=None):
     """阿里云百炼 CosyVoice 官方 SDK 合成（dashscope.audio.tts_v2.SpeechSynthesizer，
     WebSocket 流式，与官方示例一致；首包延迟低，支持 cosyvoice-v3.5-plus/flash 复刻音色）。
     写入 mp3 文件。复用 asr.api_key；模型/音色见 tts.cosyvoice_*。
@@ -900,7 +900,8 @@ def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
     fmt = direct_announce.cfg_get("tts", "cosyvoice_format", default="mp3")
     sr = int(direct_announce.cfg_get("tts", "cosyvoice_sample_rate", default=24000))
     vol = int(direct_announce.cfg_get("tts", "cosyvoice_volume", default=50))
-    rate = float(direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0))
+    rate = float(rate_override if rate_override is not None else
+                 direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0))
     pitch = float(direct_announce.cfg_get("tts", "cosyvoice_pitch", default=1.0))
     try:                                  # 新签名（1.2x+）：AudioFormat 枚举 + speech_rate/pitch_rate
         synthesizer = SpeechSynthesizer(
@@ -921,7 +922,7 @@ def _cosyvoice_synth_sdk(text, cache_path, timeout=28):
     cache_path.write_bytes(audio)
 
 
-def _cosyvoice_synth(text, cache_path, timeout=28):
+def _cosyvoice_synth(text, cache_path, timeout=28, rate_override=None):
     """阿里云百炼 CosyVoice HTTP 接口合成（兜底，SDK 不可用时使用），写入 mp3 文件。
     复用 asr.api_key（同一百炼账号、独立免费额度）；模型/音色见 tts.cosyvoice_*。
     - cosyvoice-v3.5-flash/v3.5-plus 仅华北2（北京）地域可用，且无系统音色，
@@ -951,8 +952,8 @@ def _cosyvoice_synth(text, cache_path, timeout=28):
                 "tts", "cosyvoice_sample_rate", default=24000)),
             "volume": int(direct_announce.cfg_get(
                 "tts", "cosyvoice_volume", default=50)),
-            "rate": float(direct_announce.cfg_get(
-                "tts", "cosyvoice_rate", default=1.0)),
+            "rate": float(rate_override if rate_override is not None else
+                          direct_announce.cfg_get("tts", "cosyvoice_rate", default=1.0)),
             "pitch": float(direct_announce.cfg_get(
                 "tts", "cosyvoice_pitch", default=1.0)),
         },
@@ -978,7 +979,8 @@ def _cosyvoice_synth(text, cache_path, timeout=28):
 
 
 def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=30,
-               max_retries=2, retry_delay=5.0, engine=None, cache_prefix="nc_"):
+               max_retries=2, retry_delay=5.0, engine=None, cache_prefix="nc_",
+               cosyvoice_rate=None):
     """点名 TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
     tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice：优先官方 SDK（tts_v2 WebSocket，
     与官方示例一致），SDK 未安装时自动回退 HTTP 接口；复用 asr.api_key。
@@ -1002,11 +1004,13 @@ def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=
                 if engine == "cosyvoice":
                     if direct_announce.cfg_get("tts", "cosyvoice_sdk", default=True):
                         try:
-                            _cosyvoice_synth_sdk(text, cache_path, timeout=timeout_inner)
+                            _cosyvoice_synth_sdk(text, cache_path, timeout=timeout_inner,
+                                                 rate_override=cosyvoice_rate)
                             return
                         except ImportError:
                             logger.warning("dashscope SDK 未安装，点名 TTS 回退 HTTP 接口")
-                    _cosyvoice_synth(text, cache_path, timeout=timeout_inner)
+                    _cosyvoice_synth(text, cache_path, timeout=timeout_inner,
+                                         rate_override=cosyvoice_rate)
                 else:
                     import asyncio
                     import edge_tts
