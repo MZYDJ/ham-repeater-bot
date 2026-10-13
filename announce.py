@@ -150,8 +150,14 @@ def get_announce_text(now: datetime.datetime) -> str:
         minute_text=format_minute_text(now.minute)
     )
 def tts_cache_path(text: str) -> Path:
-    """TTS 缓存文件路径（以播报文本 md5 为键）"""
-    return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
+    """TTS 缓存文件路径（以播报文本 md5 为键）。
+
+    CosyVoice 模式与点名共用 nc_ 前缀缓存，避免重复合成；Edge 模式保留旧路径。
+    """
+    digest = hashlib.md5(text.encode('utf-8')).hexdigest()
+    if cfg_get("tts", "engine", default="cosyvoice") == "cosyvoice":
+        return Path(CACHE_DIR) / f"nc_{digest}.mp3"
+    return Path(CACHE_DIR) / f"{digest}.mp3"
 def _tts_min_seconds(text: str) -> float:
     """按文本长度估算 TTS 音频最小时长（秒），拦截断流/超时产生的残缺音频。
 
@@ -184,9 +190,10 @@ def _mark_net_skip(now: datetime.datetime):
     _last_net_skip_ts = cand.timestamp()
 def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                  skip_validate: bool = False) -> str:
-    """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试。
-    注：定时播报/蓄水池/预热走本函数（Edge-TTS）；点名走 net_control.synth_text
-    （tts.engine 可配 CosyVoice/Edge）。两者引擎相互独立、互不影响。
+    """TTS 合成，含文件完整性校验和超时重试。
+
+    tts.engine=cosyvoice 时复用点名系统 net_control.synth_text() 及其 nc_ 缓存；
+    tts.engine=edge 时保留原有 Edge-TTS 路径。
     skip_validate=True：缓存存在时跳过 dry_validate 直接返回（调用方须保证该文件
     已完整验证过——announce_task 预建链分支使用：命中预建链=预热已合成+预构建成功
     （mp3 已完整解码编码过），现场重复校验是 ~0.4s 冗余开销，且会把 play 调用
@@ -207,31 +214,48 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
     for attempt in range(1, max_retries + 1):
         logger.info(f"合成语音 (第{attempt}/{max_retries}次): {text}")
         try:
-            # 捕获子线程内的真实异常（threading 不向外传播异常），
-            # 否则失败原因被吞掉，无从判断是超时/403/DNS等问题
-            syn_error = []
-            def _syn_thread():
-                async def _syn():
-                    await edge_tts.Communicate(text, TTS_VOICE).save(str(cache_path))
-                try:
-                    # 内层超时比外层 join 超时短 2 秒，让取消先落地、线程必定退出：
-                    # 否则 websocket 挂死时线程会带着事件循环和连接永久滞留进程内（内存泄漏）
-                    asyncio.run(asyncio.wait_for(_syn(), timeout=TTS_TIMEOUT_INNER))
-                except Exception as e:
-                    syn_error.append(f"{type(e).__name__}: {e}")
-            t = threading.Thread(target=_syn_thread, daemon=True)
-            t.start()
-            t.join(timeout=TTS_TIMEOUT_JOIN)  # 最多等30秒（兜底安全网）
-            if t.is_alive():
-                logger.warning(f"TTS合成超时 (第{attempt}次)")
-                # 清理可能写了一半的文件
-                if cache_path.exists() and cache_path.stat().st_size == 0:
+            if cfg_get("tts", "engine", default="cosyvoice") == "cosyvoice":
+                # 复用点名系统已配置并验证过的 CosyVoice 合成器；其缓存键与本函数一致。
+                import net_control
+                result = net_control.synth_text(
+                    text,
+                    voice=TTS_VOICE,
+                    cache_dir=CACHE_DIR,
+                    timeout_inner=TTS_TIMEOUT_INNER,
+                    timeout_join=TTS_TIMEOUT_JOIN,
+                    max_retries=1,
+                    retry_delay=0,
+                )
+                if result and cache_path.exists() and direct_announce.dry_validate_mp3(
+                        cache_path, min_seconds=min_secs):
+                    return str(cache_path)
+                # synth_text 的通用校验不含最小时长要求；删除短音频，避免下一轮误命中缓存。
+                if cache_path.exists():
                     cache_path.unlink()
-            elif cache_path.exists() and direct_announce.dry_validate_mp3(cache_path, min_seconds=min_secs):
-                return str(cache_path)
+                logger.warning(f"CosyVoice 合成失败或音频时长不足 (第{attempt}/{max_retries}次)")
             else:
-                reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
-                logger.warning(f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
+                # Edge-TTS 保留原有线程隔离、超时控制和重试行为。
+                syn_error = []
+                def _syn_thread():
+                    async def _syn():
+                        await edge_tts.Communicate(text, TTS_VOICE).save(str(cache_path))
+                    try:
+                        asyncio.run(asyncio.wait_for(_syn(), timeout=TTS_TIMEOUT_INNER))
+                    except Exception as e:
+                        syn_error.append(f"{type(e).__name__}: {e}")
+                t = threading.Thread(target=_syn_thread, daemon=True)
+                t.start()
+                t.join(timeout=TTS_TIMEOUT_JOIN)
+                if t.is_alive():
+                    logger.warning(f"TTS合成超时 (第{attempt}次)")
+                    if cache_path.exists() and cache_path.stat().st_size == 0:
+                        cache_path.unlink()
+                elif cache_path.exists() and direct_announce.dry_validate_mp3(
+                        cache_path, min_seconds=min_secs):
+                    return str(cache_path)
+                else:
+                    reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
+                    logger.warning(f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
         except Exception as e:
             logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
         if attempt < max_retries:
