@@ -132,7 +132,8 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `tts` | `engine` | 点名系统的 TTS 引擎（cosyvoice / edge，默认 cosyvoice；不控制定时播报） |
 | `announce` | `tts_engine` | 定时播报 TTS 引擎（edge / cosyvoice，默认 edge；不控制点名） |
 | `announce` | `cosyvoice_rate` | 定时播报 CosyVoice 语速（默认 1.2；不改变点名语速） |
-| `announce` | `voice` | 定时播报 Edge-TTS 语音角色（默认 zh-CN-XiaoxiaoNeural） |
+| `tts` | `voice` | 点名系统使用 Edge-TTS 时的语音角色（默认 zh-CN-XiaoxiaoNeural） |
+| `announce` | `voice` | 定时播报使用 Edge-TTS 时的语音角色（默认 zh-CN-XiaoxiaoNeural） |
 | `tts` | `cosyvoice_sdk` / `cosyvoice_model` / `cosyvoice_voice` | CosyVoice 引擎（DashScope SDK 模式 / 模型 / 音色名） |
 | `tts` | `timeout_inner` / `timeout_join` | TTS 协程/线程超时（秒） |
 | `tts` | `max_retries` / `retry_delay` | 合成重试次数与间隔 |
@@ -210,6 +211,7 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
   "engine": "cosyvoice",                    // 仅控制点名系统
   "cosyvoice_model": "cosyvoice-v3.5-flash",
   "cosyvoice_voice": "你的百炼音色ID",       // 点名与定时播报当前共用
+  "voice": "zh-CN-XiaoxiaoNeural",          // 仅点名系统使用 Edge-TTS 时生效
   "cache_expire_days": 2                     // TTS 缓存过期天数
 },
 "announce": {
