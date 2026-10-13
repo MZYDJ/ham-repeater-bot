@@ -58,6 +58,9 @@ vi config.json                       # 编辑你的参数
   },
   "announce": {
     "tts_engine": "edge", // 仅控制定时播报：edge（默认）或 cosyvoice
+    "voice": "zh-CN-XiaoxiaoNeural", // 定时播报 Edge-TTS 音色
+    "cosyvoice_rate": 1.2, // 定时播报 CosyVoice 语速，建议从 1.2 开始试
+    "prefill_hours": 48, // 预合成提前量（小时）
     "template": "CQ CQ CQ，现在是{year}年{month}月{day}日……",  // 播报内容（中继台呼号/频率/亚音）
     "start_hour": 7,  // 每日首次播报时刻
     "end_hour": 22    // 每日最后一次播报所在小时
@@ -128,12 +131,13 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `talk.client_profile` | `release` / `os_name` / `os_version` / `model` | 客户端画像（对齐真实手机 App，UserState 广播用） |
 | `tts` | `engine` | 点名系统的 TTS 引擎（cosyvoice / edge，默认 cosyvoice；不控制定时播报） |
 | `announce` | `tts_engine` | 定时播报 TTS 引擎（edge / cosyvoice，默认 edge；不控制点名） |
-| `tts` | `voice` | Edge-TTS 语音角色（默认 zh-CN-XiaoxiaoNeural） |
+| `announce` | `cosyvoice_rate` | 定时播报 CosyVoice 语速（默认 1.2；不改变点名语速） |
+| `announce` | `voice` | 定时播报 Edge-TTS 语音角色（默认 zh-CN-XiaoxiaoNeural） |
 | `tts` | `cosyvoice_sdk` / `cosyvoice_model` / `cosyvoice_voice` | CosyVoice 引擎（DashScope SDK 模式 / 模型 / 音色名） |
 | `tts` | `timeout_inner` / `timeout_join` | TTS 协程/线程超时（秒） |
 | `tts` | `max_retries` / `retry_delay` | 合成重试次数与间隔 |
 | `tts` | `cache_expire_days` | TTS 缓存过期天数（默认 2） |
-| `tts` | `prefill_hours` | TTS 蓄水池提前量（默认 48 小时） |
+| `announce` | `prefill_hours` | 定时播报 TTS 蓄水池提前量（默认 48 小时） |
 | `announce` | `template` | 播报模板（支持 {year}/{month}/{day}/{weekday}/{hour}/{minute_text} 占位符） |
 | `announce` | `start_hour` / `end_hour` | 每日播报时段（每半小时一次） |
 | `timing` | `native_prep_lead` | 准点前建链提前量（默认 2.5s） |
@@ -203,18 +207,22 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
 ### TTS 合成与缓存校验
 ```jsonc
 "tts": {
-  "engine": "cosyvoice",                    // 默认复用点名系统的 CosyVoice；edge 可切回 Edge-TTS
+  "engine": "cosyvoice",                    // 仅控制点名系统
   "cosyvoice_model": "cosyvoice-v3.5-flash",
-  "cosyvoice_voice": "你的百炼音色ID",       // CosyVoice 必填
-  "voice": "zh-CN-XiaoxiaoNeural",          // 仅 engine=edge 时使用
-  "cache_expire_days": 2,                    // TTS 缓存过期天数
-  "prefill_hours": 48                         // TTS 蓄水池提前量（小时）
+  "cosyvoice_voice": "你的百炼音色ID",       // 点名与定时播报当前共用
+  "cache_expire_days": 2                     // TTS 缓存过期天数
+},
+"announce": {
+  "tts_engine": "cosyvoice",
+  "voice": "zh-CN-XiaoxiaoNeural",          // 仅定时播报使用 Edge-TTS 时生效
+  "cosyvoice_rate": 1.2,                    // 定时播报语速
+  "prefill_hours": 48                        // 定时播报预合成提前量（小时）
 }
 ```
 CosyVoice 使用 DashScope API Key，优先读取 `net_control.asr.api_key`，也可使用顶层 `asr.api_key`；请勿将真实密钥提交到仓库。`cosyvoice_voice` 必须填写百炼控制台中可用的音色 ID。默认引擎下，定时播报与点名共用 `net_control.synth_text()` 及 `nc_` 前缀缓存，避免同一文本重复合成；设置 `"engine": "edge"` 可回退到原 Edge-TTS 路径。
 - **完整性校验**：缓存命中/合成完成时，使用 libmpg123 完整解码 dry-run 校验（识别头部损坏 + 尾部截断不完整）；定时播报还会按文本估算最小时长，短音频会删除并重试。
 - **静音裁切**：音频编码前自动裁切头尾静音（默认各留 50ms 余量），缩短播报时长、避免空白。
-TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `prefill_hours` 内所有播报时段缺失的音频，降低准点时对 TTS 服务可用性的依赖；若服务持续中断且缓存耗尽，播报仍会失败。
+TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `announce.prefill_hours` 内所有播报时段缺失的音频，降低准点时对 TTS 服务可用性的依赖；若服务持续中断且缓存耗尽，播报仍会失败。
 ### 日志与 Webhook
 ```jsonc
 "logging": {
