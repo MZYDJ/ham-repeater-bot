@@ -9,7 +9,7 @@
 - **常驻链路**：后台线程 Ping 保活 + 下行流量泵，服务器视角与长在线的真实用户一致
 - **准点对齐**：播报前一分钟预热（TTS 预合成 + 音频包预构建 + 预建链），准点前 0.5s 才抢麦（不提前占用信道），首包紧贴整点发出
 - **三级兜底**：常驻链路 → 临时短链 → 准点现场完整流程，任一环节故障自动降级，播报不中断
-- **TTS 蓄水池**：每小时预合成未来 48 小时所有播报时段的音频，准点播报不依赖播报时刻的 Edge-TTS 网络状态
+- **TTS 蓄水池**：每小时预合成未来 48 小时所有播报时段的音频，默认复用点名系统的 CosyVoice；准点播报不依赖播报时刻的 TTS 服务网络状态
 - **音频质量保障**：TTS 缓存经 libmpg123 完整解码 dry-run 校验（拦截头部损坏/尾部截断），播报前头尾静音自动裁切
 - **企业微信告警**：日志达到指定级别时自动推送到企业微信群机器人（配置中留空即禁用）
 - **轻量运行**：仅依赖 libopus0/libmpg123-0 两个系统库（ctypes 直调），无 pip 重型依赖
@@ -23,7 +23,7 @@
        │                     │ mp3 → Opus 12kbps → 185B/包
        ▼                     │
 ┌──────────────┐             │
-│  Edge-TTS    │─────────────┘
+│ CosyVoice / Edge │────────┘
 │  (语音合成)   │
 └──────────────┘
 ```
@@ -111,7 +111,7 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `talk` | `host` / `port` | 滔滔链路服务器地址与端口（默认 totalkd.allptt.com:59638） |
 | `talk` | `username` / `password` | 滔滔链路账号（必填） |
 | `talk.client_profile` | `release` / `os_name` / `os_version` / `model` | 客户端画像（对齐真实手机 App，UserState 广播用） |
-| `tts` | `engine` | 点名 TTS 引擎（cosyvoice / edge，默认 cosyvoice） |
+| `tts` | `engine` | 播报与点名共用的 TTS 引擎（cosyvoice / edge，默认 cosyvoice） |
 | `tts` | `voice` | Edge-TTS 语音角色（默认 zh-CN-XiaoxiaoNeural） |
 | `tts` | `cosyvoice_sdk` / `cosyvoice_model` / `cosyvoice_voice` | CosyVoice 引擎（DashScope SDK 模式 / 模型 / 音色名） |
 | `tts` | `timeout_inner` / `timeout_join` | TTS 协程/线程超时（秒） |
@@ -187,14 +187,18 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
 ### TTS 合成与缓存校验
 ```jsonc
 "tts": {
-  "voice": "zh-CN-XiaoxiaoNeural",   // Edge-TTS 语音角色
-  "cache_expire_days": 2,            // TTS 缓存过期天数
-  "prefill_hours": 48                // TTS 蓄水池提前量（小时）
+  "engine": "cosyvoice",                    // 默认复用点名系统的 CosyVoice；edge 可切回 Edge-TTS
+  "cosyvoice_model": "cosyvoice-v3.5-flash",
+  "cosyvoice_voice": "你的百炼音色ID",       // CosyVoice 必填
+  "voice": "zh-CN-XiaoxiaoNeural",          // 仅 engine=edge 时使用
+  "cache_expire_days": 2,                    // TTS 缓存过期天数
+  "prefill_hours": 48                         // TTS 蓄水池提前量（小时）
 }
 ```
-- **完整性校验**：缓存命中/合成完成时，使用 libmpg123 完整解码 dry-run 校验（识别头部损坏 + 尾部截断不完整），损坏文件自动删除重合成——不依赖文件大小判断。
+CosyVoice 使用 DashScope API Key，优先读取 `net_control.asr.api_key`，也可使用顶层 `asr.api_key`；请勿将真实密钥提交到仓库。`cosyvoice_voice` 必须填写百炼控制台中可用的音色 ID。默认引擎下，定时播报与点名共用 `net_control.synth_text()` 及 `nc_` 前缀缓存，避免同一文本重复合成；设置 `"engine": "edge"` 可回退到原 Edge-TTS 路径。
+- **完整性校验**：缓存命中/合成完成时，使用 libmpg123 完整解码 dry-run 校验（识别头部损坏 + 尾部截断不完整）；定时播报还会按文本估算最小时长，短音频会删除并重试。
 - **静音裁切**：音频编码前自动裁切头尾静音（默认各留 50ms 余量），缩短播报时长、避免空白。
-TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `prefill_hours` 内所有播报时段缺失的音频，使准点播报不依赖播报时刻的 Edge-TTS 网络状态——网络突发故障（分钟到小时级）不再导致播报失败，只有连续中断超过一天才可能缺音。
+TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `prefill_hours` 内所有播报时段缺失的音频，降低准点时对 TTS 服务可用性的依赖；若服务持续中断且缓存耗尽，播报仍会失败。
 ### 日志与 Webhook
 ```jsonc
 "logging": {
@@ -266,10 +270,11 @@ TTS 优化要点：呼号一律用解释法英文单词（`{call_phonetic}`）�
 | `net_records/` | 点名识别摘要与应答录音（启用 net_control 后生成） |
 ## 运行要求
 - Docker 与 Docker Compose
-- 网络需能访问滔滔链路（allptt.com:59638，TLS）和 Edge-TTS 服务
+- 网络需能访问滔滔链路（allptt.com:59638，TLS）；默认 CosyVoice 还需能访问阿里云百炼服务，或将 `tts.engine` 设为 `edge` 并确保可访问 Edge-TTS
 ## 依赖
 - Python 3.x
-- [edge-tts](https://github.com/rany2/edge-tts)（语音合成）
+- [edge-tts](https://github.com/rany2/edge-tts)（`tts.engine=edge` 时使用；当前代码仍将其作为安装依赖）
+- DashScope Python SDK（CosyVoice SDK，可选；SDK 不可用时自动回退 HTTP 接口）
 - [APScheduler](https://github.com/agronholm/apscheduler)（定时调度）
 - 系统库 `libopus0`、`libmpg123-0`（音频编解码，ctypes 直调，Dockerfile 已包含）
 ## 许可证
