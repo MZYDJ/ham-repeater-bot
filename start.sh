@@ -69,21 +69,27 @@ if not has("talk", "username") or not has("talk", "password"):
 # 必填②：播报模板（空模板=播报内容为空）
 if not has("announce", "template"):
     fail("announce.template 未配置——播报文案为空，播报无意义。")
-# 定时播报与点名共用 TTS：CosyVoice 为默认引擎，因此无论点名是否启用都必须检查密钥和音色。
-# DashScope SDK 缺失时 net_control.synth_text 会回退 HTTP，不将 SDK 当作硬依赖。
-engine = (cfg.get("tts") or {}).get("engine", "cosyvoice")
-if engine == "cosyvoice":
+# 点名与定时播报分别选择引擎：tts.engine 只控制点名；announce.tts_engine 只控制定时播报。
+# 点名引擎默认沿用历史配置（cosyvoice），定时播报默认 Edge-TTS（保持原行为）。
+# 任一系统选择 CosyVoice 时都需要百炼密钥与音色；SDK 缺失会回退 HTTP，不作为硬依赖。
+point_engine = (cfg.get("tts") or {}).get("engine", "cosyvoice")
+announce_engine = (cfg.get("announce") or {}).get("tts_engine", "edge")
+if point_engine not in ("edge", "cosyvoice"):
+    fail("tts.engine 仅支持 edge 或 cosyvoice（该项只控制点名系统）。")
+if announce_engine not in ("edge", "cosyvoice"):
+    fail("announce.tts_engine 仅支持 edge 或 cosyvoice（该项只控制定时播报）。")
+if "cosyvoice" in (point_engine, announce_engine):
     asr_key = (cfg.get("net_control", {}).get("asr", {}).get("api_key")
                or (cfg.get("asr") or {}).get("api_key"))
     if not asr_key:
-        fail("tts.engine=cosyvoice，但 net_control.asr.api_key（或顶层 asr.api_key）缺失——定时播报/点名 TTS 无法合成。")
+        fail("点名或定时播报启用了 CosyVoice，但 net_control.asr.api_key（或顶层 asr.api_key）缺失。")
     if not has("tts", "cosyvoice_voice"):
-        fail("tts.engine=cosyvoice，但 tts.cosyvoice_voice 缺失——定时播报/点名 TTS 无法合成。")
+        fail("点名或定时播报启用了 CosyVoice，但 tts.cosyvoice_voice 缺失。")
     if not has("tts", "cosyvoice_model"):
         print("[INFO] tts.cosyvoice_model 未配置，将使用默认 cosyvoice-v3.5-flash。")
-else:
+if point_engine == "edge" or announce_engine == "edge":
     if not has("tts", "voice"):
-        print("[WARN] tts.engine=edge 但 tts.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
+        print("[WARN] Edge-TTS 已启用但 tts.voice 未配置，将使用默认 zh-CN-XiaoxiaoNeural。")
 # 正式配置 config.json 已在上方 fail-fast（读取/账号/模板/点名条件全覆盖），
 # 不再单独检查示例文件 config.example.json（模板完整性由仓库测试 test_announce 兜底）
 print("==============================")
