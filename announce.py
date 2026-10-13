@@ -29,9 +29,11 @@ def cfg_get(*path, default=None):
 TALK_USERNAME = cfg_get("talk", "username", default="")
 TALK_PASSWORD = cfg_get("talk", "password", default="")
 # TTS 配置
-TTS_VOICE = cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
+TTS_VOICE = cfg_get("announce", "voice", default="zh-CN-XiaoxiaoNeural")
 # 定时播报独立引擎：不读取点名系统的 tts.engine；历史默认保持微软 Edge-TTS。
 ANNOUNCE_TTS_ENGINE = cfg_get("announce", "tts_engine", default="edge")
+# 定时播报独立语速；默认 1.2，不影响点名系统。
+ANNOUNCE_COSYVOICE_RATE = float(cfg_get("announce", "cosyvoice_rate", default=1.2))
 TTS_TIMEOUT_INNER = cfg_get("tts", "timeout_inner", default=28)   # 内层协程超时（秒）
 TTS_TIMEOUT_JOIN = cfg_get("tts", "timeout_join", default=30)     # 外层线程 join 超时（秒）
 TTS_MAX_RETRIES = cfg_get("tts", "max_retries", default=3)
@@ -46,7 +48,7 @@ LOG_DIR = cfg_get("paths", "log_dir", default=r"/app/logs")
 LOG_MAX_BYTES = cfg_get("logging", "max_bytes", default=0.25 * 1024 * 1024)
 LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
-TTS_PREFILL_HOURS = cfg_get("tts", "prefill_hours", default=48)
+TTS_PREFILL_HOURS = cfg_get("announce", "prefill_hours", default=48)
 MAX_PREFILL_PER_ROUND = 10   # 蓄水池每轮合成上限：防单轮批量合成长时间占 CPU（缺口靠每小时补充）
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
 # 准点前多少秒【发起】抢麦。take_mic 是 send(ApplyMic)→wait_for 回执→上报
@@ -227,6 +229,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                     retry_delay=0,
                     engine=ANNOUNCE_TTS_ENGINE,
                     cache_prefix="announce_",
+                    cosyvoice_rate=ANNOUNCE_COSYVOICE_RATE,
                 )
                 if result and cache_path.exists() and direct_announce.dry_validate_mp3(
                         cache_path, min_seconds=min_secs):
