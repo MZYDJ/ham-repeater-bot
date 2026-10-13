@@ -219,7 +219,7 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
 }
 ```
 ## 点名主播（net_control，可选）
-在中继台上自动主持业余无线电点名活动：纯 ASR + 本地状态机 + LLM 信息提取（可选）+ 独立 TTS。
+在中继台上自动主持业余无线电点名活动：纯 ASR + 本地状态机 + LLM 信息提取（可选）+ TTS 语音播报。定时播报与点名共用 TTS 引擎配置及 CosyVoice 缓存。
 
 **与播报的关系**：复用同一条常驻直连链路（`direct_announce.PersistentAnnouncer`）作为接收侧与发射侧；点名期间跳过整点播报与预热抢麦（`busy` 锁互斥，同一时刻只有一个发射者）。启用点名**不影响**现有定时播报——`net_control.enabled=false`（默认）时完全不走点名路径。
 
@@ -228,7 +228,7 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
 2. 识别：阿里云百炼 **qwen3-asr-flash**（OpenAI 兼容非流式接口，System Message 传实体词表提升呼号识别，`enable_itn` 归一化信号报告数字）
 3. 提取：**字母解释法词表确定性解码**（ITU 26 词 + 中文音译变体，config 可扩展）→ 呼号格式校验（快路径原文直读 + 慢路径词表装配）→ 已抄收去重 → 低置信度播报"请重复一遍呼号"（限次）→ 仍失败记未抄收
 4. 可选 LLM 兜底：智谱 **GLM-4.5-Flash**（免费）低置信度修复/备注提取（默认关闭，主路径为确定性解码）
-5. 播报：Edge-TTS 合成（全文 md5 缓存 + libmpg123 校验，与播报同款）→ 复用链路抢麦发包
+5. 播报：默认调用 CosyVoice 合成（全文 md5 的 `nc_` 共享缓存 + libmpg123 校验；`tts.engine=edge` 时使用 Edge-TTS）→ 复用链路抢麦发包
 
 **两种点名模式**：
 - 开放点名（默认 `roster_mode=false`）：CQ 开场 → 最短收听 `listen_after_open_seconds`（默认 60s）→ 到点名总时长 `max_net_seconds`（默认 1800s=30 分钟）后**不立即结束**：若仍有人在点名（正上麦应答），等其说完，连续 `quiet_end_seconds`（默认 10s）无任何应答才播结束语；`grace_seconds`（默认 300s）为到点后的硬性宽限，防持续讲话无限延长（参与者不可预知，不依赖封闭名单）
@@ -282,7 +282,7 @@ TTS 优化要点：呼号一律用解释法英文单词（`{call_phonetic}`）�
 ## 依赖
 - Python 3.x
 - [edge-tts](https://github.com/rany2/edge-tts)（`tts.engine=edge` 时使用；当前代码仍将其作为安装依赖）
-- DashScope Python SDK（CosyVoice SDK，可选；SDK 不可用时自动回退 HTTP 接口）
+- [DashScope Python SDK](https://github.com/aliyun/dashscope-sdk-python)（CosyVoice SDK，可选；SDK 不可用时自动回退 HTTP 接口）
 - [APScheduler](https://github.com/agronholm/apscheduler)（定时调度）
 - 系统库 `libopus0`、`libmpg123-0`（音频编解码，ctypes 直调，Dockerfile 已包含）
 ## 许可证
