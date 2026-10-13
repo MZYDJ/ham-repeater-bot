@@ -30,6 +30,8 @@ TALK_USERNAME = cfg_get("talk", "username", default="")
 TALK_PASSWORD = cfg_get("talk", "password", default="")
 # TTS 配置
 TTS_VOICE = cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
+# 定时播报独立引擎：不读取点名系统的 tts.engine；历史默认保持微软 Edge-TTS。
+ANNOUNCE_TTS_ENGINE = cfg_get("announce", "tts_engine", default="edge")
 TTS_TIMEOUT_INNER = cfg_get("tts", "timeout_inner", default=28)   # 内层协程超时（秒）
 TTS_TIMEOUT_JOIN = cfg_get("tts", "timeout_join", default=30)     # 外层线程 join 超时（秒）
 TTS_MAX_RETRIES = cfg_get("tts", "max_retries", default=3)
@@ -150,13 +152,10 @@ def get_announce_text(now: datetime.datetime) -> str:
         minute_text=format_minute_text(now.minute)
     )
 def tts_cache_path(text: str) -> Path:
-    """TTS 缓存文件路径（以播报文本 md5 为键）。
-
-    CosyVoice 模式与点名共用 nc_ 前缀缓存，避免重复合成；Edge 模式保留旧路径。
-    """
+    """定时播报缓存路径；按独立引擎命名，避免与点名系统缓存互相污染。"""
     digest = hashlib.md5(text.encode('utf-8')).hexdigest()
-    if cfg_get("tts", "engine", default="cosyvoice") == "cosyvoice":
-        return Path(CACHE_DIR) / f"nc_{digest}.mp3"
+    if ANNOUNCE_TTS_ENGINE == "cosyvoice":
+        return Path(CACHE_DIR) / f"announce_{digest}.mp3"
     return Path(CACHE_DIR) / f"{digest}.mp3"
 def _tts_min_seconds(text: str) -> float:
     """按文本长度估算 TTS 音频最小时长（秒），拦截断流/超时产生的残缺音频。
@@ -192,8 +191,8 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                  skip_validate: bool = False) -> str:
     """TTS 合成，含文件完整性校验和超时重试。
 
-    tts.engine=cosyvoice 时复用点名系统 net_control.synth_text() 及其 nc_ 缓存；
-    tts.engine=edge 时保留原有 Edge-TTS 路径。
+    announce.tts_engine=cosyvoice 时复用点名系统的合成实现，但显式传入独立引擎
+    并使用 announce_ 缓存；默认 edge，保持定时播报原有微软 Edge-TTS 行为。
     skip_validate=True：缓存存在时跳过 dry_validate 直接返回（调用方须保证该文件
     已完整验证过——announce_task 预建链分支使用：命中预建链=预热已合成+预构建成功
     （mp3 已完整解码编码过），现场重复校验是 ~0.4s 冗余开销，且会把 play 调用
@@ -214,8 +213,9 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
     for attempt in range(1, max_retries + 1):
         logger.info(f"合成语音 (第{attempt}/{max_retries}次): {text}")
         try:
-            if cfg_get("tts", "engine", default="cosyvoice") == "cosyvoice":
-                # 复用点名系统已配置并验证过的 CosyVoice 合成器；其缓存键与本函数一致。
+            if ANNOUNCE_TTS_ENGINE == "cosyvoice":
+                # 复用底层合成实现，但显式传入定时播报自己的引擎和缓存前缀；
+                # 不读取/改变点名系统 tts.engine，两个系统缓存也互相隔离。
                 import net_control
                 result = net_control.synth_text(
                     text,
@@ -225,6 +225,8 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                     timeout_join=TTS_TIMEOUT_JOIN,
                     max_retries=1,
                     retry_delay=0,
+                    engine=ANNOUNCE_TTS_ENGINE,
+                    cache_prefix="announce_",
                 )
                 if result and cache_path.exists() and direct_announce.dry_validate_mp3(
                         cache_path, min_seconds=min_secs):
