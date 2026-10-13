@@ -41,12 +41,20 @@ cd ham-repeater-bot
 cp config.example.json config.json   # 复制示例配置为实际配置
 vi config.json                       # 编辑你的参数
 ```
-最少需要修改三处：
+至少需要配置账号、播报模板，以及默认 CosyVoice 所需的百炼密钥和音色：
 ```jsonc
 {
   "talk": {
     "username": "你的滔滔链路账号",   // 必填
     "password": "你的滔滔链路密码"    // 必填
+  },
+  "tts": {
+    "engine": "cosyvoice",
+    "cosyvoice_model": "cosyvoice-v3.5-flash",
+    "cosyvoice_voice": "你的百炼音色ID" // 必填：百炼控制台中可用的音色 ID
+  },
+  "net_control": {
+    "asr": { "api_key": "你的DashScope API Key" } // CosyVoice 密钥；点名关闭时也需要
   },
   "announce": {
     "template": "CQ CQ CQ，现在是{year}年{month}月{day}日……",  // 播报内容（中继台呼号/频率/亚音）
@@ -58,7 +66,7 @@ vi config.json                       # 编辑你的参数
   }
 }
 ```
-> **生产/开源同步**：代码仓库不提交任何真实配置。生产部署时将实际参数写入本地 `config.json`（已被 `.gitignore` 忽略，不会误提交）。代码升级只需 `git pull` 同步代码，配置文件保持不变，两侧参数互不影响。
+如果只想使用 Edge-TTS，将 `tts.engine` 设为 `edge`，并可配置 `tts.voice`；此时不需要 CosyVoice 的 API Key 和音色 ID。
 ### 3. 启动服务
 #### 方式一：命令行启动（Linux / macOS）
 ```bash
