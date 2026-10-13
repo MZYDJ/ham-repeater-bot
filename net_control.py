@@ -978,19 +978,21 @@ def _cosyvoice_synth(text, cache_path, timeout=28):
 
 
 def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=30,
-               max_retries=2, retry_delay=5.0):
+               max_retries=2, retry_delay=5.0, engine=None, cache_prefix="nc_"):
     """点名 TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
     tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice：优先官方 SDK（tts_v2 WebSocket，
     与官方示例一致），SDK 未安装时自动回退 HTTP 接口；复用 asr.api_key。
     tts.engine=edge → Edge-TTS 兜底。与 announce.py 同款"缓存 + dry-run 校验"，键为全文 md5。"""
     import hashlib
-    engine = direct_announce.cfg_get("tts", "engine", default="cosyvoice")
+    # 默认仍由 tts.engine 控制点名系统；其他调用方可显式覆盖引擎和缓存前缀。
+    if engine is None:
+        engine = direct_announce.cfg_get("tts", "engine", default="cosyvoice")
     if voice is None:
         voice = direct_announce.cfg_get("tts", "voice", default="zh-CN-XiaoxiaoNeural")
     if cache_dir is None:
         cache_dir = nc_cfg("tts_cache_dir", default=direct_announce.cfg_get(
             "paths", "cache_dir", default="/app/tts_cache"))
-    cache_path = Path(cache_dir) / f"nc_{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
+    cache_path = Path(cache_dir) / f"{cache_prefix}{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
     if cache_path.exists() and direct_announce.dry_validate_mp3(cache_path):
         return str(cache_path)
     for attempt in range(1, max_retries + 1):
