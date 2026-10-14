@@ -665,14 +665,15 @@ def _release_prebuilt_session(s, temp):
                 _native_link.release()
     except Exception as e:
         logger.warning(f"释放预建会话异常: {e}")
-def announce_task():
-    """播报核心逻辑，仅主线程执行"""
+def announce_task(scheduled_at: datetime.datetime = None):
+    """播报核心逻辑，仅主线程执行；优先使用入队时记录的计划时刻。"""
     now = datetime.datetime.now()
+    if scheduled_at is None:
+        scheduled_at = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
     if net_active():
         logger.info("点名进行中，跳过本次定时播报")
         _mark_net_skip(now)      # 记录本应播报的准点（点名跨准点豁免依据）
         return
-    scheduled_at = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
     announce_text = get_announce_text(scheduled_at)
     logger.info(f"触发定时播报（计划 {scheduled_at:%H:%M}）: {announce_text}")
     global _native_session, _native_prebuilt, _native_session_temp, _native_talk_ts
@@ -723,7 +724,9 @@ def announce_task():
             _release_prebuilt_session(s_pre, temp_pre)
 # ========== 调度任务分发函数 ==========
 def schedule_announce():
-    task_queue.put("announce")
+    now = datetime.datetime.now()
+    scheduled_at = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+    task_queue.put(("announce", scheduled_at))
 def schedule_tts_prefill():
     task_queue.put("tts_prefill")
 def _watchdog_decision(now, last_announce_ok, last_net_skip_ts, last_tts_fail_ts,
@@ -995,10 +998,11 @@ if __name__ == "__main__":
             logger.info(f"预热规则：XX:00 / XX:30 准时播报；每次播报前一分钟（XX:29 / XX:59）预合成TTS+预构建音频+预建链，每天首次播报由 {ANNOUNCE_START_HOUR - 1}:59 预热")
             # 主线程循环：队列串行执行所有任务
             while True:
-                task = task_queue.get()
+                task_item = task_queue.get()
+                task, scheduled_at = task_item if isinstance(task_item, tuple) else (task_item, None)
                 try:
                     if task == "announce":
-                        announce_task()
+                        announce_task(scheduled_at=scheduled_at)
                         trim_python_memory()  # 回收播报产生的音频缓冲对象
                     elif task == "prewarm":
                         prewarm_task()
