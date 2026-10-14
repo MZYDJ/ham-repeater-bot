@@ -151,7 +151,7 @@ tts.voice = "zh-CN-XiaoxiaoNeural"           # 点名系统 Edge-TTS 音色（�
 CACHE_EXPIRE_DAYS = 2                         # TTS 缓存过期天数
 ```
 
-TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `announce.prefill_hours` 内所有播报时段缺失的音频，使准点播报不依赖播报时刻的 Edge-TTS 网络状态——网络突发故障（分钟到小时级）不再导致播报失败，只有连续中断超过一天才可能缺音。 单条音频最终合成失败时，按距计划播报时间分级：超过 `announce.prefill_error_threshold_seconds`（默认 86400 秒，即 24 小时）记为 `WARNING`；进入阈值窗口后记为 `ERROR`。此阈值只控制日志严重级别，不会暂停后续重试。
+TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `announce.prefill_hours` 内所有播报时段缺失的音频，使准点播报不依赖播报时刻的 Edge-TTS 网络状态——网络突发故障（分钟到小时级）不再导致播报失败，只有连续中断超过一天才可能缺音。单条音频最终合成失败时，按距计划播报时间分级：超过 `announce.prefill_error_threshold_seconds`（默认 86400 秒，即 24 小时）记为 `WARNING`；进入阈值窗口后记为 `ERROR`。此阈值只控制日志严重级别，不会暂停后续重试。
 
 ### 日志与 Webhook
 
