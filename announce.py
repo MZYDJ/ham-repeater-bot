@@ -154,10 +154,32 @@ def get_announce_text(now: datetime.datetime) -> str:
         minute_text=format_minute_text(now.minute)
     )
 def tts_cache_path(text: str) -> Path:
-    """定时播报缓存路径；按独立引擎命名，避免与点名系统缓存互相污染。"""
-    digest = hashlib.md5(text.encode('utf-8')).hexdigest()
+    """定时播报缓存路径。缓存身份包含合成配置，修改音色/模型/语速后自动重新合成。"""
+    profile = {"version": 2, "engine": ANNOUNCE_TTS_ENGINE}
     if ANNOUNCE_TTS_ENGINE == "cosyvoice":
+        # These values affect the generated waveform and must invalidate stale cache entries.
+        for key, default in (
+            ("cosyvoice_model", "cosyvoice-v3.5-flash"),
+            ("cosyvoice_voice", ""),
+            ("cosyvoice_format", "mp3"),
+            ("cosyvoice_sample_rate", 24000),
+            ("cosyvoice_volume", 50),
+            ("cosyvoice_pitch", 1.0),
+        ):
+            profile[key] = cfg_get("tts", key, default=default)
+        profile["rate"] = float(cfg_get("announce", "cosyvoice_rate", default=1.2))
+        digest_input = json.dumps(
+            {"text": text, "profile": profile}, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":")
+        )
+        digest = hashlib.md5(digest_input.encode("utf-8")).hexdigest()
         return Path(CACHE_DIR) / f"announce_{digest}.mp3"
+    profile["voice"] = cfg_get("announce", "voice", default="zh-CN-XiaoxiaoNeural")
+    digest_input = json.dumps(
+        {"text": text, "profile": profile}, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":")
+    )
+    digest = hashlib.md5(digest_input.encode("utf-8")).hexdigest()
     return Path(CACHE_DIR) / f"{digest}.mp3"
 def _tts_min_seconds(text: str) -> float:
     """按文本长度估算 TTS 音频最小时长（秒），拦截断流/超时产生的残缺音频。
@@ -230,6 +252,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                     engine=ANNOUNCE_TTS_ENGINE,
                     cache_prefix="announce_",
                     cosyvoice_rate=ANNOUNCE_COSYVOICE_RATE,
+                    cache_key=cache_path.stem.removeprefix("announce_"),
                 )
                 if result and cache_path.exists() and direct_announce.dry_validate_mp3(
                         cache_path, min_seconds=min_secs):
