@@ -210,7 +210,7 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
 "tts": {
   "engine": "cosyvoice",                    // 仅控制点名系统
   "cosyvoice_model": "cosyvoice-v3.5-flash",
-  "cosyvoice_voice": "你的百炼音色ID",       // 点名与定时播报当前共用
+  "cosyvoice_voice": "你的百炼音色ID",       // 点名与定时播报共用此 CosyVoice 音色 ID
   "voice": "zh-CN-XiaoxiaoNeural",          // 仅点名系统使用 Edge-TTS 时生效
   "cache_expire_days": 2                     // TTS 缓存过期天数
 },
@@ -221,7 +221,7 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
   "prefill_hours": 48                        // 定时播报预合成提前量（小时）
 }
 ```
-CosyVoice 使用 DashScope API Key，优先读取 `net_control.asr.api_key`，也可使用顶层 `asr.api_key`；请勿将真实密钥提交到仓库。`cosyvoice_voice` 必须填写百炼控制台中可用的音色 ID。默认引擎下，定时播报与点名共用 `net_control.synth_text()` 及 `nc_` 前缀缓存，避免同一文本重复合成；设置 `"engine": "edge"` 可回退到原 Edge-TTS 路径。
+CosyVoice 使用 DashScope API Key，优先读取 `net_control.asr.api_key`，也可使用顶层 `asr.api_key`；请勿将真实密钥提交到仓库。`tts.cosyvoice_voice` 必须填写百炼控制台中可用的音色 ID。定时播报在 `announce.tts_engine="cosyvoice"` 时复用底层 `net_control.synth_text()` 合成实现，但显式使用独立的 `announce_` 缓存，并可通过 `announce.cosyvoice_rate` 独立设置语速；点名系统仍由 `tts.engine` 与 `tts.cosyvoice_rate` 控制。缓存指纹包含合成配置，修改音色、模型或语速后会自动重新合成。定时播报默认 `edge`，不会因点名使用 CosyVoice 而自动切换。
 - **完整性校验**：缓存命中/合成完成时，使用 libmpg123 完整解码 dry-run 校验（识别头部损坏 + 尾部截断不完整）；定时播报还会按文本估算最小时长，短音频会删除并重试。
 - **静音裁切**：音频编码前自动裁切头尾静音（默认各留 50ms 余量），缩短播报时长、避免空白。
 TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `announce.prefill_hours` 内所有播报时段缺失的音频，降低准点时对 TTS 服务可用性的依赖；若服务持续中断且缓存耗尽，播报仍会失败。
@@ -237,7 +237,7 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
 }
 ```
 ## 点名主播（net_control，可选）
-在中继台上自动主持业余无线电点名活动：纯 ASR + 本地状态机 + LLM 信息提取（可选）+ TTS 语音播报。定时播报与点名共用 TTS 引擎配置及 CosyVoice 缓存。
+在中继台上自动主持业余无线电点名活动：纯 ASR + 本地状态机 + LLM 信息提取（可选）+ TTS 语音播报。点名与定时播报分别配置 TTS 引擎；底层合成实现可以复用，但配置、语速和缓存命名相互隔离。
 
 **与播报的关系**：复用同一条常驻直连链路（`direct_announce.PersistentAnnouncer`）作为接收侧与发射侧；点名期间跳过整点播报与预热抢麦（`busy` 锁互斥，同一时刻只有一个发射者）。启用点名**不影响**现有定时播报——`net_control.enabled=false`（默认）时完全不走点名路径。
 
@@ -246,7 +246,7 @@ TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算
 2. 识别：阿里云百炼 **qwen3-asr-flash**（OpenAI 兼容非流式接口，System Message 传实体词表提升呼号识别，`enable_itn` 归一化信号报告数字）
 3. 提取：**字母解释法词表确定性解码**（ITU 26 词 + 中文音译变体，config 可扩展）→ 呼号格式校验（快路径原文直读 + 慢路径词表装配）→ 已抄收去重 → 低置信度播报"请重复一遍呼号"（限次）→ 仍失败记未抄收
 4. 可选 LLM 兜底：智谱 **GLM-4.5-Flash**（免费）低置信度修复/备注提取（默认关闭，主路径为确定性解码）
-5. 播报：默认调用 CosyVoice 合成（全文 md5 的 `nc_` 共享缓存 + libmpg123 校验；`tts.engine=edge` 时使用 Edge-TTS）→ 复用链路抢麦发包
+5. 播报：点名默认调用 CosyVoice 合成（`nc_` 缓存 + libmpg123 校验；`tts.engine=edge` 时使用 Edge-TTS）→ 复用链路抢麦发包；定时播报独立使用 `announce.tts_engine`、`announce.cosyvoice_rate` 和 `announce_` 缓存。
 
 **两种点名模式**：
 - 开放点名（默认 `roster_mode=false`）：CQ 开场 → 最短收听 `listen_after_open_seconds`（默认 60s）→ 到点名总时长 `max_net_seconds`（默认 1800s=30 分钟）后**不立即结束**：若仍有人在点名（正上麦应答），等其说完，连续 `quiet_end_seconds`（默认 10s）无任何应答才播结束语；`grace_seconds`（默认 300s）为到点后的硬性宽限，防持续讲话无限延长（参与者不可预知，不依赖封闭名单）
