@@ -376,7 +376,9 @@ def test_prefill_and_prewarm_sched():
     A.schedule_announce()
     A.schedule_tts_prefill()
     got = [A.task_queue.get(), A.task_queue.get(), A.task_queue.get()]
-    check("schedule_× 入队正确", got == ["prewarm", "announce", "tts_prefill"], str(got))
+    check("schedule_× 入队正确", got[0] == "prewarm" and isinstance(got[1], tuple)
+          and got[1][0] == "announce" and isinstance(got[1][1], datetime.datetime)
+          and got[1][1].minute in (0, 30) and got[2] == "tts_prefill", str(got))
     # schedule_net_control → _net_start（不排队）
     with mock.patch.object(A, "_net_start") as ns:
         A.schedule_net_control()
