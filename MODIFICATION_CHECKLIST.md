@@ -205,10 +205,10 @@
 - ⚠️ 易漏：net_control 文案占位符（{call}/{call_phonetic}/{report} 等）改模板时 README 占位符表要同步
 
 ### E. 改 TTS / 蓄水池
-- [ ] `announce.py`：合成函数 / 蓄水池 `tts_prefill_task` / 缓存校验
+- [ ] `announce.py`：合成函数 / 蓄水池 `tts_prefill_task` / 缓存校验；`PREFILL_ERROR_THRESHOLD_SECONDS` 缺省为 86400 秒（24 小时），远期最终失败 `WARNING`、进入阈值窗口后 `ERROR`
 - [ ] 若定时播报复用点名 TTS：核对 `tts_cache_path` 与 `net_control.synth_text` 的缓存键/目录完全一致；测试共享缓存、合成失败、短音频删除与重试
-- [ ] README：配置说明表 tts 行；"TTS 合成与缓存校验"段；快速开始中写清 CosyVoice API Key 与音色要求
-- [ ] 测试：`test_announce` 的 TTS 缓存/合成/蓄水池用例；所有 mock Edge-TTS 行为的测试（包括 `test_watchdog`）应显式设 `tts.engine=edge`，避免依赖生产默认值
+- [ ] README：配置说明表 tts 行；"TTS 合成与缓存校验"段；快速开始中写清 CosyVoice API Key 与音色要求；同步记录 `announce.prefill_error_threshold_seconds` 默认值与级别语义
+- [ ] 测试：`test_announce` 的 TTS 缓存/合成/蓄水池用例（包括默认阈值 86400 秒、远期 WARNING、临近 ERROR）；所有 mock Edge-TTS 行为的测试（包括 `test_watchdog`）应显式设 `tts.engine=edge`，避免依赖生产默认值
 - [ ] `start.sh`：若改引擎/依赖，同步 cosyvoice/edge 自检逻辑；CosyVoice 成为默认引擎后，即使 `net_control.enabled=false` 也必须检查 API Key 与音色配置
 - ⚠️ 易漏：`start.sh` 的依赖自检与 Dockerfile 依赖安装是两处；CosyVoice SDK 缺失时可走 HTTP 回退，不应错误地把 SDK 当成硬依赖
 
