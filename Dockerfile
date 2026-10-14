@@ -25,9 +25,11 @@ EOF
 
 ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
-# ========== 5. 安装Python业务依赖（固定版本） ==========
+# ========== 5. 安装Python业务依赖 ==========
+# edge-tts 不固定版本：每次重建镜像时从配置的 PyPI 镜像安装可获取的最新版本，
+# 避免微软在线 TTS 服务变化后，容器仍长期使用过旧的 edge-tts。
 RUN pip install --break-system-packages --no-cache-dir \
-    edge-tts==7.2.8 \
+    edge-tts \
     APScheduler==3.11.3
 
 # ========== 6. 构建版本标记 ==========
