@@ -34,7 +34,11 @@ jobs:
       - name: Compile Python modules
         run: python -m py_compile announce.py direct_announce.py net_control.py
       - name: Check startup script syntax
-        run: bash -n start.sh
+        run: |
+          bash -n start.sh
+          bash -n scripts/build-image.sh
+      - name: Test edge-tts build-version updater
+        run: python tests/test_build_image.py
       - name: Test announcement and TTS
         run: python tests/test_announce.py
       - name: Test watchdog

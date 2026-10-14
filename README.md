@@ -75,8 +75,8 @@ vi config.json                       # 编辑你的参数
 ### 3. 启动服务
 #### 方式一：命令行启动（Linux / macOS）
 ```bash
-# 构建镜像
-docker compose build
+# 推荐：每次构建前查询 edge-tts 最新稳定版，再按版本号构建（版本未变可复用安装层缓存）
+./scripts/build-image.sh
 # 启动服务（后台运行）
 docker compose up -d
 # 查看实时日志
@@ -84,6 +84,8 @@ docker compose logs -f
 # 停止服务
 docker compose down
 ```
+
+也可以分步执行：先运行 `python3 scripts/update_edge_tts_version.py` 更新项目目录下的 `.env`，再执行 `docker compose build announce`。查询失败会停止更新，不会回退到旧版本；不要直接点击 Compose 的“重新构建”来代替版本查询。
 #### 方式二：飞牛NAS（fnOS）图形界面部署
 飞牛NAS 内置 Docker 管理功能，可通过 Compose 图形界面一键部署：
 1. **上传项目文件**
@@ -101,10 +103,10 @@ docker compose down
    - 选择路径后，系统会弹窗提示：*「所选择的路径已包含 docker-compose 配置文件，确定要使用现有的 docker-compose 配置文件来创建项目吗？」*
    - 点击 **「确定」**，系统会自动识别 `docker-compose.yml` 并创建项目
 6. **部署启动**
-   - 点击 **「部署」** 或 **「启动」** 按钮
-   - 系统会自动构建镜像并启动容器
-   - 在「容器」页面可以查看运行状态和日志
-> **提示**：首次部署需要构建镜像，可能需要几分钟时间，取决于 NAS 性能和网络速度。
+   - 每次在图形界面执行构建/重新部署前，先在 NAS 终端进入项目目录，运行 `python3 scripts/update_edge_tts_version.py`。该脚本查询阿里云 PyPI 镜像的最新稳定版并更新本地 `.env`，不修改或提交业务配置
+   - 再回到 Compose 图形界面点击 **「部署」**、**「重建」** 或对应构建按钮；Compose 会将 `.env` 中的版本号传入 Dockerfile
+   - 在「容器」页面查看运行状态和日志
+> **提示**：若版本查询失败，脚本会报错退出且不会更新旧值；请先解决 PyPI 镜像访问问题再构建。版本号未变化时，Docker 可以复用依赖安装层缓存。
 ### 4. 测试与调试
 ```bash
 # 容器内测试模式：播报指定次数后进入正常调度（默认 1 次）

@@ -229,12 +229,16 @@
 - ⚠️ 易漏：`net_control` 通过局部 import 使用 DA 的函数，改 DA 签名要看 net_control 调用点
 
 ### H. 改构建 / 部署（Dockerfile / docker-compose / start.sh）
-- [ ] `Dockerfile`：依赖安装（改包后必须确认 start.sh 自检段同步）
-- [ ] `docker-compose.yml`：镜像名 / 挂载 / 环境变量（**BUILD_TIME 已移入 Dockerfile 自动生成，此处不再需要**）
+- [ ] `Dockerfile`：依赖安装（改包后必须确认 start.sh 自检段同步）；`edge-tts` 通过 `EDGE_TTS_VERSION` 精确固定到本次查询的版本
+- [ ] `scripts/update_edge_tts_version.py`：每次构建前查询阿里云 PyPI 镜像的最新稳定版并更新本地 `.env`；查询失败必须 fail-fast，禁止静默沿用旧版本
+- [ ] `scripts/build-image.sh`：命令行构建入口，先更新版本再构建
+- [ ] `docker-compose.yml`：将 `.env` 中的 `EDGE_TTS_VERSION` 作为 build arg；`.env` 必须加入 `.gitignore`
+- [ ] 缓存：`EDGE_TTS_VERSION` 不变时复用依赖安装层；版本变化时仅使依赖安装层失效；BuildKit pip cache 用于减少重复下载
+- [ ] 飞牛 OS 图形界面：每次点“重建/部署”前先在项目目录运行 `python3 scripts/update_edge_tts_version.py`，图形界面不会自动执行该查询脚本
 - [ ] `start.sh`：环境自检 / 配置文件校验 / BUILD_TIME 读取优先级
-- [ ] 测试：`bash -n start.sh` 语法检查；本地模拟运行验证输出
-- [ ] README：依赖安装段（如需）
-- ⚠️ 易漏（历史教训）：改 Dockerfile 装包后忘记同步版本标记——现已由 `/opt/build_time` 自动生成解决；改 compose 后忘记更新 `image:` 标签
+- [ ] 测试：`bash -n start.sh`、`bash -n scripts/build-image.sh`、`python3 tests/test_build_image.py`
+- [ ] README：依赖更新与 GUI 构建步骤同步
+- ⚠️ 易漏：改 Dockerfile 装包后忘记同步版本标记——现已由 `/opt/build_time` 自动生成解决；改 compose 后忘记更新 `image:` 标签
 
 ### I. 改文档（README）
 - [ ] 自查引用一致性：`grep -rn "config.example\|BUILD_TIME\|native_mic_lead\|0.5s\|1.1s" README.md` 确保无过期数字/死引用

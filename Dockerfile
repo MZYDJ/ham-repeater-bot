@@ -26,14 +26,22 @@ EOF
 ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # ========== 5. 安装Python业务依赖 ==========
-# edge-tts 不固定版本：每次重建镜像时从配置的 PyPI 镜像安装可获取的最新版本，
-# 避免微软在线 TTS 服务变化后，容器仍长期使用过旧的 edge-tts。
+# scripts/update_edge_tts_version.py 每次构建前查询阿里云 PyPI 镜像的最新稳定版，
+# 并写入被 .gitignore 忽略的 .env；版本号作为 build arg，未变化时可复用本层缓存。
+# 使用 BuildKit pip 缓存：即使其他依赖变化需要重装，也可复用已下载的 wheel。
+# 不提供版本号时 fail-fast，避免 GUI 直接构建时静默沿用旧版。
+ARG EDGE_TTS_VERSION=unset
 # dashscope>=1.18 提供 tts_v2 SpeechSynthesizer（CosyVoice 点名 TTS 官方 SDK，
 # WebSocket 流式；net_control 已做旧版 timeout 参数兼容 + SDK 缺失自动回退 HTTP）
-RUN pip install --break-system-packages --no-cache-dir \
-    edge-tts \
-    APScheduler==3.11.3 \
-    "dashscope>=1.18.0"
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$EDGE_TTS_VERSION" = "unset" ] || [ -z "$EDGE_TTS_VERSION" ]; then \
+      echo >&2 "ERROR: EDGE_TTS_VERSION 未设置。请先运行 python3 scripts/update_edge_tts_version.py"; \
+      exit 1; \
+    fi && \
+    pip install --break-system-packages \
+      "edge-tts==${EDGE_TTS_VERSION}" \
+      APScheduler==3.11.3 \
+      "dashscope>=1.18.0"
 
 # ========== 6. 构建版本标记（构建时自动生成当天日期，无需手动同步） ==========
 # 说明：镜像构建时间随构建内容同处本文件，改 Dockerfile 重建镜像即自动更新，
