@@ -15,6 +15,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
+      - name: Verify mandatory SOP documents
+        run: |
+          test -s AGENTS.md
+          test -s MODIFICATION_CHECKLIST.md
+          grep -q '标准代码修改 SOP' MODIFICATION_CHECKLIST.md
+          test -s .github/pull_request_template.md
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
