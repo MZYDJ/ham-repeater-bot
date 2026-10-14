@@ -296,6 +296,31 @@ def test_prefill_and_prewarm_sched():
         A.tts_prefill_task()
     check("蓄水池失败记录缺口（不抛）", True)
 
+    # 按单条播报的剩余时间分级：远期 WARNING，30分钟内 ERROR。
+    far_slot = datetime.datetime.now() + datetime.timedelta(hours=2)
+    with mock.patch("announce.get_upcoming_announce_times", return_value=[far_slot]), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
+            mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
+            mock.patch("announce.get_tts_file", return_value="") as failed_tts, \
+            mock.patch("announce.logger.warning") as warn_log, \
+            mock.patch("announce.logger.error") as err_log:
+        A.tts_prefill_task()
+    check("蓄水池远期失败降为 WARNING", warn_log.called and not err_log.called,
+          f"warning={warn_log.call_count}, error={err_log.call_count}")
+    check("蓄水池失败不在 get_tts_file 内直接升级", failed_tts.call_args.kwargs.get("final_failure_level") == logging.INFO
+          and failed_tts.call_args.kwargs.get("attempt_log_level") == logging.INFO)
+
+    near_slot = datetime.datetime.now() + datetime.timedelta(minutes=10)
+    with mock.patch("announce.get_upcoming_announce_times", return_value=[near_slot]), \
+            mock.patch("announce._next_announce_time", return_value=_far_next), \
+            mock.patch("announce.direct_announce.dry_validate_mp3", return_value=False), \
+            mock.patch("announce.get_tts_file", return_value=""), \
+            mock.patch("announce.logger.warning") as warn_log, \
+            mock.patch("announce.logger.error") as err_log:
+        A.tts_prefill_task()
+    check("蓄水池临近播报失败升级为 ERROR", err_log.called and not warn_log.called,
+          f"warning={warn_log.call_count}, error={err_log.call_count}")
+
     # 点名进行中 → 跳过本轮（与预热/播报一致，避免双合成流并发）
     called = []
     with mock.patch("announce.net_active", return_value=True), \
