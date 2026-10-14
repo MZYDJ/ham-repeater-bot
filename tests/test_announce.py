@@ -94,6 +94,11 @@ def test_text_time_pure():
     check("format_minute_text(0)→整", A.format_minute_text(0) == "整")
     check("format_minute_text(30)→三十", A.format_minute_text(30) == "三十")
     check("format_minute_text(15)→15分", A.format_minute_text(15) == "15分")
+    check("format_remaining_time(2522)→42分钟2秒", A.format_remaining_time(2522) == "42分钟2秒")
+    check("format_remaining_time(3600)→1小时", A.format_remaining_time(3600) == "1小时")
+    check("format_remaining_time(3661)→1小时1分钟", A.format_remaining_time(3661) == "1小时1分钟")
+    check("format_remaining_time(86400)→1天", A.format_remaining_time(86400) == "1天")
+    check("format_remaining_time(负数)→0秒", A.format_remaining_time(-5) == "0秒")
 
     txt = A.get_announce_text(T(2026, 9, 30, 17, 30))
     check("get_announce_text 全字段替换",

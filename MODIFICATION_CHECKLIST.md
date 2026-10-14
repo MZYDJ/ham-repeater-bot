@@ -266,7 +266,7 @@
 | test_session | `timeout 60 python3 tests/test_session.py` | 点名会话状态机流程 | 点名（net_control）改动 |
 | py_compile | `python3 -m py_compile <改动的py>` | 语法 | 每次 |
 
-最近一次 GitHub Actions 实测全绿：**feat 399 项**（`test_announce` 109 + `test_watchdog` 56 + `run_tests` 222 + `test_session` 12），另通过 Python 语法编译与 `bash -n start.sh`。每次新增用例后须重新运行并更新该数字。**main 为纯播报定格线（7d3432b），该 commit 不含
+最近一次 GitHub Actions 实测全绿：**feat 404 项**（`test_announce` 114 + `test_watchdog` 56 + `run_tests` 222 + `test_session` 12），另通过 Python 语法编译与 `bash -n start.sh`。每次新增用例后须重新运行并更新该数字。**main 为纯播报定格线（7d3432b），该 commit 不含
 tests/ 目录、无独立测试套件**——main 同步播报修复时按 §1.3-6 将对应测试一并带入（剔除点名用例），
 以带入的播报用例集为准。新增用例后 feat 总数应同步上升。
 

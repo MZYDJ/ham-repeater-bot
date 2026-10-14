@@ -146,6 +146,19 @@ def format_minute_text(minute: int) -> str:
         return "三十"
     else:
         return f"{minute}分"
+def format_remaining_time(seconds: float) -> str:
+    """将剩余秒数格式化为易读的中文时长，避免告警出现大串秒数。"""
+    remaining = max(0, int(seconds))
+    days, remaining = divmod(remaining, 86400)
+    hours, remaining = divmod(remaining, 3600)
+    minutes, seconds = divmod(remaining, 60)
+    if days:
+        return f"{days}天{hours}小时" if hours else f"{days}天"
+    if hours:
+        return f"{hours}小时{minutes}分钟" if minutes else f"{hours}小时"
+    if minutes:
+        return f"{minutes}分钟{seconds}秒" if seconds else f"{minutes}分钟"
+    return f"{seconds}秒"
 def get_announce_text(now: datetime.datetime) -> str:
     return ANNOUNCE_TEMPLATE.format(
         year=now.year,
@@ -380,12 +393,12 @@ def tts_prefill_task():
             if remaining <= PREFILL_ERROR_THRESHOLD_SECONDS:
                 logger.error(
                     f"TTS蓄水池最终失败：{slot_label} 播报音频未就绪，"
-                    f"距离计划播报 {max(0, remaining):.0f}s，已进入风险窗口"
+                    f"距离计划播报 {format_remaining_time(remaining)}，已进入风险窗口"
                 )
             else:
                 logger.warning(
                     f"TTS蓄水池最终失败：{slot_label} 播报音频未就绪，"
-                    f"距离计划播报 {remaining / 60:.0f}min，暂记告警并等待后续补齐"
+                    f"距离计划播报 {format_remaining_time(remaining)}，暂记告警并等待后续补齐"
                 )
             still_missing.append(slot.strftime("%m-%d %H:%M"))
     if synthesized or still_missing:
