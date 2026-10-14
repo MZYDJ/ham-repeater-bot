@@ -984,7 +984,8 @@ def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=
     """点名 TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
     tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice：优先官方 SDK（tts_v2 WebSocket，
     与官方示例一致），SDK 未安装时自动回退 HTTP 接口；复用 asr.api_key。
-    tts.engine=edge → Edge-TTS 兜底。与 announce.py 同款"缓存 + dry-run 校验"，键为全文 md5。"""
+    tts.engine=edge → Edge-TTS 兜底。与 announce.py 同款"缓存 + dry-run 校验"；
+    默认按全文 md5 缓存，调用方可通过 cache_key 纳入合成配置指纹。"""
     import hashlib
     # 默认仍由 tts.engine 控制点名系统；其他调用方可显式覆盖引擎和缓存前缀。
     if engine is None:
