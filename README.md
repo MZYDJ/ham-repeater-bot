@@ -89,7 +89,7 @@ docker compose down
 #### 方式二：飞牛NAS（fnOS）图形界面部署
 飞牛NAS 内置 Docker 管理功能，可通过 Compose 图形界面一键部署：
 1. **上传项目文件**
-   - 将本项目的所有文件（`announce.py`、`direct_announce.py`、`Dockerfile`、`docker-compose.yml`、`start.sh`、`config.json`）上传到飞牛NAS 的共享文件夹中，例如 `/vol1/docker/ham-repeater-bot/`
+   - 将本项目的所有文件（`announce.py`、`direct_announce.py`、`Dockerfile`、`docker-compose.yml`、`start.sh`、`scripts/` 目录和 `config.json`）上传到飞牛NAS 的共享文件夹中，例如 `/vol1/docker/ham-repeater-bot/`
 2. **打开 Docker 管理**
    - 登录飞牛NAS 管理后台
    - 在桌面或应用中心找到 **「Docker」**，点击进入
