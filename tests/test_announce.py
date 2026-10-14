@@ -129,7 +129,24 @@ def test_text_time_pure():
 def test_tts_cache():
     print("\n=== TTS 缓存路径/时长估算 ===")
     p = A.tts_cache_path("hello")
-    check("tts_cache_path md5 文件名", p.name.endswith(".mp3") and len(p.stem) == 32, str(p))
+    check("tts_cache_path 配置指纹文件名", p.name.endswith(".mp3") and len(p.stem) == 32, str(p))
+    with mock.patch("announce.cfg_get", side_effect=lambda *path, default=None:
+                    "zh-CN-YunxiNeural" if path == ("announce", "voice") else default):
+        changed_voice = A.tts_cache_path("hello")
+    check("Edge 音色变化自动切换缓存", changed_voice != p, str(changed_voice))
+    def _cosy_rate(rate):
+        def _get(*path, default=None):
+            if path == ("announce", "cosyvoice_rate"):
+                return rate
+            return default
+        return _get
+    with mock.patch("announce.ANNOUNCE_TTS_ENGINE", "cosyvoice"), \
+            mock.patch("announce.cfg_get", side_effect=_cosy_rate(1.2)):
+        slow_path = A.tts_cache_path("hello")
+    with mock.patch("announce.ANNOUNCE_TTS_ENGINE", "cosyvoice"), \
+            mock.patch("announce.cfg_get", side_effect=_cosy_rate(1.3)):
+        fast_path = A.tts_cache_path("hello")
+    check("CosyVoice 语速变化自动切换缓存", slow_path != fast_path, f"{slow_path} / {fast_path}")
     check("_tts_min_seconds 按长度估算", A._tts_min_seconds("x" * 100) >= 2.0)
     check("_tts_min_seconds 最短2s", A._tts_min_seconds("短") == 2.0)
 
@@ -148,15 +165,12 @@ def test_cosyvoice_announcement_path():
             return 1.2
         return original_cfg_get(*path, default=default)
 
-    import hashlib
     text = "CosyVoice 定时播报测试"
-    cache = Path(A.CACHE_DIR) / ("announce_" + hashlib.md5(text.encode("utf-8")).hexdigest() + ".mp3")
-    cache.unlink(missing_ok=True)
     calls = []
 
     def _fake_synth(text_arg, voice=None, cache_dir=None, **kwargs):
         calls.append((text_arg, voice, cache_dir, kwargs))
-        target = Path(cache_dir) / ("announce_" + hashlib.md5(text_arg.encode("utf-8")).hexdigest() + ".mp3")
+        target = Path(cache_dir) / ("announce_" + kwargs.get("cache_key", "missing") + ".mp3")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"fake-mp3")
         return str(target)
@@ -167,7 +181,9 @@ def test_cosyvoice_announcement_path():
             mock.patch.dict(sys.modules, {"net_control": fake_nc}), \
             mock.patch("announce.direct_announce.dry_validate_mp3", return_value=True):
         p = A.tts_cache_path(text)
+        p.unlink(missing_ok=True)
         result = A.get_tts_file(text, max_retries=1, retry_delay=0)
+        cache = p
     check("定时播报 CosyVoice 使用独立 announce_ 缓存",
           p.name.startswith("announce_") and result == str(p), str(p))
     check("调用点名系统 synth_text", len(calls) == 1 and calls[0][0] == text
@@ -183,7 +199,7 @@ def test_cosyvoice_announcement_path():
     calls.clear()
     def _fake_short_synth(text_arg, voice=None, cache_dir=None, **kwargs):
         calls.append(text_arg)
-        target = Path(cache_dir) / ("announce_" + hashlib.md5(text_arg.encode("utf-8")).hexdigest() + ".mp3")
+        target = Path(cache_dir) / ("announce_" + kwargs.get("cache_key", "missing") + ".mp3")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"short")
         return str(target)
