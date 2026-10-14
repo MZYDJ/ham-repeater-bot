@@ -5,6 +5,8 @@ services:
       context: .
       args:
         BUILD_TIME: "2026-08-30"
+        # 每次构建前先运行 scripts/update_edge_tts_version.py 更新 .env
+        EDGE_TTS_VERSION: ${EDGE_TTS_VERSION:-unset}
     image: announce:latest
 
     restart: unless-stopped

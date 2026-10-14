@@ -3,6 +3,9 @@ edge_user_data/
 tts_cache/
 logs/
 
+# 本地 Compose 构建参数（包含自动查询的依赖版本）
+.env
+
 # Claude Code 本地配置
 .claude/
 

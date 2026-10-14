@@ -63,8 +63,8 @@ environment:
 #### 方式一：命令行启动（Linux / macOS）
 
 ```bash
-# 构建镜像
-docker compose build
+# 推荐：每次构建前查询 edge-tts 最新稳定版，再按版本号构建（版本未变可复用安装层缓存）
+./scripts/build-image.sh
 
 # 启动服务（后台运行）
 docker compose up -d
@@ -81,7 +81,7 @@ docker compose down
 飞牛NAS 内置 Docker 管理功能，可通过 Compose 图形界面一键部署：
 
 1. **上传项目文件**
-   - 将本项目的所有文件（`announce.py`、`direct_announce.py`、`Dockerfile`、`docker-compose.yml`、`start.sh`）上传到飞牛NAS 的共享文件夹中，例如 `/vol1/docker/ham-repeater-bot/`
+   - 将本项目的所有文件（`announce.py`、`direct_announce.py`、`Dockerfile`、`docker-compose.yml`、`start.sh` 和 `scripts/` 目录）上传到飞牛NAS 的共享文件夹中，例如 `/vol1/docker/ham-repeater-bot/`
 
 2. **打开 Docker 管理**
    - 登录飞牛NAS 管理后台
@@ -100,11 +100,11 @@ docker compose down
    - 点击 **「确定」**，系统会自动识别 `docker-compose.yml` 并创建项目
 
 6. **部署启动**
-   - 点击 **「部署」** 或 **「启动」** 按钮
-   - 系统会自动构建镜像并启动容器
-   - 在「容器」页面可以查看运行状态和日志
+   - 每次在图形界面执行构建/重新部署前，先在 NAS 终端进入项目目录，运行 `python3 scripts/update_edge_tts_version.py`，更新本地 `.env` 中的 edge-tts 版本
+   - 再回到 Compose 图形界面点击 **「部署」**、**「重建」** 或对应构建按钮；Compose 会将版本号传入 Dockerfile
+   - 在「容器」页面查看运行状态和日志
 
-> **提示**：首次部署需要构建镜像，可能需要几分钟时间，取决于 NAS 性能和网络速度。
+> **提示**：查询失败会停止更新，不会回退到旧版本；版本号未变化时，Docker 可以复用依赖安装层缓存。
 
 ### 4. 测试与调试
 

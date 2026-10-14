@@ -26,11 +26,18 @@ EOF
 ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # ========== 5. 安装Python业务依赖 ==========
-# edge-tts 不固定版本：每次重建镜像时从配置的 PyPI 镜像安装可获取的最新版本，
-# 避免微软在线 TTS 服务变化后，容器仍长期使用过旧的 edge-tts。
-RUN pip install --break-system-packages --no-cache-dir \
-    edge-tts \
-    APScheduler==3.11.3
+# 每次构建前通过 scripts/update_edge_tts_version.py 查询阿里云 PyPI 镜像的最新稳定版，
+# 并写入被 .gitignore 忽略的 .env；版本号作为 build arg，未变化时可复用本层缓存。
+# BuildKit pip 缓存可减少依赖层失效时的重复下载；未提供版本号时 fail-fast。
+ARG EDGE_TTS_VERSION=unset
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$EDGE_TTS_VERSION" = "unset" ] || [ -z "$EDGE_TTS_VERSION" ]; then \
+      echo >&2 "ERROR: EDGE_TTS_VERSION 未设置。请先运行 python3 scripts/update_edge_tts_version.py"; \
+      exit 1; \
+    fi && \
+    pip install --break-system-packages \
+      "edge-tts==${EDGE_TTS_VERSION}" \
+      APScheduler==3.11.3
 
 # ========== 6. 构建版本标记 ==========
 ARG BUILD_TIME=unknown
