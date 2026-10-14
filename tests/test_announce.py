@@ -298,7 +298,7 @@ def test_prefill_and_prewarm_sched():
         A.tts_prefill_task()
     check("蓄水池失败记录缺口（不抛）", True)
 
-    # 按单条播报的剩余时间分级：远期 WARNING，30分钟内 ERROR。
+    # 按单条播报的剩余时间分级：超过24小时 WARNING，阈值内 ERROR。
     far_slot = datetime.datetime.now() + datetime.timedelta(hours=25)
     with mock.patch("announce.get_upcoming_announce_times", return_value=[far_slot]), \
             mock.patch("announce._next_announce_time", return_value=_far_next), \
