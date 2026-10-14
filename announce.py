@@ -49,6 +49,8 @@ LOG_MAX_BYTES = cfg_get("logging", "max_bytes", default=0.25 * 1024 * 1024)
 LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
 TTS_PREFILL_HOURS = cfg_get("announce", "prefill_hours", default=48)
+# 蓄水池单条 TTS 最终失败的告警升级阈值：默认 24 小时。
+PREFILL_ERROR_THRESHOLD_SECONDS = float(cfg_get("announce", "prefill_error_threshold_seconds", default=86400))
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
 NATIVE_MIC_LEAD = cfg_get("timing", "native_mic_lead", default=0.5)
 
@@ -154,7 +156,8 @@ def tts_cache_path(text: str) -> Path:
     return Path(CACHE_DIR) / f"{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
 
 
-def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) -> str:
+def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
+                 final_failure_level: int = logging.ERROR) -> str:
     """TTS合成，子线程隔离事件循环。含文件完整性校验（libmpg123 dry-run）+ 超时重试"""
     if max_retries is None:
         max_retries = TTS_MAX_RETRIES
@@ -201,7 +204,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None) 
             logger.info(f"等待 {retry_delay} 秒后重试...")
             time.sleep(retry_delay)
 
-    logger.error(f"TTS合成最终失败，已重试 {max_retries} 次")
+    logger.log(final_failure_level, f"TTS合成最终失败，已重试 {max_retries} 次")
     return ""
 
 
@@ -247,7 +250,7 @@ def get_upcoming_announce_times(now: datetime.datetime, hours: int = None):
 
 
 def tts_prefill_task():
-    """TTS 蓄水池：预合成未来播报时段缺失的音频。"""
+    """TTS 蓄水池：预合成未来播报时段缺失的音频，并按距播报时间分级记录最终失败。"""
     now = datetime.datetime.now()
     slots = get_upcoming_announce_times(now)
     synthesized, still_missing = 0, []
@@ -259,9 +262,22 @@ def tts_prefill_task():
         cache_path = tts_cache_path(text)
         if cache_path.exists() and cache_path.stat().st_size > 0:
             continue
-        if get_tts_file(text):
+        # 单条失败由下方按计划播报时间分级；这里避免 get_tts_file 先无条件打 ERROR。
+        if get_tts_file(text, final_failure_level=logging.INFO):
             synthesized += 1
         else:
+            remaining = (slot - datetime.datetime.now()).total_seconds()
+            slot_text = slot.strftime("%Y-%m-%d %H:%M")
+            if remaining <= PREFILL_ERROR_THRESHOLD_SECONDS:
+                logger.error(
+                    f"TTS蓄水池单条音频最终失败：计划播报 {slot_text}，"
+                    f"距离播报 {remaining:.0f}s，已进入风险窗口"
+                )
+            else:
+                logger.warning(
+                    f"TTS蓄水池单条音频最终失败：计划播报 {slot_text}，"
+                    f"距离播报 {remaining / 3600:.1f}h，暂记告警并等待后续补齐"
+                )
             still_missing.append(slot.strftime("%m-%d %H:%M"))
 
     if synthesized or still_missing:
@@ -270,8 +286,6 @@ def tts_prefill_task():
             preview = "、".join(still_missing[:5]) + ("..." if len(still_missing) > 5 else "")
             summary += f"，剩余缺口 {len(still_missing)} 个（{preview}），将持续重试"
         logger.info(summary)
-        if still_missing:
-            logger.warning(f"TTS蓄水池仍有 {len(still_missing)} 个时段未备好，若到播报时仍未成功将现场重试")
 
 
 def trim_python_memory():
