@@ -61,6 +61,7 @@ vi config.json                       # 编辑你的参数
     "voice": "zh-CN-XiaoxiaoNeural", // 定时播报 Edge-TTS 音色
     "cosyvoice_rate": 1.2, // 定时播报 CosyVoice 语速，建议从 1.2 开始试
     "prefill_hours": 48, // 预合成提前量（小时）
+    "prefill_error_threshold_seconds": 86400, // TTS 蓄水池最终失败转 ERROR 的时间阈值（秒，默认24小时）
     "template": "CQ CQ CQ，现在是{year}年{month}月{day}日……",  // 播报内容（中继台呼号/频率/亚音）
     "start_hour": 7,  // 每日首次播报时刻
     "end_hour": 22    // 每日最后一次播报所在小时
@@ -139,6 +140,7 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `tts` | `max_retries` / `retry_delay` | 合成重试次数与间隔 |
 | `tts` | `cache_expire_days` | TTS 缓存过期天数（默认 2） |
 | `announce` | `prefill_hours` | 定时播报 TTS 蓄水池提前量（默认 48 小时） |
+| `announce` | `prefill_error_threshold_seconds` | 蓄水池单条 TTS 最终失败的告警升级阈值（默认 86400 秒 = 24 小时；距计划播报时间大于阈值记 WARNING，不大于阈值记 ERROR） |
 | `announce` | `template` | 播报模板（支持 {year}/{month}/{day}/{weekday}/{hour}/{minute_text} 占位符） |
 | `announce` | `start_hour` / `end_hour` | 每日播报时段（每半小时一次） |
 | `timing` | `native_prep_lead` | 准点前建链提前量（默认 2.5s） |
@@ -224,7 +226,7 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
 CosyVoice 使用 DashScope API Key，优先读取 `net_control.asr.api_key`，也可使用顶层 `asr.api_key`；请勿将真实密钥提交到仓库。`tts.cosyvoice_voice` 必须填写百炼控制台中可用的音色 ID。定时播报在 `announce.tts_engine="cosyvoice"` 时复用底层 `net_control.synth_text()` 合成实现，但显式使用独立的 `announce_` 缓存，并可通过 `announce.cosyvoice_rate` 独立设置语速；点名系统仍由 `tts.engine` 与 `tts.cosyvoice_rate` 控制。缓存指纹包含合成配置，修改音色、模型或语速后会自动重新合成。定时播报默认 `edge`，不会因点名使用 CosyVoice 而自动切换。
 - **完整性校验**：缓存命中/合成完成时，使用 libmpg123 完整解码 dry-run 校验（识别头部损坏 + 尾部截断不完整）；定时播报还会按文本估算最小时长，短音频会删除并重试。
 - **静音裁切**：音频编码前自动裁切头尾静音（默认各留 50ms 余量），缩短播报时长、避免空白。
-TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `announce.prefill_hours` 内所有播报时段缺失的音频，降低准点时对 TTS 服务可用性的依赖；若服务持续中断且缓存耗尽，播报仍会失败。
+TTS 蓄水池机制：播报文本完全由日期+时间决定，可提前计算。服务每小时检查并预合成未来 `announce.prefill_hours` 内所有播报时段缺失的音频，降低准点时对 TTS 服务可用性的依赖；若服务持续中断且缓存耗尽，播报仍会失败。单条音频最终合成失败时，按距计划播报时间的剩余时间分级：大于 `announce.prefill_error_threshold_seconds`（默认 86400 秒，即 24 小时）记为 `WARNING`，进入阈值窗口后升级为 `ERROR`。
 ### 日志与 Webhook
 ```jsonc
 "logging": {
