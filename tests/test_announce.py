@@ -191,6 +191,8 @@ def test_cosyvoice_announcement_path():
     check("显式传入独立引擎/缓存前缀", calls and calls[0][3].get("engine") == "cosyvoice"
           and calls[0][3].get("cache_prefix") == "announce_", str(calls))
     check("定时播报独立语速覆盖", calls and calls[0][3].get("cosyvoice_rate") == 1.2, str(calls))
+    check("合成缓存键与公告缓存路径一致",
+          calls and calls[0][3].get("cache_key") == p.stem.removeprefix("announce_"), str(calls))
     check("CosyVoice 传递单次内部重试", calls and calls[0][3].get("max_retries") == 1
           and calls[0][3].get("retry_delay") == 0, str(calls))
     cache.unlink(missing_ok=True)
