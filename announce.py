@@ -50,6 +50,8 @@ LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
 TTS_PREFILL_HOURS = cfg_get("announce", "prefill_hours", default=48)
 MAX_PREFILL_PER_ROUND = 10   # 蓄水池每轮合成上限：防单轮批量合成长时间占 CPU（缺口靠每小时补充）
+# 蓄水池单条 TTS 距计划播报时间 <= 此阈值时，最终失败升级为 ERROR；默认 30 分钟。
+PREFILL_ERROR_THRESHOLD_SECONDS = float(cfg_get("announce", "prefill_error_threshold_seconds", default=1800))
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
 # 准点前多少秒【发起】抢麦。take_mic 是 send(ApplyMic)→wait_for 回执→上报
 # UserTalking 的串行网络往返（实测约 1.1s），"抢麦成功"完成时刻 ≈ 发起时刻+1.1s。
@@ -212,7 +214,8 @@ def _mark_net_skip(now: datetime.datetime):
         cand = cand.replace(minute=30)
     _last_net_skip_ts = cand.timestamp()
 def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
-                 skip_validate: bool = False) -> str:
+                 skip_validate: bool = False, final_failure_level: int = logging.ERROR,
+                 attempt_log_level: int = logging.WARNING) -> str:
     """TTS 合成，含文件完整性校验和超时重试。
 
     announce.tts_engine=cosyvoice 时复用点名系统的合成实现，但显式传入独立引擎
@@ -232,7 +235,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
     if cache_path.exists():
         if skip_validate or direct_announce.dry_validate_mp3(cache_path, min_seconds=min_secs):
             return str(cache_path)
-        logger.warning(f"TTS缓存文件损坏或残缺（dry-validate失败，需≥{min_secs:.0f}s），将重新合成: {cache_path.name}")
+        logger.log(attempt_log_level, f"TTS缓存文件损坏或残缺（dry-validate失败，需≥{min_secs:.0f}s），将重新合成: {cache_path.name}")
         cache_path.unlink()
     for attempt in range(1, max_retries + 1):
         logger.info(f"合成语音 (第{attempt}/{max_retries}次): {text}")
@@ -260,7 +263,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                 # synth_text 的通用校验不含最小时长要求；删除短音频，避免下一轮误命中缓存。
                 if cache_path.exists():
                     cache_path.unlink()
-                logger.warning(f"CosyVoice 合成失败或音频时长不足 (第{attempt}/{max_retries}次)")
+                logger.log(attempt_log_level, f"CosyVoice 合成失败或音频时长不足 (第{attempt}/{max_retries}次)")
             else:
                 # Edge-TTS 保留原有线程隔离、超时控制和重试行为。
                 syn_error = []
@@ -275,7 +278,7 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                 t.start()
                 t.join(timeout=TTS_TIMEOUT_JOIN)
                 if t.is_alive():
-                    logger.warning(f"TTS合成超时 (第{attempt}次)")
+                    logger.log(attempt_log_level, f"TTS合成超时 (第{attempt}次)")
                     if cache_path.exists() and cache_path.stat().st_size == 0:
                         cache_path.unlink()
                 elif cache_path.exists() and direct_announce.dry_validate_mp3(
@@ -283,13 +286,13 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
                     return str(cache_path)
                 else:
                     reason = syn_error[0] if syn_error else "无异常抛出但文件未生成"
-                    logger.warning(f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
+                    logger.log(attempt_log_level, f"TTS合成失败或文件为空/残缺 (第{attempt}次): {reason}")
         except Exception as e:
-            logger.warning(f"TTS合成异常 (第{attempt}次): {e}")
+            logger.log(attempt_log_level, f"TTS合成异常 (第{attempt}次): {e}")
         if attempt < max_retries:
             logger.info(f"等待 {retry_delay} 秒后重试...")
             time.sleep(retry_delay)
-    logger.error(f"TTS合成最终失败，已重试 {max_retries} 次")
+    logger.log(final_failure_level, f"TTS合成最终失败，已重试 {max_retries} 次")
     return ""
 def prepare_next_tts():
     """预合成下一次准点播报的TTS音频，供播报时直接使用。顺便清理过期缓存。"""
@@ -302,7 +305,8 @@ def prepare_next_tts():
     next_time = slots[0]
     announce_text = get_announce_text(next_time)
     logger.info(f"预合成下一次播报音频: {next_time.strftime('%H:%M')}")
-    tts_file = get_tts_file(announce_text)
+    tts_file = get_tts_file(announce_text, final_failure_level=logging.WARNING,
+                            attempt_log_level=logging.INFO)
     if tts_file:
         logger.info(f"预合成完成: {Path(tts_file).name}")
     else:
@@ -367,9 +371,22 @@ def tts_prefill_task():
         if cache_path.exists() and direct_announce.dry_validate_mp3(
                 cache_path, min_seconds=_tts_min_seconds(text)):
             continue  # 已备好
-        if get_tts_file(text):
+        if get_tts_file(text, final_failure_level=logging.INFO,
+                         attempt_log_level=logging.INFO):
             synthesized += 1
         else:
+            remaining = (slot - datetime.datetime.now()).total_seconds()
+            slot_label = slot.strftime("%m-%d %H:%M")
+            if remaining <= PREFILL_ERROR_THRESHOLD_SECONDS:
+                logger.error(
+                    f"TTS蓄水池最终失败：{slot_label} 播报音频未就绪，"
+                    f"距离计划播报 {max(0, remaining):.0f}s，已进入风险窗口"
+                )
+            else:
+                logger.warning(
+                    f"TTS蓄水池最终失败：{slot_label} 播报音频未就绪，"
+                    f"距离计划播报 {remaining / 60:.0f}min，暂记告警并等待后续补齐"
+                )
             still_missing.append(slot.strftime("%m-%d %H:%M"))
     if synthesized or still_missing:
         summary = f"TTS蓄水池：本轮新合成 {synthesized} 个"
@@ -378,7 +395,7 @@ def tts_prefill_task():
             summary += f"，剩余缺口 {len(still_missing)} 个（{preview}），将持续重试"
         logger.info(summary)
         if still_missing:
-            logger.warning(f"TTS蓄水池仍有 {len(still_missing)} 个时段未备好，若到播报时仍未成功将现场重试")
+            logger.info(f"TTS蓄水池仍有 {len(still_missing)} 个时段未备好，将在后续轮次继续补齐")
 def trim_python_memory():
     """主动归还内存给操作系统：回收循环引用 + glibc 碎片整理。
     每个播报周期都会创建/销毁大量临时对象（音频包缓冲、
@@ -655,8 +672,9 @@ def announce_task():
         logger.info("点名进行中，跳过本次定时播报")
         _mark_net_skip(now)      # 记录本应播报的准点（点名跨准点豁免依据）
         return
-    announce_text = get_announce_text(now)
-    logger.info(f"触发定时播报: {announce_text}")
+    scheduled_at = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+    announce_text = get_announce_text(scheduled_at)
+    logger.info(f"触发定时播报（计划 {scheduled_at:%H:%M}）: {announce_text}")
     global _native_session, _native_prebuilt, _native_session_temp, _native_talk_ts
     # 预建会话先取走（任何出口统一释放）：防 TTS 失败/现场兜底/异常路径把
     # "说话中"会话残留到下一场预热（盲点 A）。命中路径 play 播完已自行放麦。
@@ -674,7 +692,10 @@ def announce_task():
         # 若缓存缺失/合成失败，skip_validate 自动回退正常合成+校验流程。
         if not tts_file:
             _mark_tts_fail()      # 现场失败=播报确实被 TTS 挡住：看门狗"只告警不重启"的唯一依据
-            logger.error("TTS音频文件无效，跳过本次播报")
+            delta = (scheduled_at - datetime.datetime.now()).total_seconds()
+            timing = (f"距离计划播报还有 {delta:.0f}s" if delta > 0
+                      else f"计划播报已过 {abs(delta):.0f}s")
+            logger.error(f"TTS音频文件无效，跳过本次播报（计划 {scheduled_at:%H:%M}，{timing}）")
             return
         _mark_tts_ok()            # 现场合成成功=TTS 已恢复：清除失败标记，防旧标记掩盖后续真假死
         # 预建会话+预构建音频均就绪（预热任务已在准点前抢麦完成，此刻 UserTalking 已上报）
