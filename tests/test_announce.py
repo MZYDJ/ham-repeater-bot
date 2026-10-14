@@ -124,6 +124,8 @@ def test_text_time_pure():
     # 抢麦提前量设计值：默认 1.0s（发起提前1s，take_mic往返~1.1s，完成≈整点后0.1s；
     # 若回到 0.5 则完成必落整点后 ~0.6s，日志显得"每次都迟到抢麦"）
     check("NATIVE_MIC_LEAD 默认1.0s", A.NATIVE_MIC_LEAD == 1.0, A.NATIVE_MIC_LEAD)
+    check("TTS 蓄水池失败阈值默认24小时", A.PREFILL_ERROR_THRESHOLD_SECONDS == 86400,
+          A.PREFILL_ERROR_THRESHOLD_SECONDS)
 
 # ============ 第二部分：TTS 缓存/合成 ============
 def test_tts_cache():
@@ -377,8 +379,9 @@ def test_prefill_and_prewarm_sched():
     A.schedule_tts_prefill()
     got = [A.task_queue.get(), A.task_queue.get(), A.task_queue.get()]
     check("schedule_× 入队正确", got[0] == "prewarm" and isinstance(got[1], tuple)
-          and got[1][0] == "announce" and isinstance(got[1][1], datetime.datetime)
-          and got[1][1].minute in (0, 30) and got[2] == "tts_prefill", str(got))
+          and got[1][0] == "announce" and hasattr(got[1][1], "minute") and got[1][1].minute in (0, 30)
+          and got[1][1].second == 0 and got[1][1].microsecond == 0
+          and got[2] == "tts_prefill", str(got))
     # schedule_net_control → _net_start（不排队）
     with mock.patch.object(A, "_net_start") as ns:
         A.schedule_net_control()
