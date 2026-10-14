@@ -980,7 +980,7 @@ def _cosyvoice_synth(text, cache_path, timeout=28, rate_override=None):
 
 def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=30,
                max_retries=2, retry_delay=5.0, engine=None, cache_prefix="nc_",
-               cosyvoice_rate=None):
+               cosyvoice_rate=None, cache_key=None):
     """点名 TTS 合成（懒加载），返回 mp3 路径；失败返回空串。
     tts.engine=cosyvoice（默认）→ 阿里云百炼 CosyVoice：优先官方 SDK（tts_v2 WebSocket，
     与官方示例一致），SDK 未安装时自动回退 HTTP 接口；复用 asr.api_key。
@@ -994,7 +994,10 @@ def synth_text(text, voice=None, cache_dir=None, timeout_inner=28, timeout_join=
     if cache_dir is None:
         cache_dir = nc_cfg("tts_cache_dir", default=direct_announce.cfg_get(
             "paths", "cache_dir", default="/app/tts_cache"))
-    cache_path = Path(cache_dir) / f"{cache_prefix}{hashlib.md5(text.encode('utf-8')).hexdigest()}.mp3"
+    # cache_key lets callers include engine/model/voice/rate in the cache identity.
+    # Default remains text-only for point-name compatibility.
+    digest = cache_key or hashlib.md5(text.encode('utf-8')).hexdigest()
+    cache_path = Path(cache_dir) / f"{cache_prefix}{digest}.mp3"
     if cache_path.exists() and direct_announce.dry_validate_mp3(cache_path):
         return str(cache_path)
     for attempt in range(1, max_retries + 1):
