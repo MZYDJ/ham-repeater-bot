@@ -50,8 +50,8 @@ LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
 CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
 TTS_PREFILL_HOURS = cfg_get("announce", "prefill_hours", default=48)
 MAX_PREFILL_PER_ROUND = 10   # 蓄水池每轮合成上限：防单轮批量合成长时间占 CPU（缺口靠每小时补充）
-# 蓄水池单条 TTS 距计划播报时间 <= 此阈值时，最终失败升级为 ERROR；默认 30 分钟。
-PREFILL_ERROR_THRESHOLD_SECONDS = float(cfg_get("announce", "prefill_error_threshold_seconds", default=1800))
+# 蓄水池单条 TTS 距计划播报时间 <= 此阈值时，最终失败升级为 ERROR；默认 24 小时。
+PREFILL_ERROR_THRESHOLD_SECONDS = float(cfg_get("announce", "prefill_error_threshold_seconds", default=86400))
 NATIVE_PREP_LEAD = cfg_get("timing", "native_prep_lead", default=2.5)
 # 准点前多少秒【发起】抢麦。take_mic 是 send(ApplyMic)→wait_for 回执→上报
 # UserTalking 的串行网络往返（实测约 1.1s），"抢麦成功"完成时刻 ≈ 发起时刻+1.1s。
