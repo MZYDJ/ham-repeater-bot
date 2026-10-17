@@ -370,6 +370,18 @@ def test_config_defaults():
     check("默认解释词可用", net_control.PHONETIC_ITU["bravo"] == "B")
 
 
+def test_config_boolean_numeric():
+    print("[布尔配置兼容数字 0/1]")
+    coerce = direct_announce._coerce_config_value
+    check("数字 0 转 False", coerce(0, False, ("test", "enabled")) is False)
+    check("数字 1 转 True", coerce(1, False, ("net_control", "enabled")) is True)
+    check("数字 0.0 转 False", coerce(0.0, False, ("test", "enabled")) is False)
+    check("数字 1.0 转 True", coerce(1.0, False, ("net_control", "enabled")) is True)
+    check("布尔 True 保持不变", coerce(True, False, ("test", "enabled")) is True)
+    check("字符串 false 兼容", coerce("false", True, ("test", "enabled")) is False)
+    check("非法数字 2 回退默认", coerce(2, False, ("net_control", "enabled")) is False)
+
+
 def test_retry_reset():
     print("[重试额度恢复（成功抄收后不再哑巴）]")
     sess = net_control.NetControlSession(link=None)
@@ -1474,7 +1486,7 @@ def main():
     for fn in [test_varint_roundtrip, test_parse_udp_voice, test_opus_roundtrip,
                test_voice_capture, test_wav_and_resample, test_decode_callsign,
                test_asr_body, test_vocab_echo_reject, test_conn_reuse,
-               test_config_defaults, test_retry_reset, test_llm_gate_and_missing_fields,
+               test_config_defaults, test_config_boolean_numeric, test_retry_reset, test_llm_gate_and_missing_fields,
                test_info_followup, test_report_clean, test_report_fields,
                test_cosyvoice_tts,
                test_wait_channel_idle, test_export_csv, test_echo_filter,
