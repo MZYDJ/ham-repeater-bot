@@ -1222,12 +1222,12 @@ class NetControlSession:
         - 应答处理是同步的（ASR+TTS 播报期间不检查结束条件），天然"等人说完" """
         start = time.time()
         self._last_activity = start
-        min_window = float(nc_cfg("listen_after_open_seconds", default=60))
-        max_net = float(nc_cfg("max_net_seconds", default=1800))
-        quiet_end = float(nc_cfg("quiet_end_seconds", default=10))
-        grace = float(nc_cfg("grace_seconds", default=300))
+        min_window = float(nc_cfg("listen_after_open_seconds", default=60.0))
+        max_net = float(nc_cfg("max_net_seconds", default=1800.0))
+        quiet_end = float(nc_cfg("quiet_end_seconds", default=10.0))
+        grace = float(nc_cfg("grace_seconds", default=300.0))
         max_count = int(nc_cfg("max_checked_in", default=200))
-        idle_gap = float(nc_cfg("idle_call_seconds", default=300))   # 空闲多久重新呼叫
+        idle_gap = float(nc_cfg("idle_call_seconds", default=300.0))   # 空闲多久重新呼叫
         last_idle_call = start
         deadline = start + max(max_net, min_window)
         hard = deadline + grace
@@ -1283,7 +1283,7 @@ class NetControlSession:
         if not self._current_active or not self._current_call:
             return False
         now = now or time.time()
-        cur_idle = float(nc_cfg("current_idle_timeout", default=90))
+        cur_idle = float(nc_cfg("current_idle_timeout", default=90.0))
         if now - self._current_touch < cur_idle:
             return False
         logger.info(f"当前友台 {self._current_call} 静默 "
@@ -1298,7 +1298,7 @@ class NetControlSession:
 
     def _run_roster(self):
         roster = [str(x).upper() for x in (nc_cfg("roster", default=[]) or [])]
-        max_secs = float(nc_cfg("roster_max_seconds", default=1800))
+        max_secs = float(nc_cfg("roster_max_seconds", default=1800.0))
         started = time.time()
         logger.info(f"固定名单点名，共 {len(roster)} 位（总时长上限 {max_secs:.0f}s）")
         for call in roster:
@@ -1311,7 +1311,7 @@ class NetControlSession:
                                   call=call, call_phonetic=callsign_phonetic(call)))
             try:
                 pcm16, dur, wav, session = self._seg_queue.get(
-                    timeout=float(nc_cfg("roster_call_timeout", default=12)))
+                    timeout=float(nc_cfg("roster_call_timeout", default=12.0)))
             except queue.Empty:
                 self._capture_pump()       # 时间驱动收尾：链路静默时也切段
                 self._flush_pending_report()   # 合并确认：友台说完停稳后统一播报
@@ -1623,7 +1623,7 @@ class NetControlSession:
             if raw and raw.strip():
                 now = time.time()
                 last = self._giveup_said.get(session)
-                gap = float(nc_cfg("giveup_gap_seconds", default=30))
+                gap = float(nc_cfg("giveup_gap_seconds", default=30.0))
                 if last is None or now - last >= gap:
                     self._giveup_said[session] = now
                     logger.info("重复请求额度已用尽，播报未能抄收并恢复额度")
@@ -1697,7 +1697,7 @@ class NetControlSession:
         if self._pending_at is None or not self._current_active:
             self._pending_at = None
             return
-        gap = float(nc_cfg("report_merge_gap_seconds", default=4))
+        gap = float(nc_cfg("report_merge_gap_seconds", default=4.0))
         if not force and time.time() - self._pending_at < gap:
             return
         self._pending_at = None
@@ -2017,7 +2017,7 @@ class NetControlSession:
                 model=nc_cfg("llm", "model", default="glm-4.5-flash"),
                 base_url=nc_cfg("llm", "base_url",
                                 default="https://open.bigmodel.cn/api/paas/v4"),
-                timeout=float(nc_cfg("llm", "timeout", default=8)))
+                timeout=float(nc_cfg("llm", "timeout", default=8.0)))
         if self._llm is False:
             return None
         max_calls = int(nc_cfg("llm", "max_calls", default=3))
@@ -2222,7 +2222,7 @@ class NetControlSession:
            静音累计只在有新音频帧喂入时推进——对方讲完、链路静默后不再有帧，
            _speaking 会无限卡 True（实测"没人说话却等 30s"的根因之一）。
            故加 feed 活性检测：最近 vad_idle_seconds（默认 2s）无新帧即复位。"""
-        stale = float(nc_cfg("talking_stale_seconds", default=4))
+        stale = float(nc_cfg("talking_stale_seconds", default=4.0))
         for s in list(self._talking_sessions):
             last = self._talking_active.get(s, 0)
             if time.time() - last > stale:
@@ -2249,7 +2249,7 @@ class NetControlSession:
                     # 故这里不因 idle 复位，等段真正切出（_speaking=False）。
                     if self._capture._ptt_bound:
                         return True
-                    idle = float(nc_cfg("vad_idle_seconds", default=2))
+                    idle = float(nc_cfg("vad_idle_seconds", default=2.0))
                     last = self._capture.last_feed_at
                     if last is None or time.time() - last > idle:
                         # 正在采集但已 idle 超时：无新帧（对方讲完/链路静默），
@@ -2265,7 +2265,7 @@ class NetControlSession:
                 # （实测 21:20:31-34 对方报信息被 VAD 切成 3 段，段切出瞬间
                 # 主控抢麦成功把对方整句报告压断 → 21:20:35-45 主控播报
                 # 压住对方，对方 21:20:56 才断续继续）。
-                seg_grace = float(nc_cfg("seg_grace_seconds", default=3))
+                seg_grace = float(nc_cfg("seg_grace_seconds", default=3.0))
                 if (self._capture.last_seg_end_at is not None
                         and time.time() - self._capture.last_seg_end_at < seg_grace):
                     return True
@@ -2294,7 +2294,7 @@ class NetControlSession:
         上麦（多人排队），此时不能停泵丢段——循环里同步消费 _seg_queue 并
         _process_segment：识别到谁就点名谁（抄收→成为当前友台→对其播报），
         其余自然排队。识别产生的播报会先完成，再回到本播报。"""
-        timeout = float(nc_cfg("tx_wait_timeout", default=30))
+        timeout = float(nc_cfg("tx_wait_timeout", default=30.0))
         if not self._someone_speaking():
             return True
         logger.info(f"信道占用中，等待对方讲完再播报（最多 {timeout:.0f}s），"
@@ -2493,7 +2493,7 @@ class NetControlSession:
                 play_box["done"] = True
 
         _wd["tmr"] = threading.Timer(
-            float(nc_cfg("play_watchdog_seconds", default=90)), _force_abort)
+            float(nc_cfg("play_watchdog_seconds", default=90.0)), _force_abort)
         _wd["tmr"].daemon = True
         _wd["tmr"].start()
         pt = threading.Thread(target=_do_play, daemon=True)
