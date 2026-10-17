@@ -208,6 +208,8 @@
 
 ### E. 改 TTS / 蓄水池
 - [ ] `announce.py`：合成函数 / 蓄水池 `tts_prefill_task` / 缓存校验；`PREFILL_ERROR_THRESHOLD_SECONDS` 缺省为 86400 秒（24 小时），远期最终失败 `WARNING`、进入阈值窗口后 `ERROR`
+- [ ] 缓存清理：字段使用 `announce.cache_expire_days`；缺省为 `ceil(announce.prefill_hours / 24) + 2` 天；旧 `tts.cache_expire_days` 仅作兼容回退；未来预热范围内的缓存必须避免按 mtime 误删。
+- [ ] 配置读取：通过 `direct_announce.cfg_get` 按默认值类型校验，覆盖字符串数字、字符串布尔值、错误类型回退；直接读取 `CFG` / `.get()` 的配置字段也要纳入审查。
 - [ ] 若定时播报复用点名 TTS：核对 `tts_cache_path` 与 `net_control.synth_text` 的缓存键/目录完全一致；测试共享缓存、合成失败、短音频删除与重试
 - [ ] README：配置说明表 tts 行；"TTS 合成与缓存校验"段；快速开始中写清 CosyVoice API Key 与音色要求；同步记录 `announce.prefill_error_threshold_seconds` 默认值与级别语义
 - [ ] 测试：`test_announce` 的 TTS 缓存/合成/蓄水池用例（包括默认阈值 86400 秒、远期 WARNING、临近 ERROR）；所有 mock Edge-TTS 行为的测试（包括 `test_watchdog`）应显式设 `tts.engine=edge`，避免依赖生产默认值

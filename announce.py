@@ -18,6 +18,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import edge_tts
 import contextlib
 import direct_announce
+import math
 # ====================== 配置项（v2：全部迁移至 config.json） ======================
 # 配置来源优先级：环境变量 HAM_BOT_CONFIG 指定路径 > 脚本同目录 config.json
 # direct_announce.load_config() 已在模块加载时解析；此处复用其 CFG 与 cfg_get。
@@ -47,8 +48,44 @@ CACHE_DIR = cfg_get("paths", "cache_dir", default=r"/app/tts_cache")
 LOG_DIR = cfg_get("paths", "log_dir", default=r"/app/logs")
 LOG_MAX_BYTES = cfg_get("logging", "max_bytes", default=0.25 * 1024 * 1024)
 LOG_BACKUP_COUNT = cfg_get("logging", "backup_count", default=40)
-CACHE_EXPIRE_DAYS = cfg_get("tts", "cache_expire_days", default=2)
 TTS_PREFILL_HOURS = cfg_get("announce", "prefill_hours", default=48)
+
+def _default_cache_expire_days(prefill_hours):
+    """缓存保留默认值 = 蓄水池提前量向上取整天数 + 2 天缓冲。"""
+    try:
+        hours = int(prefill_hours)
+    except (TypeError, ValueError, OverflowError):
+        hours = 48
+    return max(1, math.ceil(hours / 24)) + 2
+
+def _config_has_path(*path):
+    node = direct_announce.CFG
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return False
+        node = node[key]
+    return True
+
+def _get_cache_expire_days():
+    default = _default_cache_expire_days(TTS_PREFILL_HOURS)
+    if _config_has_path("announce", "cache_expire_days"):
+        configured = cfg_get("announce", "cache_expire_days", default=default)
+    elif _config_has_path("tts", "cache_expire_days"):
+        logging.getLogger(__name__).warning(
+            "配置项 tts.cache_expire_days 已迁移至 announce.cache_expire_days；"
+            "当前暂时兼容旧字段，请后续迁移配置"
+        )
+        configured = cfg_get("tts", "cache_expire_days", default=default)
+    else:
+        configured = default
+    if configured < 1:
+        logging.getLogger(__name__).warning(
+            "缓存过期天数必须大于 0，回退动态默认值 %s 天", default
+        )
+        return default
+    return configured
+
+CACHE_EXPIRE_DAYS = _get_cache_expire_days()
 MAX_PREFILL_PER_ROUND = 10   # 蓄水池每轮合成上限：防单轮批量合成长时间占 CPU（缺口靠每小时补充）
 # 蓄水池单条 TTS 距计划播报时间 <= 此阈值时，最终失败升级为 ERROR；默认 24 小时。
 PREFILL_ERROR_THRESHOLD_SECONDS = float(cfg_get("announce", "prefill_error_threshold_seconds", default=86400))
@@ -307,6 +344,36 @@ def get_tts_file(text: str, max_retries: int = None, retry_delay: float = None,
             time.sleep(retry_delay)
     logger.log(final_failure_level, f"TTS合成最终失败，已重试 {max_retries} 次")
     return ""
+def _cleanup_expired_tts_cache(now):
+    """清理过期缓存，但保护蓄水池范围内仍对应未来播报时段的缓存文件。"""
+    expire_threshold = now - datetime.timedelta(days=CACHE_EXPIRE_DAYS)
+    cache_dir = Path(CACHE_DIR)
+    protected_paths = set()
+    for slot in get_upcoming_announce_times(now):
+        try:
+            protected_paths.add(
+                tts_cache_path(get_announce_text(slot)).resolve()
+            )
+        except (OSError, ValueError):
+            logger.exception("计算未来播报缓存路径失败: %s", slot)
+    removed = 0
+    for f in cache_dir.glob("*.mp3"):
+        try:
+            if f.resolve() in protected_paths:
+                continue
+            if f.stat().st_mtime < expire_threshold.timestamp():
+                f.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logger.warning("清理TTS缓存文件失败: %s", f, exc_info=True)
+    if removed:
+        logger.info(
+            "清理过期TTS缓存: 删除 %s 个超过 %s 天且不属于未来播报预热范围的文件",
+            removed, CACHE_EXPIRE_DAYS
+        )
+
 def prepare_next_tts():
     """预合成下一次准点播报的TTS音频，供播报时直接使用。顺便清理过期缓存。"""
     now = datetime.datetime.now()
@@ -324,16 +391,7 @@ def prepare_next_tts():
         logger.info(f"预合成完成: {Path(tts_file).name}")
     else:
         logger.warning("预合成失败，播报时将重试")
-    # 清理过期 TTS 缓存
-    expire_threshold = now - datetime.timedelta(days=CACHE_EXPIRE_DAYS)
-    cache_dir = Path(CACHE_DIR)
-    removed = 0
-    for f in cache_dir.glob("*.mp3"):
-        if f.stat().st_mtime < expire_threshold.timestamp():
-            f.unlink()
-            removed += 1
-    if removed:
-        logger.info(f"清理过期TTS缓存: 删除 {removed} 个超过 {CACHE_EXPIRE_DAYS} 天的文件")
+    _cleanup_expired_tts_cache(now)
 def get_upcoming_announce_times(now: datetime.datetime, hours: int = None):
     """枚举 now 之后 hours 小时内的全部准点播报时刻"""
     if hours is None:

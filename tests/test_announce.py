@@ -133,6 +133,39 @@ def test_text_time_pure():
           A.PREFILL_ERROR_THRESHOLD_SECONDS)
 
 # ============ 第二部分：TTS 缓存/合成 ============
+def test_config_type_validation():
+    print("\n=== 配置类型校验/缓存保留期默认值 ===")
+    original_cfg = DA.CFG
+    original_hours = A.TTS_PREFILL_HOURS
+    try:
+        DA.CFG = {"test": {
+            "int_value": "10",
+            "float_value": "1.25",
+            "bool_false": "false",
+            "bad_int": "ten",
+            "bad_string": 123,
+            "bad_list": "not-a-list",
+        }}
+        check("数字字符串转换为整数", DA.cfg_get("test", "int_value", default=2) == 10)
+        check("数字字符串转换为小数", DA.cfg_get("test", "float_value", default=0.5) == 1.25)
+        check("字符串false解析为布尔假", DA.cfg_get("test", "bool_false", default=True) is False)
+        check("非法整数回退默认值", DA.cfg_get("test", "bad_int", default=7) == 7)
+        check("非字符串配置回退默认值", DA.cfg_get("test", "bad_string", default="safe") == "safe")
+        check("错误列表类型回退默认值", DA.cfg_get("test", "bad_list", default=[]) == [])
+        A.TTS_PREFILL_HOURS = 140
+        DA.CFG = {"tts": {"cache_expire_days": "10"}}
+        check("旧 tts 字段字符串兼容", A._get_cache_expire_days() == 10)
+        DA.CFG = {"tts": {"cache_expire_days": "10"},
+                  "announce": {"cache_expire_days": "12"}}
+        check("新 announce 字段优先", A._get_cache_expire_days() == 12)
+        DA.CFG = {"announce": {"prefill_hours": "140"}}
+        check("缺省缓存保留期按140小时动态计算", A._get_cache_expire_days() == 8)
+    finally:
+        DA.CFG = original_cfg
+        A.TTS_PREFILL_HOURS = original_hours
+    check("140小时默认缓存保留8天", A._default_cache_expire_days(140) == 8)
+    check("48小时默认缓存保留4天", A._default_cache_expire_days(48) == 4)
+
 def test_tts_cache():
     print("\n=== TTS 缓存路径/时长估算 ===")
     p = A.tts_cache_path("hello")
@@ -368,14 +401,20 @@ def test_prefill_and_prewarm_sched():
     old = cache_dir / "old.mp3"
     new = cache_dir / "new.mp3"
     old.write_bytes(b"x"); new.write_bytes(b"x")
-    old_ts = time.time() - 3 * 86400
+    old_ts = time.time() - 6 * 86400
     os.utime(old, (old_ts, old_ts))
+    future_slot = T(2026, 9, 30, 11, 0)
+    future_cache = A.tts_cache_path(A.get_announce_text(future_slot))
+    future_cache.write_bytes(b"old but needed")
+    os.utime(future_cache, (old_ts, old_ts))
     with mock.patch("announce.get_upcoming_announce_times",
-                    return_value=[T(2026, 9, 30, 11, 0)]), \
+                    return_value=[future_slot]), \
             mock.patch("announce.get_tts_file", return_value="x.mp3"):
         A.prepare_next_tts()
-    check("过期缓存清理(>2天删)", not old.exists())
+    check("超过动态保留期的无关缓存删除", not old.exists())
     check("新缓存保留", new.exists())
+    check("未来预热时段缓存即使较旧也受保护", future_cache.exists())
+    future_cache.unlink(missing_ok=True)
 
     # schedule_×：入队内容正确
     A.task_queue.queue.clear()
@@ -762,6 +801,7 @@ def test_da_pure():
 
 if __name__ == "__main__":
     test_text_time_pure()
+    test_config_type_validation()
     test_tts_cache()
     test_cosyvoice_announcement_path()
     test_get_tts_file()

@@ -126,7 +126,7 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 
 交付状态必须分开说明：**代码完成**不等于**CI 通过**，CI 通过也不等于**生产验收通过**。没有目标环境的真实验证证据时，应明确列为“待生产验收”。发布测试命令与部署后检查步骤见 `MODIFICATION_CHECKLIST.md` §2、§5、§6。
 
-`config.example.json` 为**最小可用示例**（只含必填项与最常用项）；以下为 `config.json` 完整字段表（所有字段均带代码内置默认值，缺省项自动回退）。**同步原则：不关心的项从你的 `config.json` 中删掉、跟随程序默认值**——程序升级优化默认值时示例文件与配置无需改动；显式写出的项会覆盖默认值。
+`config.example.json` 为**最小可用示例**（只含必填项与最常用项）；以下为 `config.json` 完整字段表（所有字段均带代码内置默认值，缺省项自动回退）。**同步原则：不关心的项从你的 `config.json` 中删掉、跟随程序默认值**——程序升级优化默认值时示例文件与配置无需改动；显式写出的项会覆盖默认值。配置读取会按默认值类型校验：整数/小数/布尔字段兼容对应的字符串写法（例如 `"10"`、`"false"`），非法类型会告警并回退默认值；字符串字段不会把数字等错误类型静默转成字符串。旧字段 `tts.cache_expire_days` 暂时兼容，新配置请改用 `announce.cache_expire_days`；若两者同时存在，以新字段为准。未显式设置时，缓存保留期为蓄水池提前量向上取整天数再加 2 天缓冲。
 | 配置段 | 字段 | 说明 |
 |--------|------|------|
 | `talk` | `host` / `port` | 滔滔链路服务器地址与端口（默认 totalkd.allptt.com:59638） |
@@ -140,7 +140,7 @@ docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存
 | `tts` | `cosyvoice_sdk` / `cosyvoice_model` / `cosyvoice_voice` | CosyVoice 引擎（DashScope SDK 模式 / 模型 / 音色名） |
 | `tts` | `timeout_inner` / `timeout_join` | TTS 协程/线程超时（秒） |
 | `tts` | `max_retries` / `retry_delay` | 合成重试次数与间隔 |
-| `tts` | `cache_expire_days` | TTS 缓存过期天数（默认 2） |
+| `announce` | `cache_expire_days` | 缓存过期天数（默认按 `ceil(prefill_hours / 24) + 2` 动态计算；新字段优先） |
 | `announce` | `prefill_hours` | 定时播报 TTS 蓄水池提前量（默认 48 小时） |
 | `announce` | `prefill_error_threshold_seconds` | 蓄水池单条 TTS 最终失败的告警升级阈值（默认 86400 秒 = 24 小时；距计划播报时间大于阈值记 WARNING，不大于阈值记 ERROR） |
 | `announce` | `template` | 播报模板（支持 {year}/{month}/{day}/{weekday}/{hour}/{minute_text} 占位符） |
