@@ -56,7 +56,7 @@ def _default_cache_expire_days(prefill_hours):
         hours = int(prefill_hours)
     except (TypeError, ValueError, OverflowError):
         hours = 48
-    return max(1, math.ceil(hours / 24)) + 2
+    return math.ceil(max(0, hours) / 24) + 2
 
 def _config_has_path(*path):
     node = direct_announce.CFG
