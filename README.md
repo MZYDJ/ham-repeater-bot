@@ -104,7 +104,7 @@ docker compose down
    - 再回到 Compose 图形界面点击 **「部署」**、**「重建」** 或对应构建按钮；Compose 会将版本号传入 Dockerfile
    - 在「容器」页面查看运行状态和日志
 
-> **提示**：查询失败会停止更新，不会回退到旧版本；版本号未变化时，Docker 可以复用依赖安装层缓存。
+> **提示**：查询失败会停止更新，不会回退到旧版本；版本号未变化时，Docker 可以复用依赖安装层缓存。脚本还会写入构建时间与 Git 提交号，启动日志会输出这些值以及 `DOCKERFILE_VERSION`、`COMPOSE_CONFIG_VERSION` 和 `APP_VERSION`。其中 Dockerfile/Compose 版本号在对应文件中维护；修改对应文件后请递增版本号。若部署目录不是 Git 克隆目录，`GIT_COMMIT` 会显示 `unknown`，不会猜测提交号。
 
 ### 4. 测试与调试
 
