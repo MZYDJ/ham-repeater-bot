@@ -26,6 +26,10 @@ BT_FILE="$(cat /app/BUILD_TIME 2>/dev/null || echo -)"
 BT_IMG="$(cat /opt/build_time 2>/dev/null || echo -)"
 BT_ENV="${BUILD_TIME:--}"
 echo "[ENV] BUILD_TIME: /app=${BT_FILE} | /opt=${BT_IMG} | env=${BT_ENV}"
+echo "[ENV] GIT_COMMIT: ${GIT_COMMIT:-unknown}"
+echo "[ENV] DOCKERFILE_VERSION: ${DOCKERFILE_VERSION:-unknown}"
+echo "[ENV] COMPOSE_CONFIG_VERSION: ${COMPOSE_CONFIG_VERSION:-unknown}"
+echo "[ENV] APP_VERSION: ${APP_VERSION:-unknown}"
 # 直连链路音频编解码库自检（缺失则起服务也必然播报失败，fail-fast 直接退出）
 if ! python3 -c 'import ctypes.util; raise SystemExit(0 if ctypes.util.find_library("opus") else 1)' 2>/dev/null; then
     echo "[ERROR] libopus 缺失——Opus 编解码必然失败，播报无法进行。请安装：apt-get install -y libopus0 后重建/重启容器。"
