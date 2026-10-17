@@ -40,8 +40,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       APScheduler==3.11.3
 
 # ========== 6. 构建版本标记 ==========
+# 元数据放在依赖安装层之后，版本变化不会导致 edge-tts/APScheduler 重新安装。
 ARG BUILD_TIME=unknown
-ENV BUILD_TIME=${BUILD_TIME}
+ARG GIT_COMMIT=unknown
+ARG DOCKERFILE_VERSION=1
+ENV BUILD_TIME=${BUILD_TIME} \
+    GIT_COMMIT=${GIT_COMMIT} \
+    DOCKERFILE_VERSION=${DOCKERFILE_VERSION}
 
 # ========== 7. 工作目录 ==========
 WORKDIR /app
