@@ -81,22 +81,19 @@ def update_env_values(env_path: Path, values: dict[str, str]) -> None:
     updated: list[str] = []
     seen: set[str] = set()
     for line in lines:
-        matched_key = next(
-            (key for key in values if re.match(rf"^[ \\t]*{re.escape(key)}[ \\t]*=", line)),
-            None,
-        )
-        if matched_key is None:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped else None
+        if key not in values:
             updated.append(line)
-        elif matched_key not in seen:
-            updated.append(f"{matched_key}={values[matched_key]}")
-            seen.add(matched_key)
+        elif key not in seen:
+            updated.append(f"{key}={values[key]}")
+            seen.add(key)
     for key, value in values.items():
         if key not in seen:
             if updated and updated[-1] != "":
                 updated.append("")
             updated.append(f"{key}={value}")
-    env_path.write_text("\\n".join(updated).rstrip("\\n") + "\\n", encoding="utf-8")
-
+    env_path.write_text("\n".join(updated).rstrip("\n") + "\n", encoding="utf-8")
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
