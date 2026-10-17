@@ -142,7 +142,7 @@ NATIVE_MIC_LEAD = 0.5    # 准点前该秒数才发起抢麦（不提前占麦�
 
 ### TTS 合成
 
-缓存过期周期使用 `announce.cache_expire_days` 配置（可选）；未设置时按 `ceil(announce.prefill_hours / 24) + 2` 天自动计算。旧配置 `tts.cache_expire_days` 暂时兼容，但新配置项优先。数字和布尔参数会按代码默认类型校验，并兼容数字字符串与 `"true"/"false"` 字符串。
+缓存过期周期使用 `announce.cache_expire_days` 配置（可选）；未设置时按 `ceil(announce.prefill_hours / 24) + 2` 天自动计算。旧配置 `tts.cache_expire_days` 暂时兼容，但新配置项优先。数字和布尔参数会按代码默认类型校验，并兼容数字字符串与 `"true"/"false"` 字符串；布尔字段也接受 JSON 数字 `0`/`1`（以及 `0.0`/`1.0`），分别表示 `false`/`true`，其他数字仍会告警并回退默认值。
 
 ```python
 announce.voice = "zh-CN-XiaoxiaoNeural"       # 定时播报 Edge-TTS 音色

@@ -65,15 +65,22 @@ def _coerce_config_value(value, default, path):
     expected = type(default)
     try:
         if expected is bool:
+            # JSON 中 true/false 是首选写法；兼容数字 0/1，避免常见配置习惯导致误回退。
+            # bool 是 int 的子类，因此必须先排除 bool 再判断数字。
             if isinstance(value, bool):
                 return value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if value == 0:
+                    return False
+                if value == 1:
+                    return True
             if isinstance(value, str):
                 normalized = value.strip().lower()
                 if normalized in ("true", "1", "yes", "on"):
                     return True
                 if normalized in ("false", "0", "no", "off"):
                     return False
-            raise ValueError("期望布尔值")
+            raise ValueError("期望布尔值、0/1 或对应字符串")
         if expected is int:
             if isinstance(value, bool):
                 raise ValueError("布尔值不能作为整数")
