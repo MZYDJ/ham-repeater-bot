@@ -143,9 +143,12 @@ NATIVE_MIC_LEAD = 0.5    # 准点前该秒数才发起抢麦（不提前占麦�
 
 ### TTS 合成
 
+缓存过期周期使用 `announce.cache_expire_days` 配置（可选）；未设置时按 `ceil(announce.prefill_hours / 24) + 2` 天自动计算。旧配置 `tts.cache_expire_days` 暂时兼容，但新配置项优先。数字和布尔参数会按代码默认类型校验，并兼容数字字符串与 `"true"/"false"` 字符串。
+
 ```python
 announce.voice = "zh-CN-XiaoxiaoNeural"       # 定时播报 Edge-TTS 音色
 announce.prefill_hours = 48                 # 定时播报 TTS 蓄水池提前量（小时）
+announce.cache_expire_days = 4              # 可选；默认 ceil(prefill_hours / 24) + 2 天
 announce.prefill_error_threshold_seconds = 86400 # 蓄水池最终失败告警升级阈值（默认24小时）
 tts.voice = "zh-CN-XiaoxiaoNeural"           # 点名系统 Edge-TTS 音色（若启用）
 CACHE_EXPIRE_DAYS = 2                         # TTS 缓存过期天数

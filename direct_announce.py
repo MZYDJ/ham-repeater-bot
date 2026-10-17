@@ -37,6 +37,7 @@ import array
 import ctypes
 import ctypes.util
 import json
+import math
 import os
 import socket
 import ssl
@@ -59,25 +60,83 @@ def load_config(path=None):
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}, p
 CFG, CFG_PATH = load_config()
+def _coerce_config_value(value, default, path):
+    """按代码默认值校验配置类型，并兼容 JSON 中常见的数字/布尔字符串。"""
+    expected = type(default)
+    try:
+        if expected is bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in ("true", "1", "yes", "on"):
+                    return True
+                if normalized in ("false", "0", "no", "off"):
+                    return False
+            raise ValueError("期望布尔值")
+        if expected is int:
+            if isinstance(value, bool):
+                raise ValueError("布尔值不能作为整数")
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str):
+                return int(value.strip())
+            raise ValueError("期望整数或数字字符串")
+        if expected is float:
+            if isinstance(value, bool):
+                raise ValueError("布尔值不能作为小数")
+            if isinstance(value, (int, float)):
+                result = float(value)
+            elif isinstance(value, str):
+                result = float(value.strip())
+            else:
+                raise ValueError("期望数值或数字字符串")
+            if not math.isfinite(result):
+                raise ValueError("数值必须为有限数")
+            return result
+        if expected is str:
+            if isinstance(value, str):
+                return value
+            raise ValueError("期望字符串")
+        if expected is list:
+            if isinstance(value, list):
+                return value
+            raise ValueError("期望列表")
+        if expected is dict:
+            if isinstance(value, dict):
+                return value
+            raise ValueError("期望对象")
+        return value
+    except (TypeError, ValueError, OverflowError) as exc:
+        import logging
+        logging.getLogger(__name__).warning(
+            "配置类型错误 %s：%r（%s），回退默认值 %r",
+            ".".join(path), value, exc, default
+        )
+        return default
+
 def cfg_get(*path, default=None):
-    """从配置 dict 按路径取值，缺失返回 default。"""
+    """按路径读取配置；依据 default 的类型校验/转换，非法值告警并回退默认值。"""
     node = CFG
     for key in path:
         if not isinstance(node, dict) or key not in node:
             return default
         node = node[key]
-    return node
+    if default is None:
+        return node
+    return _coerce_config_value(node, default, path)
+
 _talk = cfg_get("talk", default={}) or {}
-_client = _talk.get("client_profile", {}) or {}
-HOST = _talk.get("host", "totalkd.allptt.com")
-PORT = _talk.get("port", 59638)
-USE_TLS = _talk.get("use_tls", True)
-USERNAME = _talk.get("username", "")
-PASSWORD = _talk.get("password", "")
-RELEASE = _client.get("release", "V2.8.5")
-OS_NAME = _client.get("os_name", "Android")
-OS_VERSION = _client.get("os_version", "16")
-MODEL = _client.get("model", "PKT110")
+_client = cfg_get("talk", "client_profile", default={}) or {}
+HOST = cfg_get("talk", "host", default="totalkd.allptt.com")
+PORT = cfg_get("talk", "port", default=59638)
+USE_TLS = cfg_get("talk", "use_tls", default=True)
+USERNAME = cfg_get("talk", "username", default="")
+PASSWORD = cfg_get("talk", "password", default="")
+RELEASE = cfg_get("talk", "client_profile", "release", default="V2.8.5")
+OS_NAME = cfg_get("talk", "client_profile", "os_name", default="Android")
+OS_VERSION = cfg_get("talk", "client_profile", "os_version", default="16")
+MODEL = cfg_get("talk", "client_profile", "model", default="PKT110")
 # ---------------- protobuf 编解码（与 validate_client.py 同源已验证） ----------------
 def varint_enc(n):
     out = bytearray()
