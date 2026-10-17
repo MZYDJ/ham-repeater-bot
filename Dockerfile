@@ -26,18 +26,24 @@ EOF
 ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 
 # ========== 5. 安装Python业务依赖 ==========
-# scripts/update_edge_tts_version.py 每次构建前查询阿里云 PyPI 镜像的最新稳定版，
-# 并写入被 .gitignore 忽略的 .env；版本号作为 build arg，未变化时可复用本层缓存。
-# 使用 BuildKit pip 缓存：即使其他依赖变化需要重装，也可复用已下载的 wheel。
-# 不提供版本号时 fail-fast，避免 GUI 直接构建时静默沿用旧版。
-ARG EDGE_TTS_VERSION=unset
+# GUI Compose 构建无需预先生成 .env：未显式传版本时，在依赖层构建时自动查询阿里云 PyPI 最新稳定版。
+# 命令行 scripts/build-image.sh 会先查询版本并显式传入 build arg；版本未变化时可复用本层缓存。
+# 使用 BuildKit pip 缓存：依赖层重建时仍可复用已下载的 wheel。
+ARG EDGE_TTS_VERSION=auto
 # dashscope>=1.18 提供 tts_v2 SpeechSynthesizer（CosyVoice 点名 TTS 官方 SDK，
 # WebSocket 流式；net_control 已做旧版 timeout 参数兼容 + SDK 缺失自动回退 HTTP）
 RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ "$EDGE_TTS_VERSION" = "unset" ] || [ -z "$EDGE_TTS_VERSION" ]; then \
-      echo >&2 "ERROR: EDGE_TTS_VERSION 未设置。请先运行 python3 scripts/update_edge_tts_version.py"; \
-      exit 1; \
+    if [ -z "$EDGE_TTS_VERSION" ] || [ "$EDGE_TTS_VERSION" = "unset" ] || [ "$EDGE_TTS_VERSION" = "auto" ]; then \
+      echo "[INFO] 未指定 EDGE_TTS_VERSION，自动查询阿里云 PyPI 最新稳定版..." && \
+      VERSION_OUTPUT="$(python3 -m pip index versions --index-url https://mirrors.aliyun.com/pypi/simple/ edge-tts 2>&1)" || { \
+        echo >&2 "[ERROR] 查询 edge-tts 最新版本失败"; echo >&2 "$VERSION_OUTPUT"; exit 1; \
+      } && \
+      EDGE_TTS_VERSION="$(printf '%s\n' "$VERSION_OUTPUT" | sed -n 's/^edge-tts (\([^)]*\)).*/\1/p' | head -n 1)" && \
+      if [ -z "$EDGE_TTS_VERSION" ]; then \
+        echo >&2 "[ERROR] 无法从 PyPI 响应中解析 edge-tts 版本"; echo >&2 "$VERSION_OUTPUT"; exit 1; \
+      fi; \
     fi && \
+    echo "[INFO] 安装 edge-tts==${EDGE_TTS_VERSION}" && \
     pip install --break-system-packages \
       "edge-tts==${EDGE_TTS_VERSION}" \
       APScheduler==3.11.3 \

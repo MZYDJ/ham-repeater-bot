@@ -52,5 +52,23 @@ class EdgeTTSBuildVersionTests(unittest.TestCase):
             self.assertEqual(env.read_text(encoding="utf-8"), "EDGE_TTS_VERSION=7.3.1\n")
 
 
+class DockerBuildFlowTests(unittest.TestCase):
+    def test_dockerfile_auto_resolves_version_when_build_arg_is_missing(self):
+        dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG EDGE_TTS_VERSION=auto", dockerfile)
+        self.assertIn("python3 -m pip index versions --index-url https://mirrors.aliyun.com/pypi/simple/ edge-tts", dockerfile)
+        self.assertIn('edge-tts==${EDGE_TTS_VERSION}', dockerfile)
+        self.assertNotIn("请先运行 python3 scripts/update_edge_tts_version.py", dockerfile)
+
+    def test_compose_gui_build_does_not_depend_on_edge_tts_env(self):
+        compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertNotIn("EDGE_TTS_VERSION:", compose)
+        self.assertIn("GIT_COMMIT:", compose)
+
+    def test_cli_build_passes_explicitly_queried_version(self):
+        script = (ROOT / "scripts/build-image.sh").read_text(encoding="utf-8")
+        self.assertIn('docker compose build --build-arg "EDGE_TTS_VERSION=$EDGE_TTS_VERSION" announce', script)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

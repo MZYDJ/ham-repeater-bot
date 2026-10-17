@@ -4,8 +4,7 @@ services:
     build:
       context: .
       args:
-        # 每次构建前先运行 scripts/update_edge_tts_version.py 更新 .env
-        EDGE_TTS_VERSION: ${EDGE_TTS_VERSION:-unset}
+        # 未指定 edge-tts 版本时，Dockerfile 在依赖层构建时自动查询最新版
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
         DOCKERFILE_VERSION: "2"
       # 构建时间由 Dockerfile 写入 /opt/build_time；其余版本标识在此维护

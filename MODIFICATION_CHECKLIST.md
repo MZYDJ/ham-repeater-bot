@@ -231,12 +231,12 @@
 - ⚠️ 易漏：`net_control` 通过局部 import 使用 DA 的函数，改 DA 签名要看 net_control 调用点
 
 ### H. 改构建 / 部署（Dockerfile / docker-compose / start.sh）
-- [ ] `Dockerfile`：依赖安装（改包后必须确认 start.sh 自检段同步）；`edge-tts` 通过 `EDGE_TTS_VERSION` 精确固定到本次查询的版本
-- [ ] `scripts/update_edge_tts_version.py`：每次构建前查询阿里云 PyPI 镜像的最新稳定版并更新本地 `.env`；查询失败必须 fail-fast，禁止静默沿用旧版本
-- [ ] `scripts/build-image.sh`：命令行构建入口，先更新版本再构建
-- [ ] `docker-compose.yml`：将 `.env` 中的 `EDGE_TTS_VERSION` 作为 build arg；`.env` 必须加入 `.gitignore`
-- [ ] 缓存：`EDGE_TTS_VERSION` 不变时复用依赖安装层；版本变化时仅使依赖安装层失效；BuildKit pip cache 用于减少重复下载
-- [ ] 飞牛 OS 图形界面：每次点“重建/部署”前先在项目目录运行 `python3 scripts/update_edge_tts_version.py`，图形界面不会自动执行该查询脚本
+- [ ] `Dockerfile`：依赖安装（改包后必须确认 start.sh 自检段同步）；缺少 `EDGE_TTS_VERSION` 时应在依赖层构建时自动查询最新版，不能要求 GUI 用户先生成 `.env`
+- [ ] `docker-compose.yml`：图形界面构建不得依赖被 `.gitignore` 忽略的版本变量；版本 arg 由命令行构建脚本显式传入
+- [ ] `scripts/update_edge_tts_version.py`：命令行构建前查询阿里云 PyPI 镜像的最新稳定版并更新本地 `.env`；查询失败必须 fail-fast，禁止静默沿用旧版本
+- [ ] `scripts/build-image.sh`：命令行构建入口，每次主动查询版本并通过 build arg 传入；版本未变化时依赖层可复用缓存
+- [ ] 缓存：版本 arg 不变时复用依赖安装层；BuildKit pip cache 用于减少重复下载
+- [ ] GUI 缓存语义：依赖层缓存命中时不会重新查询最新版；若要求每次主动检查最新版，使用命令行构建入口
 - [ ] `start.sh`：环境自检 / 配置文件校验 / BUILD_TIME 读取优先级
 - [ ] 测试：`bash -n start.sh`、`bash -n scripts/build-image.sh`、`python3 tests/test_build_image.py`
 - [ ] README：依赖更新与 GUI 构建步骤同步
