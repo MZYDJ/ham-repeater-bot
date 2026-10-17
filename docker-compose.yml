@@ -4,9 +4,7 @@ services:
     build:
       context: .
       args:
-        BUILD_TIME: ${BUILD_TIME:-unknown}
-        GIT_COMMIT: ${GIT_COMMIT:-unknown}
-        DOCKERFILE_VERSION: "1"
+        BUILD_TIME: "2026-08-30"
         # 每次构建前先运行 scripts/update_edge_tts_version.py 更新 .env
         EDGE_TTS_VERSION: ${EDGE_TTS_VERSION:-unset}
     image: announce:latest
@@ -15,8 +13,6 @@ services:
 
     environment:
       - TZ=Asia/Shanghai
-      - APP_VERSION=v2
-      - COMPOSE_CONFIG_VERSION=1
       # 滔滔链路账号（必填）
       - TALK_USERNAME=YOUR_TALK_USERNAME
       - TALK_PASSWORD=YOUR_TALK_PASSWORD
