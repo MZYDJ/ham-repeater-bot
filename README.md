@@ -215,14 +215,13 @@ HAM_BOT_CONFIG=/app/config.json python3 announce.py
   "engine": "cosyvoice",                    // 仅控制点名系统
   "cosyvoice_model": "cosyvoice-v3.5-flash",
   "cosyvoice_voice": "你的百炼音色ID",       // 点名与定时播报共用此 CosyVoice 音色 ID
-  "voice": "zh-CN-XiaoxiaoNeural",          // 仅点名系统使用 Edge-TTS 时生效
-  "cache_expire_days": 2                     // TTS 缓存过期天数
+  "voice": "zh-CN-XiaoxiaoNeural"           // 仅点名系统使用 Edge-TTS 时生效
 },
 "announce": {
   "tts_engine": "cosyvoice",
   "voice": "zh-CN-XiaoxiaoNeural",          // 仅定时播报使用 Edge-TTS 时生效
   "cosyvoice_rate": 1.2,                    // 定时播报语速
-  "prefill_hours": 48                        // 定时播报预合成提前量（小时）
+  "prefill_hours": 48                        // 定时播报预合成提前量（小时）；缓存保留天数默认自动计算
 }
 ```
 CosyVoice 使用 DashScope API Key，优先读取 `net_control.asr.api_key`，也可使用顶层 `asr.api_key`；请勿将真实密钥提交到仓库。`tts.cosyvoice_voice` 必须填写百炼控制台中可用的音色 ID。定时播报在 `announce.tts_engine="cosyvoice"` 时复用底层 `net_control.synth_text()` 合成实现，但显式使用独立的 `announce_` 缓存，并可通过 `announce.cosyvoice_rate` 独立设置语速；点名系统仍由 `tts.engine` 与 `tts.cosyvoice_rate` 控制。缓存指纹包含合成配置，修改音色、模型或语速后会自动重新合成。定时播报默认 `edge`，不会因点名使用 CosyVoice 而自动切换。
