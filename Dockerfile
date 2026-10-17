@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # 元数据放在依赖安装层之后，修改版本标识不会触发 edge-tts / APScheduler / dashscope 重新安装。
 ARG GIT_COMMIT=unknown
 ARG DOCKERFILE_VERSION=2
-ENV GIT_COMMIT=${GIT_COMMIT} \\
+ENV GIT_COMMIT=${GIT_COMMIT} \
     DOCKERFILE_VERSION=${DOCKERFILE_VERSION}
 RUN date -u +'%Y-%m-%d %H:%M' > /opt/build_time
 
