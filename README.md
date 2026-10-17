@@ -290,6 +290,16 @@ TTS 优化要点：呼号一律用解释法英文单词（`{call_phonetic}`）�
 
 > **配置同步原则**：`config.example.json` 为**最小可用示例**（只含必填项与最常用项），缺省字段一律回退到代码内置默认值（见上文配置说明表）。程序升级优化默认值时，示例文件通常无需改动；若你在服务器 `config.json` 中显式写入了某项，它会覆盖代码默认值——不关心的项请从 `config.json` 删掉、跟随程序默认。
 
+## 镜像版本信息
+容器启动日志会输出以下元数据，便于确认实际运行的构建与配置版本：
+- `BUILD_TIME`：镜像构建时间（`/opt/build_time`）；若存在 `/app/BUILD_TIME`，启动日志也会单独显示该发布标记。
+- `GIT_COMMIT`：构建前运行 `scripts/update_edge_tts_version.py` 时读取的 Git 短提交号。若部署目录不是 Git 克隆目录，则显示 `unknown`。
+- `DOCKERFILE_VERSION`：Dockerfile 维护的版本号；修改 Dockerfile 后应递增。
+- `COMPOSE_CONFIG_VERSION`：Compose 配置维护的版本号；修改 `docker-compose.yml` 后应递增。
+- `APP_VERSION`：应用配置/功能版本标识。
+
+使用项目提供的 `scripts/build-image.sh` 构建时，会先查询 Edge-TTS 最新稳定版并更新本地 `.env`，然后通过 Compose 将 Git 提交号注入镜像。版本元数据位于依赖安装层之后，不会仅因版本号变化而重新安装 Python 依赖。
+
 ## 数据目录
 `docker-compose.yml` 将项目目录挂载到容器 `/app`，运行时会在 `paths.cache_dir` 与 `paths.log_dir` 指定目录下自动创建子目录：
 | 子目录 | 说明 |
