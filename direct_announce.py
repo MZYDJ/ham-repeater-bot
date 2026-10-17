@@ -742,20 +742,24 @@ def main():
     args = ap.parse_args()
     if args.config:
         # 重载配置：更新模块级 CFG 与派生常量（全局 dict 刷新，避免 import 期绑定）
-        new_cfg, _ = load_config(args.config)
-        _t = new_cfg.get("talk", {}) or {}
-        _cl = _t.get("client_profile", {}) or {}
+        new_cfg, new_path = load_config(args.config)
         g = globals()
         g["CFG"] = new_cfg
-        g["HOST"] = _t.get("host", "totalkd.allptt.com")
-        g["PORT"] = _t.get("port", 59638)
-        g["USE_TLS"] = _t.get("use_tls", True)
-        g["USERNAME"] = _t.get("username", "")
-        g["PASSWORD"] = _t.get("password", "")
-        g["RELEASE"] = _cl.get("release", "V2.8.5")
-        g["OS_NAME"] = _cl.get("os_name", "Android")
-        g["OS_VERSION"] = _cl.get("os_version", "16")
-        g["MODEL"] = _cl.get("model", "PKT110")
+        g["CFG_PATH"] = new_path
+        # 重新加载后仍经同一类型校验入口读取，避免 CLI --config 绕过配置验证。
+        g["HOST"] = cfg_get("talk", "host", default="totalkd.allptt.com")
+        g["PORT"] = cfg_get("talk", "port", default=59638)
+        g["USE_TLS"] = cfg_get("talk", "use_tls", default=True)
+        g["USERNAME"] = cfg_get("talk", "username", default="")
+        g["PASSWORD"] = cfg_get("talk", "password", default="")
+        g["RELEASE"] = cfg_get("talk", "client_profile", "release", default="V2.8.5")
+        g["OS_NAME"] = cfg_get("talk", "client_profile", "os_name", default="Android")
+        g["OS_VERSION"] = cfg_get("talk", "client_profile", "os_version", default="16")
+        g["MODEL"] = cfg_get("talk", "client_profile", "model", default="PKT110")
+        if "--host" not in sys.argv:
+            args.host = HOST
+        if "--port" not in sys.argv:
+            args.port = PORT
     if args.dry_run:
         packets, n_frames = build_audio(args.mp3)
         print("管线自测: %.1f秒 → %d 帧 → %d 包" % (n_frames * 0.02, n_frames, len(packets)))
