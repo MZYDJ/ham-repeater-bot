@@ -114,8 +114,13 @@ docker exec -it announce python3 announce.py -t [次数]
 docker exec -it announce python3 announce.py -i
 # 直连客户端独立自测（不联网，只跑音频编解码管线）
 docker exec -it announce python3 direct_announce.py --mp3 tts_cache/某个缓存文件.mp3 --dry-run
+# SSTV PCM WAV：先本地验证，不联网、不裁切头尾
+docker exec -it announce python3 direct_announce.py --wav /app/图像音频.wav --dry-run
+# 受控窗口内真实发射（会占用链路）
+docker exec -it announce python3 direct_announce.py --wav /app/图像音频.wav
 ```
-> 注意：测试模式与常驻链路同账号并发会互踢（服务器顶掉旧会话），触发一条告警后自动重连，属正常现象。
+> WAV 支持未压缩整数 PCM（8/16/24/32-bit、单声道或立体声），转换到 48kHz 单声道后沿用现有 12kbps Opus 与 185 字节包格式；WAV 路径不裁切头尾。优先使用 48kHz、16-bit、单声道 WAV。真实发送会实际发射；不要与同账号常驻播报/点名并发运行。
+> 注意：测试模式与常驻链路同账号并发会互踢（服务器顶掉旧会话），触发一条告警后自动重连，属正常现象.
 ## 配置说明
 > **修改程序前必读**：`MODIFICATION_CHECKLIST.md` 是修改检查清单（SOP），按修改类型列出全部需同步的位置（代码/示例配置/README/测试/版本标记/部署脚本），防止改一处漏多处。发布固定流程见该文件 §1。
 

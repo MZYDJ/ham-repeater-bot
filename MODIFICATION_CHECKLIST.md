@@ -156,7 +156,7 @@
 
 | 步骤 | 动作 | 命令/位置 | 失败后果 |
 |---|---|---|---|
-| P1 | 全量四套件测试 | `python3 tests/test_announce.py`、`python3 tests/test_watchdog.py`、`timeout 110 python3 tests/run_tests.py`、`timeout 60 python3 tests/test_session.py` | 有回归即停止，先修 |
+| P1 | 全量四套件测试 | `python3 tests/test_announce.py`、`python3 tests/test_watchdog.py`、`python3 tests/test_direct_announce_audio.py`、`timeout 110 python3 tests/run_tests.py`、`timeout 60 python3 tests/test_session.py` | 有回归即停止，先修 |
 | P2 | 语法编译 | `python3 -m py_compile announce.py direct_announce.py net_control.py`（及改动的 py 文件） | 语法错误 |
 | P3 | 版本标记 | ①**重建镜像场景**：Dockerfile 已自动生成 `/opt/build_time`；②**zip 覆盖场景**：打包前生成 `BUILD_TIME`（内容=`date '+%Y-%m-%d %H:%M'`，放入 zip 根，即 `/app/BUILD_TIME`）；③**git pull + 宿主目录挂载场景**：在宿主部署目录执行 `date '+%Y-%m-%d %H:%M' > BUILD_TIME`，该文件被 `.gitignore` 忽略，不会提交，但会通过挂载映射到 `/app/BUILD_TIME` | 线上 BUILD_TIME 陈旧，无法判断跑的是哪版 |
 | P4 | 提交+推送（按 §1 判定分支） | 默认只提交并 push `feat/net-control`；仅当本次改动按 §1.2 判定为**真正影响播报**的修复时，才 cherry-pick 同步 `main`（纯播报定格线）并 push。优先使用当前已验证可写的 GitHub Connector/API；若写入失败，再按授权情况使用 PAT + Bash/git | main 该同步的没同步 / 点名改动误进 main |
@@ -291,3 +291,10 @@ docker logs announce --since "30s" | grep "BUILD_TIME: /app="   # 三来源：/a
 docker logs announce -f            # 盯到首个准点播报完成（XX:00 / XX:30）
 grep -c native_mic_lead /app/config.json   # 应输出 0（旧显式值已删）或 1.0
 ```
+
+
+### J. 新增直连 WAV 输入
+- [ ] 保留 MP3 入口与 `announce_once()` 兼容；WAV 不静音裁切，复用现有 Opus 码率、包格式和发射时序。
+- [ ] WAV 只接受未压缩整数 PCM、8/16/24/32-bit、1/2 声道，转换到 48kHz s16le 单声道。
+- [ ] 测试头尾静音、下混/重采样、185 字节包长及不支持声道。
+- [ ] README 与 CI 同步；该特殊音频功能只进入 `feat/net-control`，不移植到冻结的 `main`。

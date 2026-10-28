@@ -44,6 +44,7 @@ import ssl
 import struct
 import threading
 import time
+import wave
 # ====================== 配置加载 ======================
 # 配置来源优先级：环境变量 HAM_BOT_CONFIG 指定路径 > 脚本同目录 config.json
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -514,37 +515,68 @@ def trim_silence(pcm, threshold=None, min_ms=None):
             end = min(n, i + keep + 1)
             break
     return samples[start:end].tobytes()
-def build_audio(mp3_path):
-    """mp3 → (语音包列表, 总帧数)。帧不足30字节补零，尾包不足6帧补零帧。"""
-    pcm, src_rate = Mpg123Decoder().decode(mp3_path)
-    if TRIM_SILENCE:
-        pcm = trim_silence(pcm)
-        print("已裁切头尾静音（trim_silence on）")
-    print("mp3 解码: 源 %dHz → 重采样 48000Hz 单声道" % src_rate)
-    if len(pcm) < FRAME_BYTES:
-        raise RuntimeError("mp3 解码结果为空（%.1fKB），文件损坏或路径错误" % (len(pcm) / 1024))
-    enc = OpusEncoder()
-    frames = []
+def decode_pcm_wav(path, want_rate=48000):
+    """读取未压缩整数 PCM WAV，转换为 48kHz s16le 单声道；不做静音裁切。"""
+    with wave.open(str(path), "rb") as wav:
+        channels, width, src_rate, count = wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()
+        if wav.getcomptype() != "NONE":
+            raise ValueError("仅支持未压缩 PCM WAV")
+        if channels not in (1, 2):
+            raise ValueError("WAV 声道数必须为 1 或 2")
+        if width not in (1, 2, 3, 4):
+            raise ValueError("仅支持 8/16/24/32-bit PCM")
+        raw = wav.readframes(count)
+    if len(raw) != count * channels * width:
+        raise ValueError("WAV 音频数据不完整")
+    if not raw:
+        raise ValueError("WAV 不包含音频样本")
+    def sample(offset):
+        if width == 1:
+            return (raw[offset] - 128) << 8
+        return int.from_bytes(raw[offset:offset + width], "little", signed=True) >> (8 * (width - 2))
+    if channels == 1 and width == 2:
+        pcm = raw
+    else:
+        out = array.array("h")
+        stride = channels * width
+        for off in range(0, len(raw), stride):
+            out.append(int(sum(sample(off + c * width) for c in range(channels)) / channels))
+        pcm = out.tobytes()
+    return resample_linear(pcm, src_rate, want_rate), src_rate
+
+def _encode_pcm(pcm, source):
+    if len(pcm) < FRAME_BYTES or len(pcm) % 2:
+        raise RuntimeError("%s PCM 音频无效或不足一帧" % source)
+    enc, frames = OpusEncoder(), []
     for off in range(0, len(pcm), FRAME_BYTES):
         chunk = pcm[off:off + FRAME_BYTES]
-        if len(chunk) < FRAME_BYTES:                 # 末尾不足一帧补零
+        if len(chunk) < FRAME_BYTES:
             chunk += b"\x00" * (FRAME_BYTES - len(chunk))
-        f = enc.encode_frame(chunk)
-        if len(f) > 30:
-            raise RuntimeError("Opus 帧长 %d 超过30，请检查码率设置" % len(f))
-        frames.append(f + b"\x00" * (30 - len(f)))  # 统一30字节
-    # 6帧合一包 185 字节: [0x20][varint seq][varint len=180] + 180字节（标准 Mumble 上行格式）
-    # session 字段是服务器下行转发时才注入的来源标记，上行不能带（v2 教训）。
-    # len 必须编码为 0x80 0xB4=180（v1 教训: 0x81 0xB4 会被解码成 436）。
-    # seq 每次上台从 200 起每包 +6（listen_capture.py 官方下行实测）。
+        frame = enc.encode_frame(chunk)
+        if len(frame) > 30:
+            raise RuntimeError("Opus 帧长 %d 超过30，请检查码率设置" % len(frame))
+        frames.append(frame + b"\x00" * (30 - len(frame)))
     packets = []
     for i in range(0, len(frames), 6):
         chunk = frames[i:i + 6]
         while len(chunk) < 6:
             chunk.append(b"\x00" * 30)
-        head = bytes([0x20]) + m_varint_enc(200 + i) + m_varint_enc(180)
-        packets.append(head + b"".join(chunk))
+        packets.append(bytes([0x20]) + m_varint_enc(200 + i) + m_varint_enc(180) + b"".join(chunk))
     return packets, len(frames)
+
+def build_audio_wav(path):
+    pcm, rate = decode_pcm_wav(path)
+    print("WAV 解码: 源 %dHz → 48000Hz 单声道（不裁切头尾）" % rate)
+    return _encode_pcm(pcm, "WAV")
+
+def build_audio(mp3_path):
+    """MP3 输入：保留既有静音裁切行为。"""
+    pcm, src_rate = Mpg123Decoder().decode(mp3_path)
+    if TRIM_SILENCE:
+        pcm = trim_silence(pcm)
+        print("已裁切头尾静音（trim_silence on）")
+    print("mp3 解码: 源 %dHz → 重采样 48000Hz 单声道" % src_rate)
+    return _encode_pcm(pcm, "MP3")
 # ---------------- 连接与消息循环（与 validate_client.py 同源已验证） ----------------
 class Client:
     def __init__(self, host, port, use_tls):
@@ -915,26 +947,36 @@ class PersistentAnnouncer:
         with self._lock:
             self._suspended = False
             self._backoff = 30.0          # 重置退避：尽快恢复正常保活，避免长退避空窗
-def announce_once(mp3_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
-                  username=USERNAME, password=PASSWORD, verbose=True):
-    """完整播报一次（一步到位）：编码→登录→抢麦→延迟LEAD_DELAY→匀速发包→放麦。
-    供 CLI 与 announce.py 容错兜底；准点播报请用 DirectAnnouncer 预建链分步调用。"""
-    packets, n_frames = build_audio(mp3_path)
+def _announce_packets_once(packets, n_frames, host=HOST, port=PORT, use_tls=True,
+                           ent_id=None, username=USERNAME, password=PASSWORD, verbose=True):
     if verbose:
         print("音频就绪: %.1f秒 → %d 帧 → %d 包（每%.0fms一包，预计上台 %.1f秒）" %
-              (n_frames * 0.02, n_frames, len(packets),
-               PACKET_PERIOD * 1000, len(packets) * PACKET_PERIOD))
+              (n_frames * 0.02, n_frames, len(packets), PACKET_PERIOD * 1000, len(packets) * PACKET_PERIOD))
     s = DirectAnnouncer(host, port, use_tls, username, password, ent_id)
     try:
         s.connect()
         s.take_mic()
-        s.play(packets, verbose)   # play 内部先等 LEAD_DELAY（v7 官方时序，中继台建链需要）
+        s.play(packets, verbose)
         return True
     finally:
         s.close()
+
+def announce_once(mp3_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
+                  username=USERNAME, password=PASSWORD, verbose=True):
+    """MP3 播报接口，保持 announce.py 兼容。"""
+    packets, n_frames = build_audio(mp3_path)
+    return _announce_packets_once(packets, n_frames, host, port, use_tls, ent_id, username, password, verbose)
+
+def announce_wav_once(wav_path, host=HOST, port=PORT, use_tls=True, ent_id=None,
+                      username=USERNAME, password=PASSWORD, verbose=True):
+    packets, n_frames = build_audio_wav(wav_path)
+    return _announce_packets_once(packets, n_frames, host, port, use_tls, ent_id, username, password, verbose)
+
 def main():
     ap = argparse.ArgumentParser(description="滔滔直连播报客户端")
-    ap.add_argument("--mp3", required=True, help="播报 mp3 文件路径")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--mp3", help="播报 MP3 文件路径（沿用原有处理方式）")
+    source.add_argument("--wav", help="未压缩 PCM WAV 文件路径（不裁切头尾音频）")
     ap.add_argument("--host", default=HOST)
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--tls", action="store_true", default=True)
@@ -963,14 +1005,16 @@ def main():
             args.host = HOST
         if "--port" not in sys.argv:
             args.port = PORT
+    audio_path = args.wav or args.mp3
+    builder = build_audio_wav if args.wav else build_audio
     if args.dry_run:
-        packets, n_frames = build_audio(args.mp3)
+        packets, n_frames = builder(audio_path)
         print("管线自测: %.1f秒 → %d 帧 → %d 包" % (n_frames * 0.02, n_frames, len(packets)))
         print("首包 %d 字节: %s ..." % (len(packets[0]), packets[0][:16].hex()))
-        lens = set(len(p) for p in packets)
-        print("包长集合: %s（应全为185）" % sorted(lens))
+        print("包长集合: %s（应全为185）" % sorted(set(len(p) for p in packets)))
         return
-    ok = announce_once(args.mp3, args.host, args.port, args.tls, args.ent_id)
+    fn = announce_wav_once if args.wav else announce_once
+    ok = fn(audio_path, args.host, args.port, args.tls, args.ent_id)
     print("\n===== %s =====" % ("播报完成" if ok else "播报失败"))
 if __name__ == "__main__":
     main()
